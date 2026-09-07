@@ -67,12 +67,43 @@ const STARVE_POINTS: f32 = 3.0;
 /// already holding the whole bill.
 const CORN_INCOME_PER_ROUND: f32 = 1.9;
 
-/// Value of one worker-action, in points. Calibrated against the space table
-/// below, whose mid-range entries sit around 2-3.
-const ACTION_VALUE: f32 = 2.4;
+/// Value of one worker-action, in points, *averaged over the actions a player
+/// actually gets to take*. Well under the 2-3 the mid-range entries of the
+/// space table pay, because most of a worker's actions are the cheap ones it
+/// takes on the way to the good one, and because a worker that has to be fed
+/// four times over the calendar has already spent 2 points of corn on itself.
+const ACTION_VALUE: f32 = 1.2;
 
 /// Rounds a worker typically spends riding a gear between actions.
 const ROUNDS_PER_ACTION: f32 = 2.6;
+
+/// Residual value of a building already built. Its payoff is in the state
+/// already; what is left is that three monuments count the pile.
+const BUILDING_VALUE: f32 = 0.45;
+
+/// Global scale on [`research_step_value`], which is priced per *use*.
+const RESEARCH_SCALE: f32 = 0.5;
+
+/// Fraction of a face-up monument's score credited to the player closest to
+/// affording it. See [`monument_outlook`].
+const MONUMENT_SHARE: f32 = 0.45;
+
+/// Confidence in a projected temple payout: the next scoring day is nearly
+/// locked in, a later one is a forecast that standings will move on.
+const TEMPLE_NEAR: f32 = 0.85;
+const TEMPLE_FAR: f32 = 0.55;
+
+/// What one more step on a temple is worth between scoring days, as a fraction
+/// of the jump it unlocks. Without it the search sees climbing as free.
+const TEMPLE_CLIMB: f32 = 0.10;
+
+/// Per-block bonus for holding a *spread* of block types rather than a stack of
+/// one, on top of [`BLOCK_PREMIUM`]. Mixed build costs are limited by the
+/// scarcest type.
+const BLOCK_BREADTH: f32 = 0.50;
+
+/// A held Palenque tile, which monuments #7 and #8 pay 4 each for.
+const TILE_PREMIUM: f32 = 0.25;
 
 /// What one round of one worker's throughput costs, in points: the price of
 /// leaving a worker standing on a gear for one more rotation instead of taking
@@ -85,7 +116,22 @@ const ROUNDS_PER_ACTION: f32 = 2.6;
 /// per space ridden is worth **+2.02 centred points** (95% CI +1.21..+2.83,
 /// 500 rotation blocks / 2000 games, `heuristic:32` both sides).
 ///
-/// Sweeping it is what set the value; see the note in `board_position`.
+/// Swept at 3000 rotation blocks (12000 games) per value, `heuristic:32`
+/// against the frozen cbb61a2 evaluator, paired on seed. Centred score against
+/// that baseline, and the paired difference from 0.52:
+///
+/// ```text
+///   0.34  +5.42   -3.41 (-3.76..-3.06)
+///   0.42  +7.07   -1.76 (-2.04..-1.47)
+///   0.52  +8.83    --                   <- peak
+///   0.62  +7.54   -1.29 (-1.63..-0.95)
+///   0.74  +5.20   -3.63 (-4.05..-3.22)
+/// ```
+///
+/// Unimodal, and every alternative loses by more than its interval. A quadratic
+/// through the middle three puts the vertex at 0.512, so 0.52 is the value.
+/// (An earlier 300-block sweep read 0.45 as the peak; at 600 blocks the same
+/// seeds reversed it. 300 blocks is not enough to separate 0.45 from 0.52.)
 const TEMPO_PER_ROUND: f32 = 0.52;
 
 // ---- the evaluator -----------------------------------------------------
@@ -246,7 +292,7 @@ fn held_premium(g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
     // Reward breadth: the minimum across types is what a mixed cost is limited
     // by. Worth about one extra block each.
     let breadth = counts.iter().copied().fold(f32::INFINITY, f32::min);
-    v += breadth.min(3.0) * 0.5 * spendable;
+    v += breadth.min(3.0) * BLOCK_BREADTH * spendable;
 
     // Skulls are Chichen fuel. Only while there is a space left to spend them on
     // and a turn in which to do it.
@@ -259,7 +305,7 @@ fn held_premium(g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
     // Palenque tiles feed monuments #7 and #8 at 4 points each. Even without
     // one in hand they are a live option while monuments remain.
     if g.face_up_monuments().next().is_some() {
-        v += (pl.corn_tiles + pl.wood_tiles) as f32 * 0.25 * spendable;
+        v += (pl.corn_tiles + pl.wood_tiles) as f32 * TILE_PREMIUM * spendable;
     }
 
     v
@@ -281,7 +327,7 @@ fn temple_outlook(g: &GameState, p: PlayerId) -> f32 {
         let age = 1 + POINT_DAYS.iter().filter(|&&x| x < d).count() as u8;
         let pts = g.temple_points(p, age) as f32;
         // The nearest payout is close to locked in; a later one is a forecast.
-        v += pts * if n == 0 { 0.85 } else { 0.55 };
+        v += pts * if n == 0 { TEMPLE_NEAR } else { TEMPLE_FAR };
     }
 
     for (n, &_d) in RESOURCE_DAYS.iter().filter(|&&d| d > g.day).enumerate() {
@@ -298,7 +344,7 @@ fn temple_outlook(g: &GameState, p: PlayerId) -> f32 {
                 }
             }
         }
-        v += haul * if n == 0 { 0.85 } else { 0.55 };
+        v += haul * if n == 0 { TEMPLE_NEAR } else { TEMPLE_FAR };
     }
 
     // A step is worth more than its current payout when it is one short of a
@@ -312,7 +358,7 @@ fn temple_outlook(g: &GameState, p: PlayerId) -> f32 {
             climb += (d.points[step + 1] - d.points[step]) as f32;
         }
     }
-    v += climb * 0.10;
+    v += climb * TEMPLE_CLIMB;
 
     v
 }
@@ -329,7 +375,7 @@ fn engine_value(g: &GameState, p: PlayerId, rounds_left: f32, horizon: f32) -> f
     // worth buying near the end.
     let actions_each = (rounds_left / ROUNDS_PER_ACTION).min(6.0);
     let workers = g.n_unlocked(p) as f32;
-    v += workers * actions_each * ACTION_VALUE * 0.5;
+    v += workers * actions_each * ACTION_VALUE;
 
     // Feeding is a cost per food day, not per round; the permanent discounts
     // are worth the corn they save over every food day still to come.
@@ -348,7 +394,7 @@ fn engine_value(g: &GameState, p: PlayerId, rounds_left: f32, horizon: f32) -> f
     for s in Science::ALL {
         let lvl = g.level(p, s);
         for l in 1..=lvl {
-            v += research_step_value(s, l) * uses * 0.5;
+            v += research_step_value(s, l) * uses * RESEARCH_SCALE;
         }
         // Monument #11 pays 9/20/33 for maxed tracks and #12 pays 3 a level, so
         // a track one short of the top is worth finishing.
@@ -360,7 +406,7 @@ fn engine_value(g: &GameState, p: PlayerId, rounds_left: f32, horizon: f32) -> f
     // Buildings are mostly one-shot and their payoff is already in the state.
     // What survives is that three monuments count them, so the pile itself has
     // a residual value.
-    v += pl.n_buildings() as f32 * 0.45;
+    v += pl.n_buildings() as f32 * BUILDING_VALUE;
 
     v
 }
@@ -591,7 +637,7 @@ fn monument_outlook(g: &GameState, p: PlayerId, horizon: f32) -> f32 {
             continue;
         }
         // Full value when it is already affordable, falling away with distance.
-        best = best.max(pays * 0.45 / (1.0 + short as f32));
+        best = best.max(pays * MONUMENT_SHARE / (1.0 + short as f32));
     }
 
     best * horizon.min(1.0)
