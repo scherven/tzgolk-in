@@ -25,21 +25,32 @@
 //! # Against the alpha-beta, at matched work
 //!
 //! Worth knowing before spending another day tuning `search.rs`. On the same
-//! positions and at the same cost per turn — `mcts:2048` at 21.9 ms against
-//! `minimax:8:200::greedy:capw=25` at 19.8 ms — this search is **+9.32**
-//! centred score head to head (95% CI +6.09..+12.55, p < 0.0001, 39 blocks /
-//! 156 games, solo mode) and takes 40.4% of its games against three of them,
-//! where an equally strong agent would take 25%.
+//! positions and at the same cost per turn — `mcts:2048` at 20.97 ms against
+//! `minimax:8:...::greedy:capw=25` at 19.45 ms, interleaved position by
+//! position so contention is common-mode — this search is **+3.27** centred
+//! score head to head (95% CI +1.78..+4.77, p = 1.7e-5, **150 blocks / 600
+//! games**, solo mode) and takes 31.6% of its games against three of them
+//! (95% CI 27.9..35.3), where an equally strong agent would take 25%.
+//!
+//! **That is a third of what this comment used to claim.** The earlier figure
+//! was +9.32 (CI +6.09..+12.55) from **39 blocks**, and the two intervals do
+//! not overlap. Block-level sd of centred score is 9.3, so 39 blocks buys
+//! +/-3.0 and 150 buys +/-1.5; a six-point move is two intervals, not one, so
+//! this is not simply the small n. Two things changed with it: the machine was
+//! running four other agents, and `eval.rs` has been tuned since — which the
+//! alpha-beta consumes at *every* leaf while this search consumes it only at
+//! expansions, so an evaluator that got better closes the gap from the other
+//! side. Either way the direction survives and the size does not: MCTS is
+//! ahead, by about three points rather than nine.
 //!
 //! The match is on *work* rather than on the clock, deliberately. Both sides
 //! are budget-invariant: this search runs its 2048 simulations whatever else
-//! the machine is doing, and the alpha-beta was given a budget too large to
-//! bind so that it stops at `max_depth` rather than on the clock. That matters
-//! because the two budgets are different kinds of thing, and a loaded machine
-//! silently favours the one counted in simulations — the same comparison with
-//! a 200 ms alpha-beta budget reads +11.79 (n = 23) instead of +9.46, and the
-//! difference is the contention, not the players. The 21.9-vs-19.8 ms figures
-//! are what make the two budgets comparable at all.
+//! the machine is doing, and the alpha-beta is given a budget too large to bind
+//! so that it stops at `max_depth`. The 20.97-vs-19.45 ms figures are what make
+//! the two budgets comparable at all. Re-measured, the two budget kinds now
+//! agree: a 600-second budget and a 200 ms one differ by -0.67 centred (CI
+//! -2.19..+0.85, 147 shared seeds), so the clock did not bind at the
+//! concurrency used and the shrunken effect is not an artefact of it.
 //!
 //! Not done yet: this is single-threaded. Virtual loss is applied and removed
 //! for real, on the mover's component only, so the mechanism is exercised and
@@ -47,7 +58,9 @@
 //! §3.1's atomics and there is no batching. Swapping in `AtomicU32` and signed
 //! fixed-point `AtomicI32` is mechanical; the descent logic does not change.
 
+use crate::effect::{Choice, Effect};
 use crate::ids::*;
+use crate::options::EffectPrice;
 use crate::phase::{Evaluator, Phase, Step};
 use crate::state::GameState;
 use crate::tree;
@@ -80,11 +93,30 @@ pub struct MctsConfig {
     /// overwhelming at the other.
     pub dirichlet_scale: f32,
     /// K of §2.6: how many edges a node opens with.
+    ///
+    /// **Measured inert at 32.** Over 1,446,918 node expansions from
+    /// `mcts:2048` on real positions (`bin/sprobe nodes`), legal edges per node
+    /// run p50 2, p90 6, p99 24, max 136 — so this cap drops an edge on
+    /// **0.39%** of nodes. `cap_per_width` was the alpha-beta's biggest single
+    /// win because its nodes were 184-644 moves wide; the analogous cap here
+    /// has almost nothing to bite on, and sweeping it would be sampling noise.
+    /// The wide nodes are `Take` nodes deep in a descent, not the roots of a
+    /// turn's sub-decisions, which are p50 3.
     pub max_edges: usize,
+    /// §2.6's progressive widening, `N >= widen_c * m^widen_alpha` for the
+    /// m-th child. **Also measured inert**: a node opens with
+    /// `min(edges, max_edges)` already active, so widening only ever governs
+    /// the 33rd edge and up — 0.0% of nodes in the same 1.4M-expansion sample
+    /// were sitting below the cap waiting on it.
     pub widen_c: f32,
     pub widen_alpha: f32,
-    /// The absolute ceiling widening may reach.
+    /// The absolute ceiling widening may reach, and the width past which edges
+    /// are **deleted**. See [`EdgeOrder`] before changing it: a truncation is
+    /// only as good as the key it truncates on.
     pub widen_cap: usize,
+    /// How a node wider than `max_edges` decides which edges survive. See
+    /// [`EdgeOrder`].
+    pub ordering: EdgeOrder,
     /// `tau` in §3.8. Zero picks the most-visited edge.
     pub temperature: f32,
     pub virtual_loss: u32,
@@ -133,6 +165,108 @@ pub enum Priors {
     OnePly,
 }
 
+/// How a node too wide for `max_edges` decides which edges survive.
+///
+/// # Why this is not just "sort by prior"
+///
+/// It was, and it was the most expensive bug in this file. `sort_by` is stable
+/// and `HeuristicEvaluator` returns `1.0 / n_edges` for every edge, so sorting
+/// a uniform prior is a no-op: the truncation kept the first `widen_cap` edges
+/// in **generation order**, which is `Choice`'s derived lexicographic `Ord` --
+/// a fact about the declaration order of the `Effect` variants and about
+/// nothing whatsoever in the game. Measured over 446 wide nodes, which hold
+/// 52.8% of all edge mass, that deleted the one-ply-best edge at 55.6% of them.
+///
+/// Deleted, not deprioritised. Progressive widening can reopen an edge it has
+/// not reached yet; it cannot reopen one that is no longer in the array. Every
+/// strength number this search has ever produced was measured with the best
+/// move missing at half its wide nodes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EdgeOrder {
+    /// Sort on the prior as it stands. Right when the prior is real -- a
+    /// trained policy head -- and a no-op when the evaluator abstains, which is
+    /// what makes it the wrong default while there is no net.
+    Prior,
+    /// Price every edge against `eval`'s own local gradient ([`Gradient`]),
+    /// keep the best `widen_cap`, and spend the one-ply probe only on those.
+    Gradient,
+}
+
+/// `eval::heuristic`'s local gradient: a price per unit of everything an
+/// `Effect` can hand out, in the points `heuristic` itself returns.
+///
+/// # Why a gradient and not a table of constants
+///
+/// A hand-written price list is a second opinion about the value function, and
+/// it goes stale every time someone tunes `eval.rs`. This asks `eval` instead
+/// -- probe `+1` of each axis against the position once, then price a `Choice`
+/// as the dot product of its effects with the result. Linear, so it misses
+/// every interaction between the effects of one choice; that is exactly why it
+/// is allowed to *order* edges and never to value them.
+///
+/// Sixteen `heuristic` calls to build, then **16.0 ns per edge** to apply,
+/// against **123.0 ns** for the `apply_step`-and-score one-ply probe. That 7.7x
+/// is what makes a 7,784-edge node orderable at all, and it cuts the mean
+/// regret below the best surviving edge from 0.747 points to 0.057.
+#[derive(Clone, Copy)]
+pub struct Gradient {
+    price: EffectPrice,
+}
+
+impl Gradient {
+    /// Probe the position for one player. Sixteen `+1` perturbations plus the
+    /// base, which is ~2 us -- paid once per mover per sub-decision, against
+    /// the ~2.6 ms that sub-decision costs.
+    pub fn new(g: &GameState, p: PlayerId) -> Gradient {
+        let base = crate::eval::heuristic(g, p);
+        let pr = |e| {
+            let mut probe = *g;
+            Choice::one(e).apply(&mut probe, p);
+            crate::eval::heuristic(&probe, p) - base
+        };
+        let points = pr(Effect::Points(1));
+        // The card- and space-naming effects cannot be probed without naming a
+        // card, and probing each distinct one moves the regret inside
+        // `max_edges` by 0.005 points for 26% more per edge. So: constants, on
+        // the scale `search.rs` already prices them in, converted into
+        // `heuristic` points by the probed price of a point so the two halves
+        // of the sum are commensurate.
+        let k = |pts: f32| pts * points / 4.0;
+        Gradient {
+            price: EffectPrice {
+                corn: pr(Effect::Corn(1)),
+                res: std::array::from_fn(|i| pr(Effect::Res(Resource::ALL[i], 1))),
+                points,
+                temple: std::array::from_fn(|i| pr(Effect::TempleStep(Temple::ALL[i], 1))),
+                science: std::array::from_fn(|i| pr(Effect::AdvanceResearch(Science::ALL[i]))),
+                unlock_worker: pr(Effect::UnlockWorker),
+                free_worker: pr(Effect::FreeWorker(1)),
+                worker_discount: pr(Effect::WorkerDiscount(1)),
+                palenque_tile: k(2.0),
+                burn_wood: k(-2.0),
+                fill_chichen: k(0.0),
+                build: k(8.0),
+                monument: k(20.0),
+            },
+        }
+    }
+
+    /// One `Step`, priced.
+    ///
+    /// Only `Take` carries a `Choice`, and only `Take` nodes are ever wide: the
+    /// 7,784-edge worst case is one worker's options on a full gear, where
+    /// `Placing` runs to a few hundred and every other phase is p50 3. A step
+    /// this cannot price returns 0 and the stable tie-break leaves it in
+    /// generation order, which is what those phases had anyway.
+    #[inline]
+    pub fn step(&self, s: &Step) -> f32 {
+        match s {
+            Step::Take(c) => self.price.choice(c),
+            _ => 0.0,
+        }
+    }
+}
+
 impl Default for MctsConfig {
     fn default() -> Self {
         MctsConfig {
@@ -146,6 +280,7 @@ impl Default for MctsConfig {
             widen_c: 2.0,
             widen_alpha: 0.5,
             widen_cap: 128,
+            ordering: EdgeOrder::Gradient,
             temperature: 1.0,
             virtual_loss: 1,
             max_depth: 2048,
@@ -318,7 +453,7 @@ pub struct Mcts<E: Evaluator> {
     /// Transposition index. `FxHashMap` rather than the default: the key is a
     /// whole 320-byte `GameState`, and SipHash over that costs about as much as
     /// encoding the position for the network.
-    index: FxHashMap<(GameState, Phase, PlayerId, u8), u32>,
+    index: FxHashMap<NodeKey, u32>,
     /// Nodes carried over from the previous sub-decision, and nodes thrown
     /// away, for the last `search_at`. Observability for the reuse: if `reused`
     /// stays at zero across a turn the retention is not firing.
@@ -333,6 +468,19 @@ pub struct Mcts<E: Evaluator> {
     /// Scratch for the one-ply prior pass, so a node of width 2293 does not
     /// allocate on every expansion.
     scratch: Vec<f32>,
+    /// The descent path, hoisted out of `simulate`. It is `Vec::with_capacity`
+    /// per simulation otherwise, which at 2048 simulations a search is 2048
+    /// mallocs -- and a `sample` profile put the malloc family at 14% of stack
+    /// tops. Taken and put back around each descent, because the descent needs
+    /// `&mut self` for everything else it touches.
+    path: Vec<(u32, usize)>,
+    /// One [`Gradient`] per mover, built on first use and thrown away at the
+    /// next `search_at`. Lazy because most sub-decisions never reach a node
+    /// wide enough to need an ordering at all.
+    grad: [Option<Gradient>; N_PLAYERS],
+    /// The position the gradients are anchored at -- the state `search_at` was
+    /// given, not the node being expanded. See [`Mcts::gradient`].
+    grad_root: Option<GameState>,
 }
 
 impl<E: Evaluator> Mcts<E> {
@@ -351,6 +499,9 @@ impl<E: Evaluator> Mcts<E> {
             reuse_disabled,
             bias: None,
             scratch: Vec::new(),
+            path: Vec::with_capacity(32),
+            grad: [None; N_PLAYERS],
+            grad_root: None,
         }
     }
 
@@ -427,6 +578,13 @@ impl<E: Evaluator> Mcts<E> {
             };
         }
 
+        // Re-anchor the ordering gradients on this sub-decision's own root. A
+        // turn moves a handful of resources, so re-probing per sub-decision
+        // rather than per turn is strictly fresher, and costs 16 `heuristic`
+        // calls only for a mover that actually meets a wide node.
+        self.grad = [None; N_PLAYERS];
+        self.grad_root = Some(*state);
+
         // Reuse the subtree if this node is already in the arena from the
         // previous sub-decision of the same turn.
         //
@@ -440,7 +598,7 @@ impl<E: Evaluator> Mcts<E> {
         // the right ones. A node from outside that turn was not, and reusing it
         // would search un-noised priors as if they were noised; those are
         // cleared instead.
-        let key = (*state, phase, turn, done);
+        let key = NodeKey { state: *state, phase, turn, done };
         let reusable = if self.reuse_disabled {
             None
         } else {
@@ -660,7 +818,8 @@ impl<E: Evaluator> Mcts<E> {
     // ---- one simulation -------------------------------------------------
 
     fn simulate(&mut self, root: u32) {
-        let mut path: Vec<(u32, usize)> = Vec::with_capacity(32);
+        let mut path = std::mem::take(&mut self.path);
+        path.clear();
         let mut value = [0.0f32; N_PLAYERS];
         let vl = self.cfg.virtual_loss;
 
@@ -707,6 +866,7 @@ impl<E: Evaluator> Mcts<E> {
 
         let leaf = self.cursor(&path, root);
         self.backup(&path, leaf, value);
+        self.path = path;
     }
 
     /// The node the descent currently sits on: the child of the last edge
@@ -905,11 +1065,20 @@ impl<E: Evaluator> Mcts<E> {
         }
         self.nodes = kept;
 
-        self.index.clear();
-        for (i, n) in self.nodes.iter().enumerate() {
-            self.index
-                .insert((n.state, n.phase, n.turn, n.done), i as u32);
-        }
+        // Renumber the index in place rather than rebuilding it. The key is a
+        // 320-byte `GameState` and `retain` never touches a hash, where
+        // reinserting every surviving node hashes each of them again: at 2,310
+        // nodes retained per sub-decision and ~0.4 us a hash (the figure in
+        // `Cargo.toml` that bought `rustc-hash` in the first place) that rebuild
+        // was ~0.9 ms of a ~4.7 ms search. A `sample` profile put
+        // `BuildHasher::hash_one` at 17% of all stack tops, most of it here.
+        self.index.retain(|_, v| match mapping[*v as usize] {
+            Some(n) => {
+                *v = n;
+                true
+            }
+            None => false,
+        });
         0
     }
 
@@ -921,12 +1090,26 @@ impl<E: Evaluator> Mcts<E> {
         done: u8,
         in_root_turn: bool,
     ) -> (u32, bool) {
-        if let Some(&idx) = self.index.get(&(state, phase, turn, done)) {
-            return (idx, false);
-        }
+        // Terminal first. `push_terminal` never inserts into the index, so the
+        // lookup below could not have hit for an over position -- it was a
+        // whole state hash spent to be told nothing, on every simulation that
+        // reaches the end of the game.
         if state.over {
             return (self.push_terminal(state), true);
         }
+        let key = NodeKey { state, phase, turn, done };
+        // `entry` rather than `get` then `insert`: the miss path is the common
+        // one -- an edge is only walked through here the first time it is
+        // followed, after which `Edge::child` caches the answer -- and hashing
+        // the position twice for it was half of all the hashing this search
+        // did. The index is claimed before the node exists, which is sound only
+        // because nothing between here and the `push` below touches
+        // `self.nodes`; the `debug_assert` there is what keeps that true.
+        let idx = self.nodes.len() as u32;
+        match self.index.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => return (*e.get(), false),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(idx),
+        };
 
         // A dead node would back up a terminal value for a live position, which
         // is worse than crashing, so this is an assert rather than a fallback.
@@ -956,16 +1139,30 @@ impl<E: Evaluator> Mcts<E> {
                 n_legal,
                 "evaluator returned the wrong prior count"
             );
-            let priors = self.priors_for(&state, phase, turn, done, &steps, eval.priors);
+            // Select first, price second. The one-ply prior costs an
+            // `apply_step` and a `heuristic` per edge (123.0 ns) where the
+            // gradient costs 16.0, so on a node past the cap the cheap key
+            // picks the survivors and the expensive one is spent only on them
+            // -- 34.1 us against 53.3 at the wide nodes, for the same top 32.
+            let (steps, from_eval) =
+                self.select_edges(&state, phase, turn, steps, eval.priors);
+            let priors = self.priors_for(&state, phase, turn, done, &steps, from_eval);
             let mut edges: Vec<Edge> = steps
                 .into_iter()
                 .enumerate()
                 .map(|(i, step)| new_edge(step, priors.get(i).copied().unwrap_or(0.0)))
                 .collect();
 
-            // Only a node wide enough to be capped gets reordered; below the cap
-            // the edges stay in the order the generator produced them, which is
-            // the order the encoder will see.
+            // Only a node wide enough to have been selected gets reordered;
+            // below the cap the edges stay in the order the generator produced
+            // them, which is the order the encoder will see. Above it,
+            // `select_edges` has already put them in gradient order and dropped
+            // the tail, so under `EdgeOrder::Gradient` this re-sort only matters
+            // for `Priors::OnePly`, where it promotes the true one-ply best of
+            // the survivors to the front of the `active` window, and the
+            // `truncate` is a no-op. Under `EdgeOrder::Prior` the two lines are
+            // the whole cap -- and are exactly the code that deleted the best
+            // edge at 55.6% of wide nodes, kept so the two can be raced.
             if edges.len() > self.cfg.max_edges {
                 edges.sort_by(|a, b| b.prior.total_cmp(&a.prior));
                 edges.truncate(self.cfg.widen_cap.max(self.cfg.max_edges));
@@ -992,7 +1189,11 @@ impl<E: Evaluator> Mcts<E> {
         }
 
         let active = edges.len().min(self.cfg.max_edges);
-        let idx = self.nodes.len() as u32;
+        debug_assert_eq!(
+            self.nodes.len() as u32,
+            idx,
+            "node_for claimed an index the push did not land on"
+        );
         self.nodes.push(Node {
             state,
             phase,
@@ -1008,7 +1209,6 @@ impl<E: Evaluator> Mcts<E> {
             terminal: false,
             in_root_turn,
         });
-        self.index.insert((state, phase, turn, done), idx);
         (idx, true)
     }
 
@@ -1030,6 +1230,73 @@ impl<E: Evaluator> Mcts<E> {
             in_root_turn: false,
         });
         idx
+    }
+
+    /// The turn-root gradient for one player, built on first use.
+    ///
+    /// Anchored at the state `search_at` was given rather than at the node
+    /// being expanded: within a turn the two differ by a handful of resources,
+    /// and re-probing per node would spend 16 `heuristic` calls at every wide
+    /// node to move an ordering the linear approximation has already blurred.
+    /// Keyed by mover because a descent crosses turns -- `max_depth` is 2048
+    /// sub-decisions -- and a price list is a claim about one player's
+    /// position, not about the position.
+    fn gradient(&mut self, at: &GameState, mover: PlayerId) -> Gradient {
+        if let Some(g) = self.grad[mover.idx()] {
+            return g;
+        }
+        // `search_at` sets the anchor. A caller that reached `node_for` by
+        // another route -- the tests do -- prices at the node itself, which is
+        // stricter rather than cheaper.
+        let anchor = self.grad_root.unwrap_or(*at);
+        let g = Gradient::new(&anchor, mover);
+        self.grad[mover.idx()] = Some(g);
+        g
+    }
+
+    /// Cut a node wider than `max_edges` down to `widen_cap`, best first.
+    ///
+    /// Returns the surviving steps in the order the search should open them,
+    /// with the evaluator's priors permuted and sliced to match. Below the cap
+    /// this is the identity, so the generator's order -- the encoder's order --
+    /// survives everywhere it can.
+    fn select_edges(
+        &mut self,
+        state: &GameState,
+        phase: Phase,
+        turn: PlayerId,
+        steps: Vec<Step>,
+        from_eval: Vec<f32>,
+    ) -> (Vec<Step>, Vec<f32>) {
+        if steps.len() <= self.cfg.max_edges || self.cfg.ordering == EdgeOrder::Prior {
+            return (steps, from_eval);
+        }
+        let g = self.gradient(state, phase.mover(turn));
+        let key: Vec<f32> = steps.iter().map(|s| g.step(s)).collect();
+        let mut order: Vec<u32> = (0..steps.len() as u32).collect();
+        // A full sort of the widest node seen (7,784 edges) is ~50 us against
+        // the ~125 us its pricing already cost, so `select_nth_unstable` would
+        // be optimising the smaller half. Ties break on generation order rather
+        // than on `sort_unstable`'s arbitrary choice, so that a node's surviving
+        // edge set is a function of the position and two runs of the same seed
+        // agree.
+        order.sort_unstable_by(|&a, &b| {
+            key[b as usize]
+                .total_cmp(&key[a as usize])
+                .then(a.cmp(&b))
+        });
+        order.truncate(self.cfg.widen_cap.max(self.cfg.max_edges));
+
+        // Moved out of their slots rather than cloned: a `Choice` owns a
+        // `SmallVec`, and this runs on the widest nodes in the tree.
+        let mut slots: Vec<Option<Step>> = steps.into_iter().map(Some).collect();
+        let mut out_steps = Vec::with_capacity(order.len());
+        let mut out_priors = Vec::with_capacity(order.len());
+        for &i in &order {
+            out_steps.push(slots[i as usize].take().expect("each edge selected once"));
+            out_priors.push(from_eval.get(i as usize).copied().unwrap_or(0.0));
+        }
+        (out_steps, out_priors)
     }
 
     /// The prior over a node's edges, before the §2.6 cap and the §3.7 noise.
@@ -1136,6 +1403,178 @@ impl<E: Evaluator> Mcts<E> {
             edge.prior = (1.0 - eps) * edge.prior + eps * d;
         }
     }
+}
+
+/// The transposition key, with a hash that does not walk 320 bytes one at a
+/// time.
+///
+/// # Why this hash is hand-written
+///
+/// `GameState` derives `Hash`, and a derived `Hash` over nested `u8` arrays
+/// calls `Hasher::write_u8` once per byte -- about 270 rounds of `FxHasher` for
+/// one lookup. A `sample` profile of `mcts:2048` put `GameState::hash` at
+/// **11.2% of all stack tops**, second only to `simulate` itself, and the
+/// `FxHashMap` in `Mcts::index` is the only thing that ever hashes a state.
+///
+/// **Correctness does not rest on this hash.** `HashMap` resolves every bucket
+/// with `Eq`, which is still the derived whole-state comparison, so the digest
+/// only has to spread. That frees it to skip what cannot vary inside one
+/// search, and to pack what remains eight bytes at a time:
+///
+/// * `gears` is redundant with `workers` -- `gears[g].occ[p] == w` and
+///   `workers[w] == OnGear { gear: g, pos: p }` are the same fact written
+///   twice, and `state.rs` moves them together. 55 bytes.
+/// * the three `Deck::ids` arrays are shuffled once at setup and never
+///   permuted again; only `next` advances. 45 bytes.
+/// * `Player::color` is fixed for the whole game. 4 bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NodeKey {
+    state: GameState,
+    phase: Phase,
+    turn: PlayerId,
+    done: u8,
+}
+
+impl std::hash::Hash for NodeKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        // One `write_u64` rather than one per field: `FxHasher`'s per-call work
+        // is the same multiply either way, so the win is in how few times it is
+        // reached.
+        h.write_u64(mix(state_digest(&self.state), self.phase_word()));
+    }
+}
+
+impl NodeKey {
+    /// `Phase` with its payload, not just its tag. The siblings of a `Take`
+    /// node differ only in `worker`, and dropping it would put every worker of
+    /// a position in one bucket -- correct, because `Eq` decides, and slow for
+    /// exactly the nodes this search spends its time on.
+    #[inline]
+    fn phase_word(&self) -> u64 {
+        let payload = match self.phase {
+            Phase::Beg | Phase::Mode | Phase::PickWorker | Phase::PityPlace => 0,
+            Phase::Placing { n } => n as u64,
+            Phase::Take { worker } => worker.0 as u64,
+            Phase::ExtraDay { claimer } => claimer.idx() as u64,
+            Phase::DraftTile { dealt, kept } => {
+                u32::from_le_bytes(dealt) as u64 | (kept as u64) << 32
+            }
+        };
+        self.phase.tag() as u64
+            | (self.turn.idx() as u64) << 8
+            | (self.done as u64) << 16
+            | payload << 24
+    }
+}
+
+/// FNV-1a's step, over a whole word instead of a byte.
+#[inline]
+fn mix(h: u64, x: u64) -> u64 {
+    (h ^ x).wrapping_mul(0x0100_0000_01b3)
+}
+
+#[inline]
+fn mix_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    let mut it = bytes.chunks_exact(8);
+    for c in &mut it {
+        h = mix(h, u64::from_le_bytes(c.try_into().expect("chunks_exact(8)")));
+    }
+    let rem = it.remainder();
+    if !rem.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..rem.len()].copy_from_slice(rem);
+        h = mix(h, u64::from_le_bytes(buf));
+    }
+    h
+}
+
+/// A worker's whole location in one byte, so 24 of them are three words.
+///
+/// `3 + gear * MAX_GEAR_SPACES + pos` tops out at `3 + 4*11 + 10 = 57`, which
+/// is why this fits at all.
+#[inline]
+fn worker_byte(w: crate::state::WorkerLoc) -> u8 {
+    use crate::state::WorkerLoc;
+    match w {
+        WorkerLoc::Locked => 0,
+        WorkerLoc::Available => 1,
+        WorkerLoc::FirstPlayerSpace => 2,
+        WorkerLoc::OnGear { gear, pos } => {
+            3 + gear as u8 * crate::state::MAX_GEAR_SPACES as u8 + pos.0
+        }
+    }
+}
+
+/// Everything about a position that can change inside one search, folded to a
+/// word. See [`NodeKey`] for what is left out and why.
+fn state_digest(g: &GameState) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+
+    let mut wb = [0u8; N_WORKERS];
+    for (b, w) in wb.iter_mut().zip(g.workers.iter()) {
+        *b = worker_byte(*w);
+    }
+    h = mix_bytes(h, &wb);
+
+    for p in &g.players {
+        h = mix(
+            h,
+            p.corn as u64
+                | (p.res[0] as u64) << 8
+                | (p.res[1] as u64) << 16
+                | (p.res[2] as u64) << 24
+                | (p.res[3] as u64) << 32
+                | ((p.points as u16) as u64) << 40
+                | (p.corn_tiles as u64) << 56,
+        );
+        h = mix(
+            h,
+            p.buildings as u64
+                | (p.monuments as u64) << 32
+                | (p.wood_tiles as u64) << 48
+                | (p.free_workers as u64) << 56,
+        );
+        h = mix(
+            h,
+            p.worker_discount as u64 | (p.may_skip_day as u64) << 8,
+        );
+    }
+    for row in &g.temples {
+        h = mix_bytes(h, row);
+    }
+    for row in &g.research {
+        h = mix_bytes(h, row);
+    }
+    for t in &g.palenque {
+        h = mix(h, t.corn as u64 | (t.wood as u64) << 8);
+    }
+    let opt = |o: Option<u8>| o.map_or(0u64, |v| v as u64 + 1);
+    let mut up = 0u64;
+    for (i, b) in g.buildings_up.iter().enumerate() {
+        up ^= opt(b.map(|x| x.0)) << (i * 9);
+    }
+    h = mix(h, up);
+    let mut mu = 0u64;
+    for (i, m) in g.monuments_up.iter().enumerate() {
+        mu ^= opt(m.map(|x| x.0)) << (i * 9);
+    }
+    h = mix(h, mu);
+    mix(
+        h,
+        g.chichen_filled as u64
+            | (g.accumulated_corn as u64) << 16
+            | (g.skulls_remaining as u64) << 24
+            | (opt(g.first_player_space.map(|w| w.0))) << 32
+            | (g.current.idx() as u64) << 40
+            | (g.first_player.idx() as u64) << 43
+            | (g.age as u64) << 46
+            | (g.day as u64) << 48
+            | (g.over as u64) << 56
+            // The decks are only ever drawn from, so `next` is the whole of
+            // their state that a search can move.
+            | (g.age1.next as u64) << 57,
+    ) ^ mix(0, g.age2.next as u64 | (g.monument_deck.next as u64) << 8)
 }
 
 fn add(acc: &mut [f32; N_PLAYERS], v: &[f32; N_PLAYERS]) {

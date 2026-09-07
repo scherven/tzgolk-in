@@ -65,7 +65,7 @@ use rand::Rng;
 use crate::eval::Ranking;
 use crate::ids::*;
 use crate::moves::{apply_move, sample_legal_move, Move};
-use crate::mcts::{Mcts, MctsConfig, Priors, SearchResult};
+use crate::mcts::{EdgeOrder, Mcts, MctsConfig, Priors, SearchResult};
 use crate::phase::{Evaluation, Evaluator, HeuristicEvaluator, Phase, Step};
 use crate::tree;
 use crate::state::{Deck, GameState, GearState, Player, TileStack, WorkerLoc, MAX_GEAR_SPACES, N_DISPLAY};
@@ -2287,7 +2287,19 @@ pub fn mcts_label(sims: u32, evaluator: &str, cfg: &MctsConfig) -> String {
         f(format!(":wa={}", cfg.widen_alpha));
     }
     if cfg.widen_cap != d.widen_cap {
-        f(format!(":wcap={}", cfg.widen_cap));
+        // Spelled back the way it is spelled in, because the alternative prints
+        // `:wcap=18446744073709551615` into every row of a results table.
+        f(if cfg.widen_cap == usize::MAX {
+            ":nocap".to_string()
+        } else {
+            format!(":wcap={}", cfg.widen_cap)
+        });
+    }
+    if cfg.ordering != d.ordering {
+        f(match cfg.ordering {
+            EdgeOrder::Prior => ":ord=prior".into(),
+            EdgeOrder::Gradient => ":ord=grad".to_string(),
+        });
     }
     if cfg.tree_reuse != d.tree_reuse {
         f(":noreuse".into());
@@ -2976,6 +2988,18 @@ fn parse_mcts_flags(flags: &str) -> Result<MctsConfig, String> {
             "wc" | "widenc" => cfg.widen_c = num("wc")?,
             "wa" | "widenalpha" => cfg.widen_alpha = num("wa")?,
             "wcap" => cfg.widen_cap = int("wcap")?.max(1),
+            // `wcap=0` is the readable spelling of "never truncate"; the
+            // `.max(1)` above would otherwise turn it into a one-edge node.
+            "nocap" => cfg.widen_cap = usize::MAX,
+            "ord" | "ordering" => {
+                cfg.ordering = match v {
+                    "prior" | "p" => EdgeOrder::Prior,
+                    "grad" | "gradient" | "g" => EdgeOrder::Gradient,
+                    other => {
+                        return Err(format!("mcts ord= is prior or grad, got {other:?}"))
+                    }
+                }
+            }
             "vl" => cfg.virtual_loss = int("vl")? as u32,
             "reuse" => cfg.tree_reuse = true,
             "noreuse" => cfg.tree_reuse = false,
@@ -3104,7 +3128,7 @@ impl AgentSpec {
                 let is_flags = |f: &str| {
                     !f.is_empty()
                         && f.split(',')
-                            .all(|x| x.contains('=') || matches!(x, "noreuse" | "reuse"))
+                            .all(|x| x.contains('=') || matches!(x, "noreuse" | "reuse" | "nocap"))
                 };
                 let (ev, flags) = match tail.rsplit_once(':') {
                     Some((e, f)) if is_flags(f) => (e, f),

@@ -84,7 +84,12 @@ fn run(label: &str, cfg: Config, ps: &[GameState]) {
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let which = argv.get(1).cloned().unwrap_or_else(|| "depth".into());
-    let ps = positions(6, 7);
+    // The wide `Take` nodes are late-game, high on a gear, with resources to
+    // spend: a 6-game sample every 7th turn tops out around 84 edges and never
+    // meets the cap at all. `SPROBE_GAMES`/`SPROBE_EVERY` are how a run gets to
+    // the thousand-edge nodes the cap was written for.
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let ps = positions(env("SPROBE_GAMES", 6) as u64, env("SPROBE_EVERY", 7));
     println!("{} positions from heuristic:16 games\n", ps.len());
     let base = || Config::default();
     match which.as_str() {
@@ -362,6 +367,114 @@ fn main() {
             }
             let full = t.elapsed().as_secs_f64();
             println!("walk + succ + heur   {n3} moves in {:.3}s = {:.2} us/move  (+{:.2} for heuristic)  [{acc}]", full, full * 1e6 / n3 as f64, (full - succ) * 1e6 / n3 as f64);
+        }
+        "trunc" => {
+            // What does the §2.6 cap actually delete? The cap sorts on the
+            // prior and truncates -- and under `HeuristicEvaluator` the prior
+            // is uniform, so the sort is a stable no-op and the survivors are
+            // whichever edges `Choice`'s derived `Ord` happened to emit first.
+            // This scores every edge of every wide node one ply deep, which is
+            // the best ground truth available without a net, and asks how often
+            // the winner is in the part that gets kept.
+            use tzolkin::mcts::Gradient;
+            use tzolkin::phase::Phase;
+            let max_edges: usize = argv.get(2).and_then(|v| v.parse().ok()).unwrap_or(32);
+            let caps: Vec<usize> = argv
+                .get(3)
+                .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+                .unwrap_or_else(|| vec![128, 512, usize::MAX]);
+
+            // One row per (ordering, cap): how often the one-ply best edge is
+            // deleted, and how much worse the best survivor is.
+            struct Row { excl_cap: usize, excl_act: usize, regret_cap: f64, regret_act: f64 }
+            let mut rows: Vec<(String, usize, Row)> = Vec::new();
+            for ord in ["generation", "gradient"] {
+                for &c in &caps {
+                    rows.push((ord.into(), c, Row { excl_cap: 0, excl_act: 0, regret_cap: 0.0, regret_act: 0.0 }));
+                }
+            }
+
+            let (mut wide, mut nodes, mut wide_mass, mut mass) = (0usize, 0usize, 0u64, 0u64);
+            let mut widths: Vec<usize> = Vec::new();
+            let (mut t_grad, mut t_oneply, mut n_edges) = (0f64, 0f64, 0u64);
+            let mut worst = 0usize;
+
+            for g in ps.iter() {
+                for &p in PlayerId::ALL.iter() {
+                    let workers: Vec<_> = g.on_board(p).collect();
+                    for w in workers {
+                        let phase = Phase::Take { worker: w };
+                        let steps = tzolkin::tree::legal_steps(g, phase, p, 0);
+                        if steps.len() < 2 { continue; }
+                        nodes += 1;
+                        mass += steps.len() as u64;
+                        if steps.len() <= max_edges { continue; }
+                        wide += 1;
+                        wide_mass += steps.len() as u64;
+                        widths.push(steps.len());
+                        worst = worst.max(steps.len());
+
+                        // Ground truth: the one-ply score of every edge.
+                        let t = Instant::now();
+                        let one: Vec<f32> = steps.iter().map(|st| {
+                            let mut next = *g;
+                            let _ = tzolkin::tree::apply_step(&mut next, phase, p, 0, st);
+                            tzolkin::eval::heuristic(&next, p)
+                        }).collect();
+                        t_oneply += t.elapsed().as_secs_f64();
+
+                        let t = Instant::now();
+                        let grad = Gradient::new(g, p);
+                        let key: Vec<f32> = steps.iter().map(|st| grad.step(st)).collect();
+                        t_grad += t.elapsed().as_secs_f64();
+                        n_edges += steps.len() as u64;
+
+                        let best = one.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+                        let by_gradient = {
+                            let mut o: Vec<u32> = (0..steps.len() as u32).collect();
+                            o.sort_unstable_by(|&a, &b| key[b as usize].total_cmp(&key[a as usize]).then(a.cmp(&b)));
+                            o
+                        };
+                        let by_generation: Vec<u32> = (0..steps.len() as u32).collect();
+
+                        for (ord, cap, row) in rows.iter_mut() {
+                            let order = if ord == "gradient" { &by_gradient } else { &by_generation };
+                            let kept = order.len().min((*cap).max(max_edges));
+                            // Two windows matter and they are different
+                            // questions. `cap` is what survives at all --
+                            // deleted edges can never be reopened. `max_edges`
+                            // is what `active` opens immediately; the rest wait
+                            // on widening and are only delayed.
+                            let top = |n: usize| order[..n.min(order.len())]
+                                .iter().map(|&i| one[i as usize])
+                                .fold(f32::NEG_INFINITY, f32::max);
+                            let bc = top(kept);
+                            let ba = top(max_edges);
+                            if bc < best { row.excl_cap += 1; }
+                            if ba < best { row.excl_act += 1; }
+                            row.regret_cap += (best - bc) as f64;
+                            row.regret_act += (best - ba) as f64;
+                        }
+                    }
+                }
+            }
+            widths.sort_unstable();
+            let q = |f: f64| if widths.is_empty() { 0 } else { widths[((widths.len()-1) as f64 * f) as usize] };
+            println!("{} Take nodes, {wide} wider than max_edges={max_edges} ({:.1}%)", nodes, 100.0 * wide as f64 / nodes.max(1) as f64);
+            println!("wide nodes hold {}/{} edges = {:.1}% of all edge mass; width p50 {} p90 {} max {}",
+                     wide_mass, mass, 100.0 * wide_mass as f64 / mass.max(1) as f64, q(0.5), q(0.9), worst);
+            println!("per edge: gradient {:.1} ns   one-ply {:.1} ns   ({:.1}x)",
+                     t_grad * 1e9 / n_edges as f64, t_oneply * 1e9 / n_edges as f64, t_oneply / t_grad.max(1e-12));
+            println!();
+            println!("{:<11} {:>8} | {:>16} {:>10} | {:>16} {:>10}", "order", "cap", "best deleted", "regret", "best not in top32", "regret");
+            for (ord, cap, r) in &rows {
+                let capname = if *cap == usize::MAX { "none".to_string() } else { cap.to_string() };
+                println!("{:<11} {:>8} | {:>7} ({:>5.1}%) {:>10.3} | {:>7} ({:>5.1}%) {:>10.3}",
+                    ord, capname,
+                    r.excl_cap, 100.0 * r.excl_cap as f64 / wide.max(1) as f64, r.regret_cap / wide.max(1) as f64,
+                    r.excl_act, 100.0 * r.excl_act as f64 / wide.max(1) as f64, r.regret_act / wide.max(1) as f64);
+            }
         }
         other => println!("unknown mode {other}"),
     }
