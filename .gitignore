@@ -1,2 +1,4 @@
 *.prof
 src/tzgolkin
+train/.venv
+.venv

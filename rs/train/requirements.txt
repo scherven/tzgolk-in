@@ -1,0 +1,13 @@
+# CPU-only. LEARNING.md §5.1: a 4.2M-parameter MLP at batch 1024 is ~26 GFLOP
+# per step, under 100 ms on this machine's CPU, and §5.2 documents small nets
+# that silently fail to learn on MPS. There is nothing to buy with a GPU here.
+#
+#   python3 -m venv train/.venv && source train/.venv/bin/activate
+#   pip install -r train/requirements.txt
+#
+# On the Windows/GPU machine the same install works; pass --device cuda if you
+# want it, but check the loss curve against CPU for the first few hundred steps.
+
+numpy>=1.24
+torch>=2.2
+safetensors>=0.4     # the weight container LEARNING.md §5.1 settles on
