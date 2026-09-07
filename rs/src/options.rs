@@ -429,10 +429,55 @@ pub fn corn_exchange(g: &GameState, p: PlayerId) -> Vec<Choice> {
 }
 
 // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
-pub static PRUNE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+//
+// Three levels rather than two, so one run can price each generation of rules
+// against the *same* positions: 0 generates everything, 1 is the corn-axis
+// dominance that was already here, 2 adds this pass's rules. Phase 1 of
+// `movestats` walks its games at level 0, so the position set does not move
+// when the rules do.
+pub static PRUNE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+// SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+pub fn prune_level() -> u8 {
+    PRUNE.load(std::sync::atomic::Ordering::Relaxed)
+}
 // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
 pub fn pruning_on() -> bool {
-    PRUNE.load(std::sync::atomic::Ordering::Relaxed)
+    prune_level() >= 1
+}
+// SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+pub fn wide_pruning_on() -> bool {
+    prune_level() >= 2
+}
+
+/// Drop every choice that lands in a position an earlier one already reaches.
+///
+/// Ground truth rather than a rule about effect lists: two choices that leave
+/// `g` in the same state are the same move for every purpose downstream, and
+/// all that is lost is one of two spellings in the move log.
+///
+/// The expensive kind of redundancy this exists for is `tikal::build_two`.
+/// Building A then B and B then A are the same pair of cards, and unless the
+/// architecture discount is in play they cost the same too, so an unbuilder's
+/// double build is generated exactly twice -- measured at 6% of every option
+/// list on Tikal 4, 5, 6 and 7, and again inside every mirror that reaches
+/// them. `dedup` cannot see it because the two effect lists are permutations,
+/// and a multiset key would not be sound: `TempleStep` clamps, so a choice
+/// carrying both a step up and a step down on one temple depends on their
+/// order, and building #30's mirror can reach Palenque's corn dig.
+///
+/// A `GameState` is `Copy`, so the probe is a memcpy; `FxHashSet` for the same
+/// reason `mcts` uses it -- 320 bytes of key is where SipHash starts to cost
+/// more than the work it protects.
+pub fn dedup_by_position(g: &GameState, p: PlayerId, v: Vec<Choice>) -> Vec<Choice> {
+    let mut seen: rustc_hash::FxHashSet<GameState> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(v.len(), Default::default());
+    v.into_iter()
+        .filter(|c| {
+            let mut probe = *g;
+            c.apply(&mut probe, p);
+            seen.insert(probe)
+        })
+        .collect()
 }
 
 /// Sort and deduplicate. Generation is naturally redundant -- several routes
@@ -444,32 +489,47 @@ pub fn dedup(mut v: Vec<Choice>) -> Vec<Choice> {
     v
 }
 
-/// Sort, deduplicate, and drop every choice another choice buys more cheaply.
+/// Sort, deduplicate, and drop every choice another choice strictly beats.
 ///
-/// Two choices that agree on every non-corn effect, in the same order, and
-/// differ only in how much corn they move are not two decisions: whoever takes
-/// the dearer one arrives at exactly the position the cheaper one reaches, with
-/// less corn in hand. Nothing in the game pays a player for holding *less*
-/// corn -- the one rule that reads a corn ceiling is begging, which requires
-/// fewer than three and hands back three plus a step *down* a temple, so it is
-/// a worse position on both axes than simply keeping the corn. The dearer
-/// choice is therefore dominated, not merely unattractive.
+/// Two choices that agree on every effect *except* how much corn, how many
+/// blocks and how many points they move are not two decisions: whoever takes
+/// the one that moves less of all five arrives at exactly the position the
+/// other reaches, poorer. Nothing in the game pays a player for holding *less*
+/// of any of them -- blocks and skulls have no upkeep and no hand limit, points
+/// are pure victory points, and the one rule that reads a corn *ceiling* is
+/// begging, which requires fewer than three, sets the count to exactly three
+/// and charges a step *down* a temple, so holding three or more is better on
+/// both axes than being allowed to beg. The poorer choice is therefore
+/// dominated, not merely unattractive.
 ///
 /// This is the same argument `choices_for_worker` already made for "paying corn
-/// to reach a space that does nothing", generalised from the empty choice to
-/// every choice. It matters because the board offers the *same action at two
-/// prices* all over the place once a worker is high on a gear: Uxmal's mirror
-/// sells any lower action for one corn while stepping down to that action
-/// costs one corn per space, and the free-choice spaces at the top of every
-/// gear repeat the whole gear for nothing.
+/// to reach a space that does nothing", widened twice: first from the empty
+/// choice to every choice, then from corn alone to everything liquid. Both
+/// widenings pay off because the board offers the *same action at two prices*
+/// all over the place once a worker is high on a gear -- Uxmal's mirror sells
+/// any lower action for one corn while stepping down to that action costs one
+/// corn per space -- and because the free-choice spaces stack whole gears on
+/// top of each other, where a strictly fatter version of an action is usually
+/// sitting a few spaces up. Yaxchilan 5 hands out the gold of space 3 and the
+/// stone of space 2 together, so from Yaxchilan 6 those two spaces are dead
+/// letters; and a worker on Uxmal 6 can mirror Palenque 1 for a net two corn,
+/// which beats selling a block for two corn at Uxmal 2.
 ///
-/// Corn deltas commute with everything else in an affordable choice -- no
-/// generated effect reads the corn count at execution time, and generation
-/// never emits a sequence whose running corn balance dips below zero -- so
-/// comparing the net is comparing the position reached. The non-corn effects
-/// are keyed *in order* rather than as a multiset, which leaves two spellings
-/// of the same bundle standing: `Effect::TempleStep` clamps, so re-ordering is
-/// not free in general and is not worth the proof here.
+/// The wealth deltas commute with everything else in an affordable choice -- no
+/// generated effect reads corn, blocks or points at execution time, `SetCorn`
+/// is never generated (only begging emits it, and begging lives on the `Move`),
+/// and generation never emits a sequence whose running balance dips below zero
+/// -- `generated_moves_are_legal` runs `check_move`, and so `Choice::affordable`,
+/// over every move of 40 seeded games -- so `apply`'s clamp never fires on a
+/// generated choice and the net *is* the position reached.
+/// Skulls are deliberately **not** a wealth axis: `take_skulls` caps against a
+/// shared bank, so the net does not determine the outcome and a bigger gain
+/// also changes `skulls_remaining`, which is not this player's to trade away.
+/// They stay in the key and must match exactly.
+///
+/// The key is compared *in order* rather than as a multiset, which leaves two
+/// spellings of the same bundle standing: `TempleStep` clamps, so re-ordering
+/// is not free in general and is not worth the proof here.
 ///
 /// The empty choice is exempt. "Pick the worker up and do nothing" is one of
 /// the three options the rules name, not a degenerate corn gain, and every
@@ -481,17 +541,21 @@ pub fn dominated_dedup(mut v: Vec<Choice>) -> Vec<Choice> {
     if !pruning_on() {
         return dedup(v);
     }
-    // Order by "what it does, ignoring the price", then by price. That puts
-    // every rival spelling of one outcome in a run with the cheapest first, so
-    // the survivors are the heads of the runs. The key is compared as an
-    // iterator rather than materialised, because this runs at every node of the
-    // retrieval walk and a per-choice allocation there is not free.
-    let same_action = |a: &Choice, b: &Choice| {
+    // Order by "what it does, ignoring the price", then by total wealth moved.
+    // A dominator moves at least as much on every axis, so it also moves at
+    // least as much in total: sorting by the sum descending puts every
+    // dominator ahead of everything it beats, which turns the Pareto front into
+    // one forward pass. The key is compared as an iterator rather than
+    // materialised, because this runs at every node of the retrieval walk and a
+    // per-choice allocation there is not free.
+    // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+    let wide = wide_pruning_on();
+    let group = |a: &Choice, b: &Choice| {
         a.is_skip() == b.is_skip()
             && a.0
                 .iter()
-                .filter(|e| !matches!(e, Effect::Corn(_)))
-                .cmp(b.0.iter().filter(|e| !matches!(e, Effect::Corn(_))))
+                .filter(|e| !is_wealth(e, wide))
+                .cmp(b.0.iter().filter(|e| !is_wealth(e, wide)))
                 .is_eq()
     };
     v.sort_unstable_by(|a, b| {
@@ -499,17 +563,182 @@ pub fn dominated_dedup(mut v: Vec<Choice>) -> Vec<Choice> {
             .cmp(&b.is_skip())
             .then_with(|| {
                 a.0.iter()
-                    .filter(|e| !matches!(e, Effect::Corn(_)))
-                    .cmp(b.0.iter().filter(|e| !matches!(e, Effect::Corn(_))))
+                    .filter(|e| !is_wealth(e, wide))
+                    .cmp(b.0.iter().filter(|e| !is_wealth(e, wide)))
             })
-            .then_with(|| b.net_corn().cmp(&a.net_corn()))
+            .then_with(|| {
+                wealth(b, wide)
+                    .iter()
+                    .sum::<i32>()
+                    .cmp(&wealth(a, wide).iter().sum::<i32>())
+            })
             .then_with(|| a.cmp(b))
     });
-    v.dedup_by(|a, b| same_action(a, b));
+
+    // Compact in place: `keep` is the write cursor and never runs ahead of the
+    // read cursor, so the survivors of the group being scanned are always the
+    // slice this compares against.
+    let mut front: Vec<[i32; N_WEALTH]> = Vec::new();
+    let mut keep = 0usize;
+    let mut i = 0usize;
+    while i < v.len() {
+        let mut j = i + 1;
+        while j < v.len() && group(&v[i], &v[j]) {
+            j += 1;
+        }
+        front.clear();
+        for r in i..j {
+            let w = wealth(&v[r], wide);
+            // Equal vectors count as dominated: identical key and identical net
+            // means an identical position, so the first spelling stands for all
+            // of them. That collapses pairs plain `dedup` misses, such as the
+            // mirror's `-1 corn, +3 corn` against a bare `+2 corn`.
+            if front.iter().any(|f| (0..N_WEALTH).all(|k| f[k] >= w[k])) {
+                continue;
+            }
+            front.push(w);
+            v.swap(keep, r);
+            keep += 1;
+        }
+        i = j;
+    }
+    v.truncate(keep);
     // Back into `Choice` order, which is what every other generator returns and
     // what makes the traversal order of `legal_moves` stable.
     v.sort_unstable();
     v
+}
+
+/// Corn, the three block types, and points.
+const N_WEALTH: usize = 5;
+
+/// Whether an effect only moves liquid wealth, and so is priced rather than
+/// structural. Skulls are excluded on purpose -- see `dominated_dedup`.
+///
+/// SCRATCH: `wide` is the measurement switch. False keeps corn as the only
+/// priced axis, which is what the rule was before this pass; delete the
+/// parameter with src/bin/movestats.rs.
+#[inline]
+fn is_wealth(e: &Effect, wide: bool) -> bool {
+    match e {
+        Effect::Corn(_) => true,
+        Effect::Points(_) => wide,
+        Effect::Res(r, _) => wide && *r != Resource::Skull,
+        _ => false,
+    }
+}
+
+/// Net corn, wood, stone, gold and points a choice moves.
+#[inline]
+fn wealth(c: &Choice, wide: bool) -> [i32; N_WEALTH] {
+    let mut w = [0i32; N_WEALTH];
+    for e in &c.0 {
+        match *e {
+            Effect::Corn(n) => w[0] += n as i32,
+            Effect::Res(r, n) if wide && r != Resource::Skull => w[1 + r.idx()] += n as i32,
+            Effect::Points(n) if wide => w[4] += n as i32,
+            _ => {}
+        }
+    }
+    w
+}
+
+/// A linear price on the resolved effect vocabulary: the prior a `Choice` can
+/// be given **without applying it**.
+///
+/// # Why this is enough
+///
+/// `effect.rs` resolves every value at generation time -- `Effect::Corn(7)` is
+/// seven corn, not "however much the agriculture level implies" -- so a
+/// `Choice` is already a summary of what it does. Nothing further has to travel
+/// alongside it. Measured over 6,238 `Take` nodes of >= 8 edges (353,429 edges,
+/// 24 seeded games), pricing a choice this way costs **16.0 ns an edge against
+/// 123.0 ns** for the `apply_step` plus `eval::heuristic` that
+/// `mcts::Priors::OnePly` pays -- 7.7x, and 6.4x at the nodes wider than
+/// `widen_cap`, where over half the edge mass sits and the expansion cost
+/// actually lives.
+///
+/// The five-axis net that `dominated_dedup` already computes for every choice
+/// is *not* enough on its own, which is the part that had to be measured rather
+/// than assumed: pricing only corn, blocks and points leaves 0.247 heuristic
+/// points of regret in the first `max_edges` against 0.057 for the whole
+/// vocabulary, and drops the best edge at a truncated node three times as
+/// often. The structural effects -- a temple step, a research advance, a card --
+/// carry real ordering information, and they are exactly what the wealth vector
+/// throws away in order to be a sound dominance key.
+///
+/// # Why the prices are the caller's
+///
+/// A fixed table would be a second opinion about the value function. The
+/// numbers that worked are `eval::heuristic`'s own local gradient: probe `+1`
+/// of each axis against the position once, and price a choice as the dot
+/// product. Fifteen `heuristic` calls, 1.8 us, paid once per *turn* and reused
+/// at every `Take` node of it -- 0.71 us amortised per node. Rebuilding the
+/// gradient at each node is 4x dearer and buys 0.057 -> 0.035 points of regret,
+/// so the turn-level probe is the one to build. Ordering is sound and filtering
+/// is not, so a stale gradient costs simulations and never legality.
+///
+/// Deliberately not priced: `Effect::Res(Skull, _)` is a normal axis here even
+/// though `dominated_dedup` excludes it, because ordering is not dominance --
+/// a skull genuinely is worth something, it just is not this player's to trade
+/// away.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EffectPrice {
+    pub corn: f32,
+    /// Wood, stone, gold, skull, in `Resource::ALL` order.
+    pub res: [f32; 4],
+    pub points: f32,
+    /// Brown, yellow, green, in `Temple::ALL` order.
+    pub temple: [f32; 3],
+    pub science: [f32; 4],
+    pub unlock_worker: f32,
+    pub free_worker: f32,
+    pub worker_discount: f32,
+    /// The card- and space-naming effects. Probing each distinct one against
+    /// the state is worth almost nothing -- a per-card probe moves the regret
+    /// in the first `max_edges` from 0.057 to 0.052 points and costs 26% more
+    /// per edge -- so one constant apiece is the shape that earns its keep.
+    pub palenque_tile: f32,
+    pub burn_wood: f32,
+    pub fill_chichen: f32,
+    pub build: f32,
+    pub monument: f32,
+}
+
+impl EffectPrice {
+    /// Exhaustive with no wildcard arm, for the same reason `Effect::tag` is:
+    /// a new effect must break the build here rather than silently price at
+    /// zero and drop out of every prior in the search.
+    #[inline]
+    pub fn of(&self, e: Effect) -> f32 {
+        match e {
+            Effect::Corn(n) => n as f32 * self.corn,
+            // Never generated -- only begging emits it, and begging lives on
+            // the `Move` rather than in a `Choice` -- so the delta reading is
+            // unreachable rather than wrong.
+            Effect::SetCorn(n) => n as f32 * self.corn,
+            Effect::Res(r, n) => n as f32 * self.res[r.idx()],
+            Effect::Points(n) => n as f32 * self.points,
+            Effect::TempleStep(t, n) => n as f32 * self.temple[t.idx()],
+            Effect::AdvanceResearch(s) => self.science[s.idx()],
+            Effect::UnlockWorker => self.unlock_worker,
+            Effect::FreeWorker(n) => n as f32 * self.free_worker,
+            Effect::WorkerDiscount(n) => n as f32 * self.worker_discount,
+            Effect::TakePalenqueTile(..) => self.palenque_tile,
+            Effect::BurnPalenqueWood(_) => self.burn_wood,
+            Effect::FillChichen(_) => self.fill_chichen,
+            Effect::Build(_) => self.build,
+            Effect::TakeMonument(_) => self.monument,
+        }
+    }
+
+    /// One choice, priced. Linear, so it misses every interaction between the
+    /// effects of one choice; that is what makes it a hint and not an
+    /// evaluation.
+    #[inline]
+    pub fn choice(&self, c: &Choice) -> f32 {
+        c.0.iter().map(|&e| self.of(e)).sum()
+    }
 }
 
 /// Monument definitions are static; this is here so callers don't reach past

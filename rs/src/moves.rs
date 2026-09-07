@@ -136,6 +136,52 @@ impl std::fmt::Display for Move {
     }
 }
 
+/// A traversal-order hint.
+///
+/// Ordering is sound where filtering is not. A plan-directed *filter* that drops
+/// brown-temple options because the plan says green can drop the best move; a
+/// plan-directed *order* that yields green options first loses nothing, because
+/// a caller that wants everything still gets everything and a caller that stops
+/// early stops by choice. This type has no way to express a filter -- it returns
+/// a key, not a verdict -- which is the whole reason it is a key.
+///
+/// Keys sort descending, so higher is tried first, and every sort taken against
+/// them is stable, so an all-zero hint reproduces generation order exactly. The
+/// methods are handed `&Choice` and `Placement` rather than a state, because
+/// they run once per option on lists of up to 350 at every node of the retrieval
+/// walk: a hint that probes the state would cost more than the walk it steers.
+pub trait Priority {
+    /// Whether this hint ever reorders anything. `false` turns every sort in
+    /// this module into a compile-time no-op, which is what makes the ordered
+    /// walk free for a caller that has no plan.
+    const ORDERS: bool = true;
+
+    fn placement(&self, _spot: Placement) -> i32 {
+        0
+    }
+    /// Which worker to pick up first. `(gear, pos)` is where it stands.
+    fn worker(&self, _gear: Gear, _pos: Pos) -> i32 {
+        0
+    }
+    /// What that worker should do. `(gear, pos)` is the *worker's* space, not
+    /// the space the choice was generated at -- `choices_for_worker` fuses the
+    /// pay-down, so a choice does not have one.
+    fn choice(&self, _gear: Gear, _pos: Pos, _c: &Choice) -> i32 {
+        0
+    }
+}
+
+/// The order the generator has always walked in.
+///
+/// `ORDERS = false` is not a hint that happens to be flat: it is the statement
+/// that makes `sort_by_key` disappear from the ordinary path entirely, so
+/// `legal_moves` and every existing caller are the same machine code they were.
+pub struct NoOrder;
+
+impl Priority for NoOrder {
+    const ORDERS: bool = false;
+}
+
 /// Visit every legal move for `p` without materialising the list.
 ///
 /// This is the primitive; `legal_moves` collects from it. A search node with a
@@ -146,7 +192,29 @@ impl std::fmt::Display for Move {
 /// The callback returns `ControlFlow::Break` to stop early. Traversal order is
 /// deterministic: the memo decides *whether* a move is emitted, never in what
 /// order, so a capped walk returns the same moves every run.
-pub fn visit_legal_moves<F>(g: &GameState, p: PlayerId, mut f: F) -> ControlFlow<()>
+pub fn visit_legal_moves<F>(g: &GameState, p: PlayerId, f: F) -> ControlFlow<()>
+where
+    F: FnMut(&Move) -> ControlFlow<()>,
+{
+    visit_legal_moves_by(g, p, &NoOrder, f)
+}
+
+/// [`visit_legal_moves`] under a traversal-order hint.
+///
+/// The *set* of moves is not quite invariant under the hint and the set of
+/// positions reached is: `retrieve_rec`'s memo emits whichever ordering of a
+/// commuting retrieval it reaches first, so reordering changes which spelling
+/// stands for a reached state. It cannot change which states are reachable --
+/// that is a depth-first walk with a visited set over a DAG, and its visited
+/// set is the reachable set whatever order the edges come in. So this is safe
+/// for a capped consumer and for `tests/tree.rs`'s state-set equivalence, and
+/// `legal_moves` keeps [`NoOrder`] so its output is bit-identical.
+pub fn visit_legal_moves_by<O: Priority, F>(
+    g: &GameState,
+    p: PlayerId,
+    order: &O,
+    mut f: F,
+) -> ControlFlow<()>
 where
     F: FnMut(&Move) -> ControlFlow<()>,
 {
@@ -159,7 +227,7 @@ where
             any = true;
             f(m)
         };
-        visit_normal_moves(g, p, &mut wrapped)?;
+        visit_normal_moves_of(g, p, Kinds::All, order, &mut wrapped)?;
     }
     if !any {
         for m in pity_moves(g, p) {
@@ -192,7 +260,22 @@ pub fn visit_moves_of<F>(g: &GameState, p: PlayerId, kinds: Kinds, mut f: F) -> 
 where
     F: FnMut(&Move) -> ControlFlow<()>,
 {
-    visit_normal_moves_of(g, p, kinds, &mut f)
+    visit_normal_moves_of(g, p, kinds, &NoOrder, &mut f)
+}
+
+/// [`visit_moves_of`] under a traversal-order hint. See [`visit_legal_moves_by`]
+/// for what the hint may and may not change.
+pub fn visit_moves_of_by<O: Priority, F>(
+    g: &GameState,
+    p: PlayerId,
+    kinds: Kinds,
+    order: &O,
+    mut f: F,
+) -> ControlFlow<()>
+where
+    F: FnMut(&Move) -> ControlFlow<()>,
+{
+    visit_normal_moves_of(g, p, kinds, order, &mut f)
 }
 
 /// Everything except the pity fallback. Separate so that the pity rule can ask
@@ -201,13 +284,14 @@ fn visit_normal_moves<F>(g: &GameState, p: PlayerId, f: &mut F) -> ControlFlow<(
 where
     F: FnMut(&Move) -> ControlFlow<()>,
 {
-    visit_normal_moves_of(g, p, Kinds::All, f)
+    visit_normal_moves_of(g, p, Kinds::All, &NoOrder, f)
 }
 
-fn visit_normal_moves_of<F>(
+fn visit_normal_moves_of<O: Priority, F>(
     g: &GameState,
     p: PlayerId,
     kinds: Kinds,
+    order: &O,
     f: &mut F,
 ) -> ControlFlow<()>
 where
@@ -215,6 +299,7 @@ where
 {
     let mut v = Walk {
         f,
+        order,
         reached: HashSet::new(),
     };
 
@@ -269,12 +354,13 @@ pub fn pity_moves(g: &GameState, p: PlayerId) -> Vec<Move> {
         .collect()
 }
 
-struct Walk<'a, F> {
+struct Walk<'a, F, O> {
     f: &'a mut F,
+    order: &'a O,
     reached: HashSet<GameState>,
 }
 
-impl<F> Walk<'_, F>
+impl<F, O> Walk<'_, F, O>
 where
     F: FnMut(&Move) -> ControlFlow<()>,
 {
@@ -347,12 +433,12 @@ pub fn beg_options(g: &GameState, p: PlayerId) -> Vec<Option<Temple>> {
 
 // ---- placement ---------------------------------------------------------
 
-fn visit_placements<F>(
+fn visit_placements<F, O: Priority>(
     g: &GameState,
     p: PlayerId,
     budget: u8,
     beg: Option<Temple>,
-    v: &mut Walk<F>,
+    v: &mut Walk<F, O>,
 ) -> ControlFlow<()>
 where
     F: FnMut(&Move) -> ControlFlow<()>,
@@ -370,7 +456,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn place_rec<F>(
+fn place_rec<F, O: Priority>(
     g: &mut GameState,
     p: PlayerId,
     avail: &[WorkerId],
@@ -379,7 +465,7 @@ fn place_rec<F>(
     budget: u8,
     beg: Option<Temple>,
     cur: &mut Placements,
-    v: &mut Walk<F>,
+    v: &mut Walk<F, O>,
 ) -> ControlFlow<()>
 where
     F: FnMut(&Move) -> ControlFlow<()>,
@@ -404,6 +490,11 @@ where
     }
     if g.first_player_space.is_none() {
         spots.push(Placement::FirstPlayer);
+    }
+    // Six spots at most, and a stable sort, so a flat hint leaves gear order
+    // exactly as `Gear::ALL` built it.
+    if O::ORDERS {
+        spots.sort_by_key(|&s| std::cmp::Reverse(v.order.placement(s)));
     }
 
     for spot in spots {
@@ -447,6 +538,23 @@ where
 /// widens) -- so a list generated after paying a fee is a subset of the same
 /// list generated without paying it.
 pub fn choices_for_worker(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> Vec<Choice> {
+    choices_for_worker_by(g, p, gear, pos, &NoOrder)
+}
+
+/// [`choices_for_worker`] with the returned list sorted by a hint.
+///
+/// The sort is the last thing that happens, after `dominated_dedup`, and it is
+/// stable, so it permutes the canonical list and never changes its membership.
+/// This is the one place ordering costs anything measurable -- it runs at every
+/// node of the retrieval walk on a list whose p99 is 157 -- which is why the
+/// key is a plain `i32` off the effect vector and not a state probe.
+pub fn choices_for_worker_by<O: Priority>(
+    g: &GameState,
+    p: PlayerId,
+    gear: Gear,
+    pos: Pos,
+    order: &O,
+) -> Vec<Choice> {
     let corn = g.players[p.idx()].corn;
     // "Do nothing (except pick up the worker)" is always one of the three
     // options the rules give for a retrieved worker. Go only offered it when a
@@ -492,21 +600,36 @@ pub fn choices_for_worker(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> V
     // action is often reachable at two fees (Uxmal's mirror sells any lower
     // action for one corn, however many spaces down it sits), and the dearer
     // route is dominated. See `options::dominated_dedup`.
-    crate::options::dominated_dedup(out)
+    let mut out = crate::options::dominated_dedup(out);
+    if O::ORDERS {
+        out.sort_by_key(|c| std::cmp::Reverse(order.choice(gear, pos, c)));
+    }
+    out
 }
 
-fn visit_retrievals<F>(
+fn visit_retrievals<F, O: Priority>(
     g: &GameState,
     p: PlayerId,
     beg: Option<Temple>,
-    v: &mut Walk<F>,
+    v: &mut Walk<F, O>,
 ) -> ControlFlow<()>
 where
     F: FnMut(&Move) -> ControlFlow<()>,
 {
-    let on_board: SmallVec<[WorkerId; 6]> = g.on_board(p).collect();
+    let mut on_board: SmallVec<[WorkerId; 6]> = g.on_board(p).collect();
     if on_board.is_empty() {
         return ControlFlow::Continue(());
+    }
+    // Sorted once, not per node: retrieving one worker never moves another, so
+    // every worker's `(gear, pos)` -- and therefore its key -- is invariant for
+    // the whole walk.
+    if O::ORDERS {
+        on_board.sort_by_key(|&w| {
+            std::cmp::Reverse(match g.loc(w).on_board() {
+                Some((gear, pos)) => v.order.worker(gear, pos),
+                None => i32::MIN,
+            })
+        });
     }
     let mut probe = *g;
     let mut cur = Retrievals::new();
@@ -524,13 +647,13 @@ where
 /// Cost is therefore proportional to the number of distinct reachable positions
 /// rather than to the number of orderings, which is only possible because the
 /// state is `Copy + Hash`.
-fn retrieve_rec<F>(
+fn retrieve_rec<F, O: Priority>(
     g: &mut GameState,
     p: PlayerId,
     board: &[WorkerId],
     cur: &mut Retrievals,
     beg: Option<Temple>,
-    v: &mut Walk<F>,
+    v: &mut Walk<F, O>,
 ) -> ControlFlow<()>
 where
     F: FnMut(&Move) -> ControlFlow<()>,
@@ -550,7 +673,7 @@ where
         let Some((gear, pos)) = g.loc(w).on_board() else {
             continue;
         };
-        for choice in choices_for_worker(g, p, gear, pos) {
+        for choice in choices_for_worker_by(g, p, gear, pos, v.order) {
             let saved = *g;
             choice.apply(g, p);
             g.retrieve_worker(w);

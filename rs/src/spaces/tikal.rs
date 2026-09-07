@@ -42,6 +42,7 @@ pub fn at_d(g: &GameState, p: PlayerId, pos: Pos, depth: u8) -> Vec<Choice> {
 /// probe is a memcpy of a `Copy` struct.
 fn build_two(g: &GameState, p: PlayerId, depth: u8) -> Vec<Choice> {
     let mut out = Vec::new();
+    let mut pairs = Vec::new();
 
     for first in building_choices(g, p, None, true, depth) {
         out.push(first.clone());
@@ -56,10 +57,22 @@ fn build_two(g: &GameState, p: PlayerId, depth: u8) -> Vec<Choice> {
 
         // The second building gets no architecture bonus.
         for second in building_choices(&probe, p, built, false, 0) {
-            out.push(first.clone().chain(&second));
+            pairs.push(first.clone().chain(&second));
         }
     }
 
+    // Both orders of every pair are enumerated above, and the two orders reach
+    // the same position whenever the architecture discount is not in play --
+    // which is most of the game. See `options::dedup_by_position` for why the
+    // states are compared rather than the effect lists. Only the pairs are
+    // walked: a single build already comes deduplicated out of
+    // `building_choices`, and a pair can never collide with a single or with a
+    // monument, because they disagree on the cards-owned bitsets.
+    // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+    if crate::options::wide_pruning_on() {
+        pairs = crate::options::dedup_by_position(g, p, pairs);
+    }
+    out.append(&mut pairs);
     out.extend(monument_choices(g, p));
     out
 }
