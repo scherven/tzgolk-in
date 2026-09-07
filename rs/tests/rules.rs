@@ -1270,6 +1270,114 @@ fn ridge(x: &[Vec<f64>], y: &[f64], lambda: f64) -> Vec<f64> {
     (0..k).map(|i| a[i][k]).collect()
 }
 
+/// Invert a small square matrix by Gauss-Jordan with partial pivoting.
+#[cfg(test)]
+fn invert(a0: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let k = a0.len();
+    let mut a: Vec<Vec<f64>> = (0..k)
+        .map(|i| a0[i].iter().copied().chain((0..k).map(|j| f64::from(i == j))).collect())
+        .collect();
+    for i in 0..k {
+        let piv = (i..k).max_by(|&r, &s| a[r][i].abs().total_cmp(&a[s][i].abs())).unwrap();
+        a.swap(i, piv);
+        if a[i][i].abs() < 1e-12 {
+            continue;
+        }
+        let d = a[i][i];
+        for j in 0..2 * k {
+            a[i][j] /= d;
+        }
+        for r in 0..k {
+            if r == i || a[r][i] == 0.0 {
+                continue;
+            }
+            let f = a[r][i];
+            for j in 0..2 * k {
+                a[r][j] -= f * a[i][j];
+            }
+        }
+    }
+    a.into_iter().map(|r| r[k..].to_vec()).collect()
+}
+
+/// [`ridge`], and a standard error for every coefficient.
+///
+/// The iid standard error is meaningless on this data and reading these
+/// coefficients without one is how a fit of noise gets promoted to a finding.
+/// All four seats of a position share one regressor draw, and every position in
+/// a game shares one *outcome vector* — 100-odd rows per game whose y is four
+/// numbers. So errors are clustered on the game, which is the same argument
+/// `bin/arena` makes for treating a rotation block rather than a game as its
+/// independent unit. The clustered interval here comes out 5-15x the iid one.
+///
+/// Sandwich form: `A^-1 (sum_g Xg'eg eg'Xg) A^-1` with `A = X'X + lambda n I`,
+/// scaled by `G/(G-1)`. `cl` names each row's game and need not be sorted.
+#[cfg(test)]
+fn ridge_se(x: &[Vec<f64>], y: &[f64], cl: &[u64], lambda: f64) -> (Vec<f64>, Vec<f64>) {
+    let k = x[0].len();
+    let mut a = vec![vec![0.0f64; k]; k];
+    let mut xty = vec![0.0f64; k];
+    for (row, &yi) in x.iter().zip(y) {
+        for i in 0..k {
+            for j in 0..k {
+                a[i][j] += row[i] * row[j];
+            }
+            xty[i] += row[i] * yi;
+        }
+    }
+    for i in 1..k {
+        a[i][i] += lambda * x.len() as f64;
+    }
+    let ainv = invert(&a);
+    let beta: Vec<f64> =
+        (0..k).map(|i| (0..k).map(|j| ainv[i][j] * xty[j]).sum()).collect();
+
+    let mut order: Vec<usize> = (0..x.len()).collect();
+    order.sort_unstable_by_key(|&i| cl[i]);
+    let mut meat = vec![vec![0.0f64; k]; k];
+    let mut score = vec![0.0f64; k];
+    let mut groups = 0usize;
+    let flush = |score: &mut Vec<f64>, meat: &mut Vec<Vec<f64>>| {
+        for i in 0..k {
+            for j in 0..k {
+                meat[i][j] += score[i] * score[j];
+            }
+        }
+        score.iter_mut().for_each(|v| *v = 0.0);
+    };
+    let mut cur = None;
+    for &i in &order {
+        if cur != Some(cl[i]) {
+            if cur.is_some() {
+                flush(&mut score, &mut meat);
+                groups += 1;
+            }
+            cur = Some(cl[i]);
+        }
+        let e = y[i] - (0..k).map(|j| beta[j] * x[i][j]).sum::<f64>();
+        for j in 0..k {
+            score[j] += x[i][j] * e;
+        }
+    }
+    if cur.is_some() {
+        flush(&mut score, &mut meat);
+        groups += 1;
+    }
+    let adj = groups as f64 / (groups.max(2) - 1) as f64;
+    let se = (0..k)
+        .map(|d| {
+            let mut v = 0.0;
+            for i in 0..k {
+                for j in 0..k {
+                    v += ainv[d][i] * meat[i][j] * ainv[j][d];
+                }
+            }
+            (v * adj).max(0.0).sqrt()
+        })
+        .collect();
+    (beta, se)
+}
+
 /// Is `eval::heuristic` actually predicting the final score, and where is it
 /// wrong?
 ///
@@ -1311,6 +1419,9 @@ fn evaluator_calibration() {
     /// One recorded turn root: the estimate for every seat, and what every seat
     /// finally scored.
     struct Row {
+        /// The game this position came from: every row of one game shares an
+        /// outcome vector, so it is the cluster the standard errors use.
+        game: u64,
         day: u8,
         state: GameState,
         est: [f32; N_PLAYERS],
@@ -1334,6 +1445,7 @@ fn evaluator_calibration() {
                 .iter()
                 .filter(|n| n.flags & flags::TURN_ROOT != 0 && !n.state.over)
                 .map(|n| Row {
+                    game: seed,
                     day: n.state.day,
                     state: n.state,
                     est: std::array::from_fn(|i| heuristic(&n.state, PlayerId(i as u8))),
@@ -1435,9 +1547,10 @@ fn evaluator_calibration() {
     // `(coef - 1) * mean(term)`, which is the points per position the current
     // weight is getting wrong.
     let names = Components::NAMES;
-    let build = |sel: &dyn Fn(&Row) -> bool| -> (Vec<Vec<f64>>, Vec<f64>) {
+    let build = |sel: &dyn Fn(&Row) -> bool| -> (Vec<Vec<f64>>, Vec<f64>, Vec<u64>) {
         let mut x = Vec::new();
         let mut y = Vec::new();
+        let mut cl = Vec::new();
         for r in rows.iter().filter(|r| sel(r)) {
             for i in 0..N_PLAYERS {
                 let t = r.parts[i].terms();
@@ -1445,27 +1558,28 @@ fn evaluator_calibration() {
                 row.extend(t.iter().map(|&v| v as f64));
                 x.push(row);
                 y.push(r.outcome[i] as f64);
+                cl.push(r.game);
             }
         }
-        (x, y)
+        (x, y, cl)
     };
 
     println!(
         "\n-- what each term is worth: OLS(final score ~ terms), whole game --\n\
-         {:>12}  {:>8}  {:>8}  {:>8}  {:>8}",
-        "term", "mean", "coef", "should be", "pts/pos"
+         {:>12}  {:>8}  {:>14}  {:>8}  {:>8}",
+        "term", "mean", "coef +/-95%", "should be", "pts/pos"
     );
-    let (x, y) = build(&|_| true);
-    let coefs = ridge(&x, &y, 1e-3);
+    let (x, y, cl) = build(&|_| true);
+    let (coefs, coef_se) = ridge_se(&x, &y, &cl, 1e-3);
     println!("{:>12}  {:>8}  {:>+8.2}", "(intercept)", "", coefs[0]);
     for (k, name) in names.iter().enumerate() {
         let col: Vec<f64> = x.iter().map(|r| r[k + 1]).collect();
         let m = mean(&col);
         println!(
-            "{:>12}  {:>8.2}  {:>8.2}  {:>8.2}  {:>+8.2}",
+            "{:>12}  {:>8.2}  {:>14}  {:>8.2}  {:>+8.2}",
             name,
             m,
-            coefs[k + 1],
+            format!("{:.2} +/-{:.2}", coefs[k + 1], 1.96 * coef_se[k + 1]),
             coefs[k + 1] * m,
             (1.0 - coefs[k + 1]) * m,
         );
@@ -1474,7 +1588,7 @@ fn evaluator_calibration() {
     // The same fit split by phase, because a term that decays wrongly has a
     // coefficient that moves with the calendar.
     for (label, lo, hi) in [("day 0-8", 0u8, 8u8), ("day 9-17", 9, 17), ("day 18-26", 18, 27)] {
-        let (x, y) = build(&|r| r.day >= lo && r.day <= hi);
+        let (x, y, _) = build(&|r| r.day >= lo && r.day <= hi);
         if y.len() < 200 {
             continue;
         }
@@ -1497,9 +1611,10 @@ fn evaluator_calibration() {
     //
     // A term whose coefficient is near zero is dead weight in the margin. A
     // negative one is actively pointing the search the wrong way.
-    let fe = |sel: &dyn Fn(&Row) -> bool| -> (Vec<Vec<f64>>, Vec<f64>) {
+    let fe = |sel: &dyn Fn(&Row) -> bool| -> (Vec<Vec<f64>>, Vec<f64>, Vec<u64>) {
         let mut x = Vec::new();
         let mut y = Vec::new();
+        let mut cl = Vec::new();
         for r in rows.iter().filter(|r| sel(r)) {
             let t: Vec<[f32; 8]> = (0..N_PLAYERS).map(|i| r.parts[i].terms()).collect();
             let tbar: [f64; 8] = std::array::from_fn(|k| {
@@ -1511,26 +1626,28 @@ fn evaluator_calibration() {
                 row.extend((0..8).map(|k| t[i][k] as f64 - tbar[k]));
                 x.push(row);
                 y.push(r.outcome[i] as f64 - ybar);
+                cl.push(r.game);
             }
         }
-        (x, y)
+        (x, y, cl)
     };
     println!(
         "\n-- what each term is worth as a *discriminator*: the same fit with \n\
            every term and outcome centred across the four seats of one position --\n\
-         {:>12}  {:>8}  {:>8}  {:>8}",
-        "term", "sd", "coef", "coef*sd"
+         {:>12}  {:>8}  {:>16}  {:>8}",
+        "term", "sd", "coef +/-95%", "coef*sd"
     );
-    let (x, y) = fe(&|_| true);
+    let (x, y, cl) = fe(&|_| true);
+    let (fc, fse) = ridge_se(&x, &y, &cl, 1e-3);
     for (k, name) in names.iter().enumerate() {
         let col: Vec<f64> = x.iter().map(|r| r[k + 1]).collect();
         let s = sd(&col);
         println!(
-            "{:>12}  {:>8.2}  {:>8.2}  {:>8.2}",
+            "{:>12}  {:>8.2}  {:>16}  {:>8.2}",
             name,
             s,
-            ridge(&x, &y, 1e-3)[k + 1],
-            ridge(&x, &y, 1e-3)[k + 1] * s,
+            format!("{:.2} +/-{:.2}", fc[k + 1], 1.96 * fse[k + 1]),
+            fc[k + 1] * s,
         );
     }
     println!("  (centred outcome sd {:.2})", sd(&y));
@@ -1541,15 +1658,18 @@ fn evaluator_calibration() {
         print!("  {name:>11}");
     }
     println!();
+    println!("  (`.` marks a coefficient whose 95% interval covers 1.0 — \
+already scaled right, or too noisy to say)");
     for b in 0..9 {
-        let (x, y) = fe(&|r| bucket_of(r.day) == b);
+        let (x, y, cl) = fe(&|r| bucket_of(r.day) == b);
         if y.len() < 200 {
             continue;
         }
-        let c = ridge(&x, &y, 1e-3);
+        let (c, e) = ridge_se(&x, &y, &cl, 1e-3);
         print!("{:>12}", format!("{}-{}", b * 3, b * 3 + 2));
         for k in 0..8 {
-            print!("  {:>11.2}", c[k + 1]);
+            let flat = (c[k + 1] - 1.0).abs() <= 1.96 * e[k + 1];
+            print!("  {:>10.2}{}", c[k + 1], if flat { "." } else { " " });
         }
         println!();
     }
@@ -1599,8 +1719,8 @@ fn evaluator_calibration() {
             pl.may_skip_day as u8 as f64,
         ]
     };
-    let fe_raw = |sel: &dyn Fn(&Row) -> bool| -> (Vec<Vec<f64>>, Vec<f64>) {
-        let (mut x, mut y) = (Vec::new(), Vec::new());
+    let fe_raw = |sel: &dyn Fn(&Row) -> bool| -> (Vec<Vec<f64>>, Vec<f64>, Vec<u64>) {
+        let (mut x, mut y, mut cl) = (Vec::new(), Vec::new(), Vec::new());
         for r in rows.iter().filter(|r| sel(r)) {
             let t: Vec<[f64; 18]> = (0..N_PLAYERS)
                 .map(|i| raw_of(&r.state, PlayerId(i as u8)))
@@ -1614,33 +1734,34 @@ fn evaluator_calibration() {
                 row.extend((0..18).map(|k| t[i][k] - tbar[k]));
                 x.push(row);
                 y.push(r.outcome[i] as f64 - ybar);
+                cl.push(r.game);
             }
         }
-        (x, y)
+        (x, y, cl)
     };
     println!(
         "\n-- marginal value of one unit, in realised final points --\n\
-         (centred across the four seats of a position; `now` is what \n\
-          src/eval.rs currently pays for the same unit)\n{:>12}  {:>8}  {:>8}  {:>8}",
-        "holding", "sd", "day 0-8", "day 18-26"
+         (centred across the four seats of a position. These are *associations*, \n\
+          not prices: the columns are collinear -- a seat with more workers is a \n\
+          seat that spent corn on them -- so read the sign and the interval, and \n\
+          settle the size in the arena.)\n{:>12}  {:>8}  {:>8}  {:>8}  {:>16}",
+        "holding", "sd", "day 0-8", "day 18-26", "all +/-95%"
     );
-    let (xa, ya) = fe_raw(&|r| r.day <= 8);
-    let (xb, yb) = fe_raw(&|r| r.day >= 18);
-    let (xall, yall) = fe_raw(&|_| true);
-    let (ca, cb, call) = (
-        ridge(&xa, &ya, 1e-2),
-        ridge(&xb, &yb, 1e-2),
-        ridge(&xall, &yall, 1e-2),
-    );
+    let (xa, ya, cla) = fe_raw(&|r| r.day <= 8);
+    let (xb, yb, clb) = fe_raw(&|r| r.day >= 18);
+    let (xall, yall, clall) = fe_raw(&|_| true);
+    let ca = ridge_se(&xa, &ya, &cla, 1e-2).0;
+    let cb = ridge_se(&xb, &yb, &clb, 1e-2).0;
+    let (call, sall) = ridge_se(&xall, &yall, &clall, 1e-2);
     for (k, name) in RAW.iter().enumerate() {
         let col: Vec<f64> = xall.iter().map(|r| r[k + 1]).collect();
         println!(
-            "{:>12}  {:>8.2}  {:>8.2}  {:>8.2}   (all {:>5.2})",
+            "{:>12}  {:>8.2}  {:>8.2}  {:>8.2}  {:>16}",
             name,
             sd(&col),
             ca[k + 1],
             cb[k + 1],
-            call[k + 1],
+            format!("{:.2} +/-{:.2}", call[k + 1], 1.96 * sall[k + 1]),
         );
     }
 
@@ -1814,6 +1935,156 @@ fn a_builder_never_pays_the_listed_price() {
     assert!(checked > 0, "no buildable card to check");
 }
 
+/// The non-wealth part of a choice, and the net corn, wood, stone, gold and
+/// points it moves. Skulls stay in the shape: `take_skulls` caps against a
+/// shared bank, so their net does not pin the outcome.
+fn shape_and_wealth(c: &Choice) -> (Vec<Effect>, [i32; 5]) {
+    let mut shape = Vec::new();
+    let mut w = [0i32; 5];
+    for e in &c.0 {
+        match *e {
+            Effect::Corn(n) => w[0] += n as i32,
+            Effect::Res(r, n) if r != Resource::Skull => w[1 + r.idx()] += n as i32,
+            Effect::Points(n) => w[4] += n as i32,
+            other => shape.push(other),
+        }
+    }
+    (shape, w)
+}
+
+/// Every option a space offers must reach a position no other option reaches.
+///
+/// This is ground truth, not a rule about effect lists: two choices that leave
+/// the state identical are one move wearing two spellings. `tikal::build_two`
+/// used to spell every double build twice, because building A then B and B then
+/// A cost the same whenever the architecture discount is not in play -- 6% of
+/// every option list on Tikal 4 through 7, measured, and again inside every
+/// mirror and every step-down that reaches them.
+#[test]
+fn no_two_options_at_a_space_reach_the_same_position() {
+    for seed in 0..5u64 {
+        let mut g = Game::new(seed);
+        for _ in 0..14 {
+            g.play_round();
+            for p in PlayerId::ALL {
+                for gear in Gear::ALL {
+                    for i in 0..gear.size() {
+                        let mut seen: std::collections::HashMap<GameState, Choice> =
+                            std::collections::HashMap::new();
+                        for c in choices_at(&g.state, p, gear, Pos(i)) {
+                            let mut probe = g.state;
+                            c.apply(&mut probe, p);
+                            if let Some(prev) = seen.insert(probe, c.clone()) {
+                                panic!(
+                                    "{}:{i} offers [{prev}] and [{c}], which are one position",
+                                    gear.name()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// No option may be another option's poorer twin.
+///
+/// Two choices that agree on everything except how much corn, how many blocks
+/// and how many points they move are one decision: the poorer arrives where the
+/// richer arrives, holding less, and nothing in the game pays for holding less.
+/// The empty choice is exempt -- "pick the worker up and do nothing" is one of
+/// the three options the rules name, so it is kept even where a free payout
+/// beats it.
+#[test]
+fn no_option_is_a_strictly_poorer_twin() {
+    for seed in 0..5u64 {
+        let mut g = Game::new(seed);
+        for _ in 0..14 {
+            g.play_round();
+            for p in PlayerId::ALL {
+                for gear in Gear::ALL {
+                    for i in 0..gear.size() {
+                        let cs = choices_at(&g.state, p, gear, Pos(i));
+                        let keyed: Vec<_> = cs.iter().map(shape_and_wealth).collect();
+                        for (a, (sa, wa)) in cs.iter().zip(&keyed) {
+                            if a.is_skip() {
+                                continue;
+                            }
+                            for (b, (sb, wb)) in cs.iter().zip(&keyed) {
+                                if sa != sb {
+                                    continue;
+                                }
+                                let beaten = (0..5).all(|k| wb[k] >= wa[k])
+                                    && (0..5).any(|k| wb[k] > wa[k]);
+                                assert!(
+                                    !beaten,
+                                    "{}:{i} offers [{a}] when [{b}] does the same for less",
+                                    gear.name()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Yaxchilan 5 hands out the stone of space 2 and the gold of space 3 together,
+/// so from the free-choice spaces at the top of the gear those two are dead
+/// letters. Wood is not: space 1 gives something space 5 does not.
+#[test]
+fn a_richer_action_at_the_same_price_retires_the_leaner_one() {
+    let g = fresh();
+    let p = PlayerId(0);
+    let top = choices_at(&g.state, p, Gear::Yaxchilan, Pos(6));
+
+    for dead in [2u8, 3] {
+        for c in choices_at(&g.state, p, Gear::Yaxchilan, Pos(dead)) {
+            assert!(
+                !top.contains(&c),
+                "Yaxchilan:6 still offers [{c}], which space 5 swallows whole"
+            );
+        }
+    }
+    for live in [1u8, 4, 5] {
+        for c in choices_at(&g.state, p, Gear::Yaxchilan, Pos(live)) {
+            assert!(
+                top.contains(&c),
+                "Yaxchilan:6 dropped [{c}], which nothing on the gear covers"
+            );
+        }
+    }
+}
+
+/// Building A then B and B then A are the same pair of cards at the same price
+/// unless the architecture discount is in play, and `build_two` enumerates both
+/// orders. The discount is what makes the orders differ, so this checks the
+/// case where it is absent.
+#[test]
+fn a_double_build_is_offered_once_per_pair() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.players[p.idx()].res = [9, 9, 9, 0];
+    assert!(!g.state.builder(p), "no discount, so the two orders cost the same");
+
+    let mut seen: std::collections::HashMap<GameState, Choice> = std::collections::HashMap::new();
+    let mut doubles = 0;
+    for c in choices_at(&g.state, p, Gear::Tikal, Pos(4)) {
+        if c.0.iter().filter(|e| matches!(e, Effect::Build(_))).count() < 2 {
+            continue;
+        }
+        doubles += 1;
+        let mut probe = g.state;
+        c.apply(&mut probe, p);
+        if let Some(prev) = seen.insert(probe, c.clone()) {
+            panic!("the same double build twice: [{prev}] and [{c}]");
+        }
+    }
+    assert!(doubles > 0, "no affordable pair of buildings to check");
+}
+
 /// Two advances are one decision however they are spelled: which track goes
 /// first, and which block pays for which half, are not choices a player makes.
 #[test]
@@ -1835,4 +2106,124 @@ fn two_advances_are_offered_once_per_outcome() {
         }
         assert!(!seen.is_empty());
     }
+}
+
+/// Ordering the walk permutes it; it may not change what it finds.
+///
+/// `moves::Priority` exists so a capped caller can be handed the plausible
+/// moves first rather than the first ones — the prefix of traversal order is
+/// one spine of `retrieve_rec`'s recursion, not a slice of the move space, and
+/// `docs/SEARCH.md` §2.2 is the long form of why that matters. Ordering is the
+/// sound half of the idea: a filter that drops what the plan dislikes can drop
+/// the best move, a permutation cannot drop anything.
+///
+/// What makes that true here is that `retrieve_rec` is a depth-first walk with
+/// a visited set over a DAG — the worker it retrieves never comes back, so no
+/// edge can return to its own subtree — and the visited set of such a walk is
+/// the reachable set whatever order the edges arrive in. The memo does pick a
+/// different *spelling* of a commuting retrieval, which is why this compares
+/// reached positions and counts rather than `Move`s.
+///
+/// The hint is deliberately adversarial: a hash of the option, so it agrees
+/// with generation order nowhere.
+#[test]
+fn a_traversal_hint_reorders_the_walk_and_nothing_else() {
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+    use std::ops::ControlFlow;
+    use tzolkin::moves::{self, Kinds, Placement, Priority};
+
+    fn scramble<H: Hash>(x: H) -> i32 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        x.hash(&mut h);
+        (h.finish() >> 33) as i32
+    }
+
+    struct Scramble;
+    impl Priority for Scramble {
+        fn placement(&self, spot: Placement) -> i32 {
+            scramble(spot)
+        }
+        fn worker(&self, gear: Gear, pos: Pos) -> i32 {
+            scramble((gear.name(), pos.0, 0x77_6f_72_6bu32))
+        }
+        fn choice(&self, gear: Gear, pos: Pos, c: &Choice) -> i32 {
+            scramble((gear.name(), pos.0, c))
+        }
+    }
+
+    // Above this a position is skipped rather than compared, so the two walks
+    // are never two different prefixes of the same set.
+    const MAX_MOVES: usize = 20_000;
+    let mut compared = 0usize;
+    let mut retrieval_heavy = 0usize;
+
+    for seed in 0..12u64 {
+        let mut g = Game::new(seed);
+        while !g.state.over {
+            g.state.current = g.state.first_player;
+            for _ in 0..N_PLAYERS {
+                let p = g.state.current;
+                for kinds in [Kinds::Placements, Kinds::Retrievals, Kinds::All] {
+                    let walk = |order: Option<&Scramble>| {
+                        let mut states = HashSet::new();
+                        let mut n = 0usize;
+                        let mut f = |m: &tzolkin::moves::Move| {
+                            let mut probe = g.state;
+                            tzolkin::moves::apply_move(&mut probe, p, m);
+                            states.insert(probe);
+                            n += 1;
+                            if n > MAX_MOVES {
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            }
+                        };
+                        match order {
+                            Some(o) => {
+                                let _ = moves::visit_moves_of_by(&g.state, p, kinds, o, &mut f);
+                            }
+                            None => {
+                                let _ = moves::visit_moves_of(&g.state, p, kinds, &mut f);
+                            }
+                        }
+                        (states, n)
+                    };
+                    let (plain, n_plain) = walk(None);
+                    if n_plain > MAX_MOVES {
+                        continue;
+                    }
+                    let (hinted, n_hinted) = walk(Some(&Scramble));
+                    assert_eq!(
+                        plain, hinted,
+                        "seed {seed} day {} {kinds:?}: the hint changed which positions are reachable",
+                        g.state.day
+                    );
+                    assert_eq!(
+                        n_plain, n_hinted,
+                        "seed {seed} day {} {kinds:?}: the hint changed how many moves are emitted",
+                        g.state.day
+                    );
+                    compared += 1;
+                    if kinds == Kinds::Retrievals && n_plain > 200 {
+                        retrieval_heavy += 1;
+                    }
+                }
+                g.take_turn_sampled();
+                g.state.current = g.state.current.next(1);
+            }
+            g.end_round_public();
+        }
+    }
+
+    // Guard the guard: the claim is only interesting where the walk is deep
+    // enough for the memo to be collapsing orderings in the first place.
+    assert!(compared > 3_000, "only {compared} walks compared");
+    assert!(
+        retrieval_heavy > 100,
+        "only {retrieval_heavy} retrieval-heavy positions compared"
+    );
+    println!(
+        "{compared} walks compared, {retrieval_heavy} of them over 200 retrievals"
+    );
 }
