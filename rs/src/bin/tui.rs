@@ -10,41 +10,54 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 
-use tzolkin::eval::{heuristic, rank};
+use tzolkin::eval::{self, margin, Ranking};
 use tzolkin::game::Game;
-use tzolkin::moves::{sample_legal_move, Move};
+use tzolkin::ids::PlayerId;
+use tzolkin::moves::sample_legal_move;
 use tzolkin::ui::{self, App, MoveSource};
 
 const SHOWN: usize = 10;
-/// Above this, ranking every move is too slow to do on each redraw.
-const RANK_BUDGET: usize = 20_000;
+
+/// How long the `full` view will walk a move list before giving up and saying
+/// the position is wider than it could finish.
+const FULL_VIEW_BUDGET: Duration = Duration::from_secs(5);
 
 const HELP: &str = "\
 tui -- watch a game
 
 USAGE
-  cargo run --release --bin tui -- [SEED] [--agent SPEC]
+  cargo run --release --bin tui -- [SEED] [--agent SPEC] [--view VIEW]
 
 OPTIONS
-  --agent SPEC   who plays when you press `n` or turn on autoplay.
-                 Without it the rollout policy plays and the move list is
-                 ranked by the placeholder heuristic.
+  --agent SPEC   who plays when you press `n` or turn on autoplay, and whose
+                 ranking the `agent` view shows. Without it the rollout policy
+                 plays and the move list is scored by the built-in evaluator.
+  --view VIEW    which move list to open on: sampled | full | agent.
+                 Defaults to `agent` with --agent, `full` without.
 
 AGENT SPECS  (the same ones arena and selfplay take)
   random                              the rollout policy
-  heuristic[:K]                       one-ply greedy over K sampled turns
-  mcts:SIMS                           search on the heuristic evaluator
-  mcts:SIMS:PATH.safetensors          search on a trained net
-  PATH.safetensors                    shorthand for mcts at the default budget
+  heuristic[:K]                       one ply, over K sampled turns
+  heuristic:full                      one ply, over EVERY legal move
+  minimax[:DEPTH[:MS[:WIDTH]]]        paranoid alpha-beta; exhaustive first ply
+  greedy:K:EVAL / greedy:full:EVAL    one ply over any evaluator
+  mcts:SIMS[:EVAL]                    tree search
+  PATH.safetensors                    shorthand for mcts on a trained net
+
+VIEWS  (cycle with `t`)
+  sampled   ten draws from the rollout policy -- instant, and biased
+  full      the ten best of EVERY legal move, by eval::margin
+  agent     the ten best of every legal move as --agent scores them. For
+            minimax those are backed-up search values, so they price the
+            opponents' replies; for a one-ply agent they are its evaluator's.
 
 KEYS
   j/k    move the selection        n    let the current player act
-  enter  play the highlighted move r    redraw the candidate list
-  t      sampled <-> ranked        a    autoplay          q  quit
+  enter  play the highlighted move r    recompute the list
+  t      next view                 a    autoplay          q  quit
 
-With --agent, the preview pane shows the search's visit share at each
-sub-decision of the last turn -- what the agent actually considered, not a
-heuristic ranking of the alternatives.
+Scores are `margin`: this player's estimated final score less the best
+opponent's. Positive means ahead.
 ";
 
 fn main() -> io::Result<()> {
@@ -81,16 +94,33 @@ fn main() -> io::Result<()> {
     };
     let agent_name = agent.as_ref().map(|a| a.name()).unwrap_or_default();
 
+    // Opening on the agent's own ranking is the point of passing `--agent`;
+    // without one there is nothing to ask, so the built-in exhaustive scoring
+    // is the default instead.
+    let view = std::env::args()
+        .position(|a| a == "--view")
+        .and_then(|i| std::env::args().nth(i + 1));
+    let source = match view.as_deref() {
+        Some("sampled") => MoveSource::Sampled,
+        Some("full") => MoveSource::Full,
+        Some("agent") => MoveSource::Agent,
+        Some(other) => {
+            eprintln!("tui: --view {other}: try sampled, full or agent");
+            std::process::exit(2);
+        }
+        None if agent.is_some() => MoveSource::Agent,
+        None => MoveSource::Full,
+    };
+
     let mut app = App {
         game: Game::new(seed),
         agent,
         agent_name,
         last_decisions: Vec::new(),
-        candidates: Vec::new(),
+        ranking: Ranking::default(),
         selected: 0,
-        source: MoveSource::Sampled,
+        source,
         autoplay: false,
-        total_moves: None,
         status: format!("seed {seed}"),
     };
     refresh(&mut app);
@@ -121,24 +151,22 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('j') | KeyCode::Down => {
-                        if !app.candidates.is_empty() {
-                            app.selected = (app.selected + 1) % app.candidates.len();
+                        let n = app.candidates().len();
+                        if n > 0 {
+                            app.selected = (app.selected + 1) % n;
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        if !app.candidates.is_empty() {
-                            app.selected = (app.selected + app.candidates.len() - 1)
-                                % app.candidates.len();
+                        let n = app.candidates().len();
+                        if n > 0 {
+                            app.selected = (app.selected + n - 1) % n;
                         }
                     }
                     KeyCode::Enter | KeyCode::Char(' ') => play_selected(app),
                     KeyCode::Char('n') => step(app),
                     KeyCode::Char('r') => refresh(app),
                     KeyCode::Char('t') => {
-                        app.source = match app.source {
-                            MoveSource::Sampled => MoveSource::Ranked,
-                            MoveSource::Ranked => MoveSource::Sampled,
-                        };
+                        app.source = app.source.next();
                         refresh(app);
                     }
                     KeyCode::Char('a') => app.autoplay = !app.autoplay,
@@ -163,7 +191,7 @@ fn play_selected(app: &mut App) {
         app.status = "game over".into();
         return;
     }
-    let Some((m, _)) = app.candidates.get(app.selected).cloned() else {
+    let Some(m) = app.selected_move().cloned() else {
         return;
     };
     let p = app.game.state.current;
@@ -182,9 +210,10 @@ fn step(app: &mut App) {
         return;
     }
 
-    // Play the best candidate when ranking, otherwise a sampled one.
+    // With no agent configured, `n` plays whatever the current view recommends:
+    // the top of a scored list, or a fresh draw from the rollout policy.
     match app.source {
-        MoveSource::Ranked => play_selected_best(app),
+        MoveSource::Full | MoveSource::Agent => play_best(app),
         MoveSource::Sampled => {
             let p = app.game.state.current;
             if let Some(m) = sample_legal_move(&app.game.state, p, &mut app.game.rng) {
@@ -205,36 +234,21 @@ fn agent_step(app: &mut App) {
     let outcome = agent.play_turn(&app.game.state, p, 0.0, &mut rng);
     app.agent = Some(agent);
 
+    // `decisions_from` keeps only the nodes whose visit indices really are edge
+    // indices, so a one-ply or minimax agent leaves this empty and the preview
+    // pane shows the move diff instead — which is the honest thing to show for
+    // an agent that never built a tree.
     app.last_decisions.clear();
     if let Some(o) = &outcome {
         app.last_decisions = ui::decisions_from(&o.nodes);
-        for node in &o.nodes {
-            let total: u32 = node.visits.iter().map(|(_, n)| *n as u32).sum();
-            if total == 0 {
-                continue;
-            }
-            let (best, n) = node
-                .visits
-                .iter()
-                .max_by_key(|(_, n)| *n)
-                .map(|(s, n)| (format!("{s:?}"), *n as u32))
-                .unwrap_or_default();
-            // `Step`'s Debug is long; the variant name carries the meaning.
-            let short = best.split(['(', ' ']).next().unwrap_or(&best).to_string();
-            app.last_decisions.push((
-                format!("{:?}", node.phase),
-                short,
-                n as f32 / total as f32,
-            ));
-        }
         app.game.play(p, &o.mv);
     }
     advance(app);
 }
 
-fn play_selected_best(app: &mut App) {
+fn play_best(app: &mut App) {
     let p = app.game.state.current;
-    if let Some((m, _)) = app.candidates.first().cloned() {
+    if let Some((m, _)) = app.ranking.moves.first().cloned() {
         app.game.play(p, &m);
     }
     advance(app);
@@ -255,8 +269,7 @@ fn advance(app: &mut App) {
 /// Rebuild the candidate list for whoever is to move.
 fn refresh(app: &mut App) {
     app.selected = 0;
-    app.candidates.clear();
-    app.total_moves = None;
+    app.ranking = Ranking::default();
 
     if app.game.state.over {
         let scores = app.game.scores();
@@ -271,57 +284,64 @@ fn refresh(app: &mut App) {
     }
 
     let p = app.game.state.current;
-    match app.source {
-        MoveSource::Sampled => {
-            // Distinct draws from the rollout policy, so the list is varied.
-            let mut seen = std::collections::HashSet::new();
-            for _ in 0..SHOWN * 20 {
-                if app.candidates.len() >= SHOWN {
-                    break;
-                }
-                if let Some(m) = sample_legal_move(&app.game.state, p, &mut app.game.rng) {
-                    if seen.insert(m.clone()) {
-                        let mut probe = app.game.state;
-                        tzolkin::moves::apply_move(&mut probe, p, &m);
-                        app.candidates.push((m, heuristic(&probe, p)));
-                    }
-                }
+    let started = Instant::now();
+
+    app.ranking = match app.source {
+        MoveSource::Sampled => sampled(app, p),
+        // A longer leash than an agent gets: nothing is waiting on this but a
+        // person looking at one position, and seeing the whole list is the
+        // point of the view. It still has a leash, because the widest turns run
+        // to millions of moves and a frozen terminal explains nothing.
+        MoveSource::Full => eval::rank_all_capped(&app.game.state, p, SHOWN, FULL_VIEW_BUDGET),
+        MoveSource::Agent => match app.agent.as_ref() {
+            // The agent scores the whole move list itself, so `minimax` reports
+            // backed-up search values here rather than a one-ply guess.
+            Some(a) => a
+                .ranked_moves(&app.game.state, p, SHOWN)
+                .unwrap_or_else(|| eval::rank_all(&app.game.state, p, SHOWN)),
+            None => {
+                let mut r =
+                    eval::rank_all_capped(&app.game.state, p, SHOWN, FULL_VIEW_BUDGET);
+                r.note = format!("{} — no --agent, so this is the built-in scoring", r.note);
+                r
             }
-            app.status = format!("seed view · {} sampled", app.candidates.len());
+        },
+    };
+
+    app.status = format!(
+        "{} · {:.0} ms",
+        app.ranking.note,
+        started.elapsed().as_secs_f64() * 1e3
+    );
+}
+
+/// Distinct draws from the rollout policy, so the list is varied.
+///
+/// The one view that stays instant no matter how wide the position is, which is
+/// why it is kept: `Full` and `Agent` both walk the whole move list.
+fn sampled(app: &mut App, p: PlayerId) -> Ranking {
+    let mut moves: Vec<(tzolkin::moves::Move, f32)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..SHOWN * 20 {
+        if moves.len() >= SHOWN {
+            break;
         }
-        MoveSource::Ranked => {
-            // Ranking needs the real list, which is unbounded in the late game.
-            let all: Vec<Move> =
-                tzolkin::moves::legal_moves_capped(&app.game.state, p, RANK_BUDGET);
-            let capped = all.len() >= RANK_BUDGET;
-            let total = if capped {
-                None
-            } else {
-                Some(all.len())
-            };
-            app.total_moves = total;
-            for (i, s) in rank(&app.game.state, p, &all).into_iter().take(SHOWN) {
-                app.candidates.push((all[i].clone(), s));
+        if let Some(m) = sample_legal_move(&app.game.state, p, &mut app.game.rng) {
+            if seen.insert(m.clone()) {
+                let succ = eval::successor(&app.game.state, p, &m);
+                moves.push((m, margin(&succ, p)));
             }
-            app.status = if capped {
-                format!("ranked first {RANK_BUDGET} of a larger set")
-            } else {
-                format!("ranked all {}", all.len())
-            };
         }
     }
-
-    // Keep the exact count available when it is cheap to know.
-    if app.total_moves.is_none() && app.source == MoveSource::Sampled {
-        let mut n = 0usize;
-        let _ = tzolkin::moves::visit_legal_moves(&app.game.state, p, |_| {
-            n += 1;
-            if n > RANK_BUDGET {
-                std::ops::ControlFlow::Break(())
-            } else {
-                std::ops::ControlFlow::Continue(())
-            }
-        });
-        app.total_moves = (n <= RANK_BUDGET).then_some(n);
+    moves.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let n = moves.len();
+    Ranking {
+        moves,
+        total: n,
+        distinct: n,
+        // These are draws, not the move list: nothing here says how many moves
+        // the position actually has, and the panel must not imply that it does.
+        exhaustive: false,
+        note: format!("{n} draws from the rollout policy"),
     }
 }

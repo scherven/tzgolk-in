@@ -228,6 +228,8 @@ CONCURRENCY   (docs/COMPUTE.md section 2)
 AGENT SPECS
   random               the sample_legal_move rollout policy
   heuristic[:K]        one-ply greedy over K sampled turns  [K=32]
+  heuristic:full       one ply over EVERY legal move
+  minimax[:D[:MS[:W]]]  paranoid alpha-beta; budget it (minimax:4:120)
   greedy:K:EVAL        one-ply greedy over any evaluator
   mcts:SIMS[:EVAL]     tree search; EVAL defaults to heuristic
   net-random[:small|main]   an untrained net, for measuring the pipeline

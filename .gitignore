@@ -2,3 +2,9 @@
 src/tzgolkin
 train/.venv
 .venv
+rs/data
+*.pyc
+*.log
+*.jsonl
+rs/.DS_Store
+.DS_Store

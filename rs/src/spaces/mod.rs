@@ -29,7 +29,24 @@ pub fn choices_at(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> Vec<Choic
         Gear::Uxmal => uxmal::at(g, p, pos),
         Gear::Chichen => chichen::at(g, p, pos),
     };
-    crate::options::dedup(v)
+    // `dominated_dedup` rather than `dedup` because a free-choice space stacks
+    // several routes to one action on top of each other: Uxmal 6 offers the
+    // unlock for nothing (space 3) and again for a corn (space 5's mirror), and
+    // the same doubling runs through every action the mirror can reach.
+    crate::options::dominated_dedup(v)
+}
+
+/// The spaces that repeat every action below them for free: 6 and 7 on the
+/// small gears, 10 on Chichen Itza.
+///
+/// This mirrors the catch-all arm of each space module and has to move with it.
+/// `choices_for_worker` reads it to skip the pay-to-step-down walk, which from
+/// one of these spaces can only re-buy what the space already gives away.
+pub fn is_free_choice(gear: Gear, pos: Pos) -> bool {
+    match gear {
+        Gear::Chichen => pos.0 >= 10,
+        _ => pos.0 >= 6,
+    }
 }
 
 /// The two spaces at the top of each small gear repeat every action below them.

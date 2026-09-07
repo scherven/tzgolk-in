@@ -1866,7 +1866,15 @@ impl<E: Evaluator> GreedyAgent<E> {
                 (cands, scores)
             }
             Candidates::All => {
-                let r = crate::eval::rank_all_by(g, p, self.cands.keep(), |s| self.value(s, p)[p.idx()]);
+                // Bounded: this is driving a game, and the widest turns a strong
+                // player reaches are wide enough to stall one for minutes.
+                let r = crate::eval::rank_all_within(
+                    g,
+                    p,
+                    self.cands.keep(),
+                    Some(crate::eval::FULL_BUDGET),
+                    |s| self.value(s, p)[p.idx()],
+                );
                 r.moves.into_iter().unzip()
             }
         }
@@ -1955,14 +1963,23 @@ impl<E: Evaluator> Agent for GreedyAgent<E> {
         // that the shortlist came out of the entire move space, and a `Sampled`
         // agent's own draws would not support it. What stays the agent's is the
         // *evaluator* doing the scoring.
-        let mut r = crate::eval::rank_all_by(g, p, keep, |s| self.value(s, p)[p.idx()]);
+        let mut r = crate::eval::rank_all_within(
+            g,
+            p,
+            keep,
+            Some(crate::eval::FULL_BUDGET),
+            |s| self.value(s, p)[p.idx()],
+        );
+        let seen = if r.exhaustive {
+            format!("all {} moves scored", r.total)
+        } else {
+            format!("{} moves scored before the budget ran out", r.total)
+        };
         r.note = match self.cands {
-            Candidates::All => format!("{} · all {} moves scored", self.ev.name(), r.total),
-            Candidates::Sampled(k) => format!(
-                "{} · all {} moves scored (it plays from {k} sampled)",
-                self.ev.name(),
-                r.total
-            ),
+            Candidates::All => format!("{} · {seen}", self.ev.name()),
+            Candidates::Sampled(k) => {
+                format!("{} · {seen} (it plays from {k} sampled)", self.ev.name())
+            }
         };
         Some(r)
     }
@@ -2241,14 +2258,25 @@ pub struct MinimaxAgent {
     record: bool,
 }
 
+/// How a minimax spec prints. Carries the opponent model, because paranoid and
+/// greedy are different players and a run log that cannot tell them apart is
+/// not a run log.
+pub fn minimax_label(cfg: &crate::search::Config) -> String {
+    format!(
+        "minimax:d{}:{}ms:w{}:{}",
+        cfg.max_depth,
+        cfg.budget.as_millis(),
+        cfg.width_at(0),
+        match cfg.opponents {
+            crate::search::Opponents::Paranoid => "paranoid",
+            crate::search::Opponents::Greedy => "greedy",
+        }
+    )
+}
+
 impl MinimaxAgent {
     pub fn new(cfg: crate::search::Config, record: bool) -> Self {
-        let label = format!(
-            "minimax:d{}:{}ms:w{}",
-            cfg.max_depth,
-            cfg.budget.as_millis(),
-            cfg.width_at(0)
-        );
+        let label = minimax_label(&cfg);
         MinimaxAgent {
             inner: Mutex::new(crate::search::Search::new(cfg)),
             label,
@@ -2357,10 +2385,13 @@ impl Agent for MinimaxAgent {
 ///   sample of them. No cap and no traversal-order bias; see
 ///   [`Candidates::All`].
 /// * `greedy:K:EVAL` / `greedy:full:EVAL` — the same two, over any evaluator.
-/// * `minimax` / `minimax:DEPTH[:MS[:WIDTH]]` — paranoid alpha-beta from
+/// * `minimax` / `minimax:DEPTH[:MS[:WIDTH[:MODEL]]]` — alpha-beta from
 ///   `src/search.rs`. `DEPTH` is in turns (4 is one full round), `MS` is the
-///   wall-clock budget per turn, `WIDTH` the root beam. Its first ply is always
-///   exhaustive whatever the width; the width bounds what gets *deepened*.
+///   deepening budget per turn, `WIDTH` the root beam, `MODEL` is `paranoid`
+///   (opponents minimise your margin; prunes) or `greedy` (opponents play their
+///   own best move; cannot prune but is far cheaper, so it buys depth). Its
+///   first ply is always exhaustive whatever the width; the width bounds what
+///   gets *deepened*.
 /// * `mcts:SIMS` / `mcts:SIMS:EVAL` — tree search from `src/mcts.rs`. `EVAL`
 ///   defaults to `heuristic`.
 /// * `net-random` / `net-random:small` / `net-random:main` — an untrained
@@ -2447,7 +2478,11 @@ fn parse_candidates(rest: Option<&str>, what: &str) -> Result<Candidates, String
     }
 }
 
-/// `DEPTH[:MS[:WIDTH]]`, each field defaulting to `search::Config::default`.
+/// `DEPTH[:MS[:WIDTH[:MODEL]]]`, each field defaulting to
+/// `search::Config::default`. `MODEL` is `paranoid` or `greedy`.
+///
+/// An empty field takes the default, so `minimax:6:::greedy` sets only the
+/// depth and the opponent model.
 fn parse_minimax(rest: Option<&str>) -> Result<crate::search::Config, String> {
     let mut cfg = crate::search::Config::default();
     let Some(rest) = rest else {
@@ -2490,9 +2525,19 @@ fn parse_minimax(rest: Option<&str>) -> Result<crate::search::Config, String> {
             )
             .collect();
     }
+    match parts.next() {
+        None | Some("") => {}
+        Some("paranoid") => cfg.opponents = crate::search::Opponents::Paranoid,
+        Some("greedy") => cfg.opponents = crate::search::Opponents::Greedy,
+        Some(other) => {
+            return Err(format!(
+                "minimax MODEL is `paranoid` or `greedy`, got {other:?}"
+            ))
+        }
+    }
     if let Some(extra) = parts.next() {
         return Err(format!(
-            "minimax takes minimax:DEPTH[:MS[:WIDTH]]; did not expect {extra:?}"
+            "minimax takes minimax:DEPTH[:MS[:WIDTH[:MODEL]]]; did not expect {extra:?}"
         ));
     }
     Ok(cfg)
@@ -2537,12 +2582,7 @@ impl AgentSpec {
                 Candidates::All => format!("{}:full", backend.name()),
             },
             SpecKind::Search { sims } => format!("mcts{sims}/{}", backend.name()),
-            SpecKind::Minimax { cfg } => format!(
-                "minimax:d{}:{}ms:w{}",
-                cfg.max_depth,
-                cfg.budget.as_millis(),
-                cfg.width_at(0)
-            ),
+            SpecKind::Minimax { cfg } => minimax_label(cfg),
         };
         Ok(AgentSpec {
             spec: spec.to_string(),

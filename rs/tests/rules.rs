@@ -995,7 +995,7 @@ fn extra_day_restrictions() {
 fn ui_renders_at_many_sizes() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use tzolkin::eval::heuristic;
+    use tzolkin::eval::Ranking;
     use tzolkin::ui::{self, App, MoveSource};
 
     for &(w, h) in &[(80u16, 24u16), (100, 30), (132, 44), (200, 60), (60, 20)] {
@@ -1009,33 +1009,30 @@ fn ui_renders_at_many_sizes() {
             }
 
             let p = game.state.current;
-            let candidates: Vec<_> = legal_moves(&game.state, p)
-                .into_iter()
-                .take(10)
-                .map(|m| {
-                    let mut probe = game.state;
-                    tzolkin::moves::apply_move(&mut probe, p, &m);
-                    let s = heuristic(&probe, p);
-                    (m, s)
-                })
-                .collect();
+            let ranking = tzolkin::eval::rank_all(&game.state, p, 10);
+            let n = ranking.moves.len();
 
-            for source in [MoveSource::Sampled, MoveSource::Ranked] {
-                let app = App {
-                    game: Game::new(3),
-                    agent: None,
-                    agent_name: "net".into(),
-                    last_decisions: Vec::new(),
-                    candidates: candidates.clone(),
-                    selected: candidates.len().saturating_sub(1),
-                    source,
-                    autoplay: false,
-                    total_moves: Some(1234),
-                    status: "x".repeat(200),
-                };
-                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-                term.draw(|f| ui::draw(f, &app))
-                    .unwrap_or_else(|e| panic!("{w}x{h} after {rounds} rounds: {e}"));
+            for source in [MoveSource::Sampled, MoveSource::Full, MoveSource::Agent] {
+                for exhaustive in [true, false] {
+                    let app = App {
+                        game: Game::new(3),
+                        agent: None,
+                        agent_name: "net".into(),
+                        last_decisions: Vec::new(),
+                        ranking: Ranking {
+                            exhaustive,
+                            note: "x".repeat(200),
+                            ..ranking.clone()
+                        },
+                        selected: n.saturating_sub(1),
+                        source,
+                        autoplay: false,
+                        status: "x".repeat(200),
+                    };
+                    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    term.draw(|f| ui::draw(f, &app))
+                        .unwrap_or_else(|e| panic!("{w}x{h} after {rounds} rounds: {e}"));
+                }
             }
         }
     }

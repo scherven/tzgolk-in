@@ -16,11 +16,11 @@
 //! - the food the engine will fail to pay for
 //! ```
 //!
-//! The third and fourth terms are the ones that decay: `engine_value` is scaled
-//! by the rounds remaining and reaches zero on the last day, which makes
-//! `heuristic` **exactly** `state.scores()[p]` once `over` is set. A leaf
-//! evaluation and a real result are therefore the same number, which is what
-//! lets the search compare a forced win against a heuristic guess.
+//! Everything below the first line is an estimate of a game that has not
+//! finished, so once `over` is set they all go away and `heuristic` is simply
+//! `state.scores()[p]` — `end_game` has by then folded the liquidation into
+//! `points` itself. A leaf evaluation and a real result are therefore the same
+//! number, which is what lets the search compare a forced win against a guess.
 //!
 //! [`margin`] is the zero-sum reduction the search runs on: how far ahead of the
 //! best opponent a player stands. It is what makes denying an opponent — a
@@ -32,7 +32,10 @@ use crate::data::temples::TEMPLES;
 use crate::ids::*;
 use crate::moves::Move;
 use crate::state::{GameState, LAST_DAY, POINT_DAYS, RESOURCE_DAYS};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
 
 // ---- tuning ------------------------------------------------------------
 
@@ -75,17 +78,23 @@ const ROUNDS_PER_ACTION: f32 = 2.6;
 
 /// Estimated final score for `p`, in points.
 ///
-/// Exact once `g.over`: every speculative term is scaled by the rounds left.
+/// Exactly `g.scores()[p]` once `g.over`, so a finished line and a guess about
+/// one are the same kind of number and the search can compare them.
 pub fn heuristic(g: &GameState, p: PlayerId) -> f32 {
     let pl = &g.players[p.idx()];
     let mut v = pl.points as f32;
 
-    // Liquidation, as `end_game` would compute it right now. Exact.
-    v += liquidation(g, p);
-
+    // A finished game needs no estimate. `end_game` has already folded corn,
+    // skulls and monuments into `points`, and the resources it converted are
+    // still sitting in the player — so adding `liquidation` here would pay for
+    // them a second time.
     if g.over {
         return v;
     }
+
+    // What liquidation would pay if the game ended now, by the same arithmetic
+    // `end_game` uses. Exact, unlike everything below it.
+    v += liquidation(g, p);
 
     let rounds_left = (LAST_DAY.saturating_sub(g.day)) as f32;
     // 1.0 at the start of the game, 0.0 on the last day. Everything speculative
@@ -120,7 +129,8 @@ pub fn margin(g: &GameState, p: PlayerId) -> f32 {
 
 // ---- components --------------------------------------------------------
 
-/// Exactly what `GameState::end_game` would add to this player's points.
+/// Exactly what `GameState::end_game` would add to this player's points if the
+/// game ended right now. Only meaningful before it has actually run.
 fn liquidation(g: &GameState, p: PlayerId) -> f32 {
     let pl = &g.players[p.idx()];
     let mut v = (pl.total_corn() / 4) as f32;
@@ -641,44 +651,114 @@ pub fn rank(g: &GameState, p: PlayerId, moves: &[Move]) -> Vec<(usize, f32)> {
     scored
 }
 
+/// How long an exhaustive walk may run before it gives up and says so.
+///
+/// Exhaustive is the contract, and on all but a handful of positions it costs
+/// under a millisecond. But the move space is not bounded by anything a caller
+/// can see in advance — a strong player holding six workers and a pile of corn
+/// reaches turns whose retrieval space runs into the millions — and an agent
+/// that can stall for minutes on one turn is not an agent. So the walk carries
+/// a deadline, and a `Ranking` that hit it says `exhaustive: false` rather than
+/// quietly implying it saw everything.
+pub const FULL_BUDGET: Duration = Duration::from_millis(2_500);
+
+/// Moves scored between deadline checks. `Instant::now` is ~20 ns, which is a
+/// real fraction of the ~1 us it costs to score a move, so it is not worth
+/// asking on every one.
+const DEADLINE_STRIDE: usize = 1024;
+
+/// Sampled draws mixed in when the walk gave up, to counter the fact that a
+/// prefix of traversal order is all placements and first-worker retrievals.
+const GIVE_UP_TOP_UP: usize = 64;
+
 /// Score **every** legal move with `score` and keep the best `keep`.
 ///
 /// `score` is handed the successor state, already refilled. This is the
 /// primitive `heuristic:full` and the search root are both built on: no cap, no
 /// sampling, no traversal-order bias. It is affordable because scoring is
 /// streamed — `visit_legal_moves` hands over one move at a time, it is applied
-/// to a copy of the state, scored, and dropped unless it is good enough to keep.
+/// to a copy of the state, scored, and dropped unless it is good enough to keep
+/// — so a six-figure node costs time but not memory.
 ///
-/// Cost is one `score` call per legal move, so an evaluator that is not cheap
-/// has no business here: the widest measured node is ~1.9M moves.
-pub fn rank_all_by<F>(g: &GameState, p: PlayerId, keep: usize, mut score: F) -> Ranking
+/// `budget` bounds that time. `None` means genuinely unbounded, which is right
+/// where a human is waiting on one position and wrong anywhere a turn has to
+/// come back. Cost is one `score` call per legal move, so an evaluator that is
+/// not cheap has no business here either way.
+pub fn rank_all_within<F>(
+    g: &GameState,
+    p: PlayerId,
+    keep: usize,
+    budget: Option<Duration>,
+    mut score: F,
+) -> Ranking
 where
     F: FnMut(&GameState) -> f32,
 {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
+    let deadline = budget.map(|b| started + b);
     let mut top = TopK::new(keep);
     let mut total = 0usize;
 
-    let _ = crate::moves::visit_legal_moves(g, p, |m| {
+    let flow = crate::moves::visit_legal_moves(g, p, |m| {
         total += 1;
         top.offer(m, score(&successor(g, p, m)));
+        if let Some(d) = deadline {
+            if total % DEADLINE_STRIDE == 0 && Instant::now() >= d {
+                return ControlFlow::Break(());
+            }
+        }
         ControlFlow::Continue(())
     });
+
+    let gave_up = flow.is_break();
+    if gave_up {
+        // What was walked is a prefix of traversal order, which is placements
+        // and then retrievals worker by worker — not a slice of the move space.
+        // These draws come from the rollout policy, which is shaped like real
+        // play, so the shortlist is at least not blind to a whole move kind.
+        // Seeded from the position, so the same turn ranks the same way twice.
+        let mut rng = StdRng::seed_from_u64(
+            (g.day as u64) << 32 | (p.0 as u64) << 8 | g.current.0 as u64,
+        );
+        for _ in 0..GIVE_UP_TOP_UP {
+            let Some(m) = crate::moves::sample_legal_move(g, p, &mut rng) else {
+                break;
+            };
+            top.offer(&m, score(&successor(g, p, &m)));
+        }
+    }
 
     let ms = started.elapsed().as_secs_f64() * 1e3;
     let dupes = top.dupes;
     Ranking {
         moves: top.finish(),
         total,
-        distinct: total - dupes,
-        exhaustive: true,
-        note: format!("all {total} moves scored in {ms:.0} ms"),
+        distinct: total.saturating_sub(dupes),
+        exhaustive: !gave_up,
+        note: if gave_up {
+            format!("gave up at {total} moves after {ms:.0} ms — the list is wider than that")
+        } else {
+            format!("all {total} moves scored in {ms:.0} ms")
+        },
     }
 }
 
-/// [`rank_all_by`] against the built-in [`margin`].
+/// [`rank_all_within`] with no deadline. Only for a caller that can wait.
+pub fn rank_all_by<F>(g: &GameState, p: PlayerId, keep: usize, score: F) -> Ranking
+where
+    F: FnMut(&GameState) -> f32,
+{
+    rank_all_within(g, p, keep, None, score)
+}
+
+/// Every legal move, scored by [`margin`], with no deadline.
 pub fn rank_all(g: &GameState, p: PlayerId, keep: usize) -> Ranking {
     rank_all_by(g, p, keep, |s| margin(s, p))
+}
+
+/// The same under a deadline, which is what anything driving a game wants.
+pub fn rank_all_capped(g: &GameState, p: PlayerId, keep: usize, budget: Duration) -> Ranking {
+    rank_all_within(g, p, keep, Some(budget), |s| margin(s, p))
 }
 
 /// The same, stopping after `cap` moves.
@@ -705,7 +785,7 @@ pub fn rank_capped(g: &GameState, p: PlayerId, keep: usize, cap: usize) -> Ranki
     Ranking {
         moves: top.finish(),
         total,
-        distinct: total - dupes,
+        distinct: total.saturating_sub(dupes),
         exhaustive: !capped,
         note: if capped {
             format!("first {total} moves in traversal order")

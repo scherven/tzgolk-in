@@ -33,20 +33,36 @@ fn label() -> Style {
     Style::default().fg(ratatui::style::Color::Gray)
 }
 
-/// What the move list is showing.
+/// Where the move list comes from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MoveSource {
-    /// Ten drawn from the rollout policy.
+    /// Drawn from the `sample_legal_move` rollout policy. Cheap, and the only
+    /// option that stays instant in a position with a six-figure move list.
     Sampled,
-    /// The ten best by the placeholder heuristic.
-    Ranked,
+    /// The best of **every** legal move, by `eval::margin`. Nothing is capped
+    /// and nothing is sampled.
+    Full,
+    /// The best of every legal move as the configured `--agent` ranks them —
+    /// for `minimax`, that is the search's own backed-up values, not a one-ply
+    /// score. Falls back to [`MoveSource::Full`] with no agent.
+    Agent,
 }
 
 impl MoveSource {
     pub fn label(self) -> &'static str {
         match self {
-            MoveSource::Sampled => "10 sampled",
-            MoveSource::Ranked => "top 10 by heuristic",
+            MoveSource::Sampled => "sampled",
+            MoveSource::Full => "scored, every move",
+            MoveSource::Agent => "agent's own ranking",
+        }
+    }
+
+    /// The order `t` cycles through.
+    pub fn next(self) -> MoveSource {
+        match self {
+            MoveSource::Sampled => MoveSource::Full,
+            MoveSource::Full => MoveSource::Agent,
+            MoveSource::Agent => MoveSource::Sampled,
         }
     }
 }
@@ -62,12 +78,23 @@ pub struct App {
     /// chose, and the share of visits that went there. This is the search
     /// talking, not a heuristic ranking of it.
     pub last_decisions: Vec<(String, String, f32)>,
-    pub candidates: Vec<(Move, f32)>,
+    /// The move list on show, best first, together with how many moves it was
+    /// drawn from and what produced it.
+    pub ranking: crate::eval::Ranking,
     pub selected: usize,
     pub source: MoveSource,
     pub autoplay: bool,
-    pub total_moves: Option<usize>,
     pub status: String,
+}
+
+impl App {
+    pub fn candidates(&self) -> &[(Move, f32)] {
+        &self.ranking.moves
+    }
+
+    pub fn selected_move(&self) -> Option<&Move> {
+        self.ranking.moves.get(self.selected).map(|(m, _)| m)
+    }
 }
 
 // ---- top-level layout ---------------------------------------------------
@@ -462,13 +489,30 @@ fn cost_str(cost: Bundle) -> String {
 }
 
 fn moves(f: &mut Frame, area: Rect, app: &App) {
-    let title = match app.total_moves {
-        Some(n) => format!("Moves — {} of {n}", app.source.label()),
-        None => format!("Moves — {}", app.source.label()),
+    let r = &app.ranking;
+    let shown = r.moves.len();
+    let title = if r.total == 0 {
+        format!("Moves — {}", app.source.label())
+    } else if r.exhaustive {
+        // The claim the panel is making: this shortlist came out of the whole
+        // move space, not a sample of it. Say how big that space was.
+        let restated = if r.distinct < r.total {
+            format!(", {} distinct", r.distinct)
+        } else {
+            String::new()
+        };
+        format!(
+            "Moves — top {shown} of every one of {}{restated} · {}",
+            r.total,
+            app.source.label()
+        )
+    } else {
+        format!("Moves — {shown} of {} · {}", r.total, app.source.label())
     };
 
     let items: Vec<ListItem> = app
-        .candidates
+        .ranking
+        .moves
         .iter()
         .enumerate()
         .map(|(i, (m, score))| {
@@ -539,7 +583,7 @@ fn preview(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let lines = match app.candidates.get(app.selected) {
+    let lines = match app.ranking.moves.get(app.selected) {
         Some((m, _)) => {
             let before = app.game.state;
             let mut after = before;
@@ -565,11 +609,8 @@ fn preview(f: &mut Frame, area: Rect, app: &App) {
 fn help(f: &mut Frame, area: Rect, app: &App) {
     let auto = if app.autoplay { "on" } else { "off" };
     let text = format!(
-        " j/k move · enter play selected · n next turn · r reroll · t {} · a autoplay [{auto}] · q quit    {}",
-        match app.source {
-            MoveSource::Sampled => "ranked",
-            MoveSource::Ranked => "sampled",
-        },
+        " j/k move · enter play · n next turn · r redraw · t {} · a autoplay [{auto}] · q quit    {}",
+        app.source.next().label(),
         app.status
     );
     f.render_widget(Paragraph::new(Span::styled(text, label())), area);
@@ -599,6 +640,13 @@ pub fn short_agent(name: &str) -> String {
 pub fn decisions_from(nodes: &[crate::record::Node]) -> Vec<(String, String, f32)> {
     let mut out = Vec::new();
     for node in nodes {
+        // Only `TREE_EDGE` nodes index the step enumeration. A one-ply or
+        // minimax agent stores indices into its *own* candidate list under
+        // `policy_kind::NONE`, and reading those through `legal_steps` would
+        // print a confident label for a step the agent never considered.
+        if node.policy_kind != crate::record::policy_kind::TREE_EDGE {
+            continue;
+        }
         let total: u32 = node.visits.iter().map(|(_, n)| *n as u32).sum();
         if total == 0 {
             continue;

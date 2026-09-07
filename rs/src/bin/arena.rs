@@ -380,6 +380,11 @@ CONCURRENCY   (docs/COMPUTE.md section 2)
 AGENT SPECS  (identical in selfplay; see src/record.rs AgentSpec)
   random             the sample_legal_move rollout policy
   heuristic[:K]      one-ply greedy over K sampled turns; K is the strength knob
+  heuristic:full     one ply over EVERY legal move, not a sample of them
+  minimax[:D[:MS[:W]]]  paranoid alpha-beta, D turns deep, MS ms of deepening
+                     per turn, W root moves deepened. The first ply is
+                     exhaustive whatever W is. Budget it: `minimax:4:120` plays
+                     a game in seconds, the 600 ms default takes minutes.
   greedy:K:EVAL      one-ply greedy over any evaluator
   mcts:SIMS[:EVAL]   tree search; EVAL defaults to heuristic
   net-random[:small|main]   an untrained net, for timing the pipeline
@@ -388,6 +393,12 @@ AGENT SPECS  (identical in selfplay; see src/record.rs AgentSpec)
 EXAMPLES
   # is the pipeline wired up at all?  This must be a large positive number.
   arena --candidate heuristic:32 --baseline random --games 200
+
+  # does seeing every move beat sampling 32 of them?
+  arena --candidate heuristic:full --baseline heuristic:32 --games 120
+
+  # does looking ahead beat one ply?
+  arena --candidate minimax:4:120 --baseline heuristic:full --games 120
 
   # does search beat one ply?  the first thing to check after mcts lands.
   arena --candidate mcts:400 --baseline heuristic:32 --games 120

@@ -169,9 +169,47 @@ where
     ControlFlow::Continue(())
 }
 
+/// Which half of the move space to walk.
+///
+/// Traversal emits every placement before any retrieval, so a caller that caps
+/// the walk gets *only* placements — and with three workers in hand there are
+/// already a couple of hundred of those, while retrievals are where the points
+/// come from (88% of generated moves, measured). Splitting the walk lets a
+/// bounded caller give each half its own budget instead of letting the first
+/// half eat the whole thing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kinds {
+    All,
+    Placements,
+    Retrievals,
+}
+
+/// Visit one half of the ordinary move space, or both.
+///
+/// Excludes the pity fallback, which is not a normal move — use
+/// [`visit_legal_moves`] where the fallback matters.
+pub fn visit_moves_of<F>(g: &GameState, p: PlayerId, kinds: Kinds, mut f: F) -> ControlFlow<()>
+where
+    F: FnMut(&Move) -> ControlFlow<()>,
+{
+    visit_normal_moves_of(g, p, kinds, &mut f)
+}
+
 /// Everything except the pity fallback. Separate so that the pity rule can ask
 /// "is there any other move?" without recursing into itself.
 fn visit_normal_moves<F>(g: &GameState, p: PlayerId, f: &mut F) -> ControlFlow<()>
+where
+    F: FnMut(&Move) -> ControlFlow<()>,
+{
+    visit_normal_moves_of(g, p, Kinds::All, f)
+}
+
+fn visit_normal_moves_of<F>(
+    g: &GameState,
+    p: PlayerId,
+    kinds: Kinds,
+    f: &mut F,
+) -> ControlFlow<()>
 where
     F: FnMut(&Move) -> ControlFlow<()>,
 {
@@ -190,8 +228,15 @@ where
             }
             None => g.players[p.idx()].corn,
         };
-        visit_placements(&probe, p, budget, beg, &mut v)?;
-        visit_retrievals(&probe, p, beg, &mut v)?;
+        if kinds != Kinds::Retrievals {
+            visit_placements(&probe, p, budget, beg, &mut v)?;
+        }
+        if kinds != Kinds::Placements {
+            // The `reached` memo carries across beg variants on purpose: begging
+            // one temple down and stepping it back up lands where begging
+            // another would, so the variants converge.
+            visit_retrievals(&probe, p, beg, &mut v)?;
+        }
     }
     ControlFlow::Continue(())
 }
@@ -392,6 +437,15 @@ where
 /// A worker may take the action of its own space or of any *lower* space on the
 /// same gear, paying one corn per space it steps down. The Go version had this
 /// commented out with the note "first attempt broke".
+///
+/// Two prunings keep the step-down walk from multiplying the option count by
+/// `pos+1`. Both rest on the same fact about the generators: **every space's
+/// option list grows monotonically with the player's corn.** Nothing in
+/// `spaces` returns *fewer* choices when a player is richer -- corn only ever
+/// gates an option in (`pay_for_temple` needs three, `build_with_corn` needs
+/// the price, `mirror_choices` needs one, `corn_exchange`'s buying budget only
+/// widens) -- so a list generated after paying a fee is a subset of the same
+/// list generated without paying it.
 pub fn choices_for_worker(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> Vec<Choice> {
     let corn = g.players[p.idx()].corn;
     // "Do nothing (except pick up the worker)" is always one of the three
@@ -400,7 +454,21 @@ pub fn choices_for_worker(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> V
     // worker on Uxmal 3, spend a block on Tikal 5, or build on Tikal 2 and 4.
     let mut out = vec![Choice::skip()];
 
-    for j in 0..=pos.0 {
+    // A worker already standing on a free-choice space has every lower action
+    // for nothing, generated against its *unreduced* corn. Walking down from
+    // there can only re-buy a subset of what it is holding, at a price. This is
+    // the single largest source of duplicate retrievals: a worker on Uxmal 7
+    // used to generate the whole gear eight times over, once per fee.
+    let lowest = if crate::spaces::is_free_choice(gear, pos)
+        // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+        && crate::options::PRUNE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        pos.0
+    } else {
+        0
+    };
+
+    for j in lowest..=pos.0 {
         let fee = pos.0 - j;
         if fee > corn {
             continue;
@@ -420,7 +488,11 @@ pub fn choices_for_worker(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> V
             }
         }
     }
-    crate::options::dedup(out)
+    // The rest of the step-down redundancy is priced, not structural: the same
+    // action is often reachable at two fees (Uxmal's mirror sells any lower
+    // action for one corn, however many spaces down it sits), and the dearer
+    // route is dominated. See `options::dominated_dedup`.
+    crate::options::dominated_dedup(out)
 }
 
 fn visit_retrievals<F>(

@@ -54,9 +54,37 @@ use std::time::{Duration, Instant};
 
 const INF: f32 = 1e9;
 
+/// What the search assumes the other three seats will do.
+///
+/// This is the load-bearing choice in a four-player search, and neither answer
+/// is right — that is why it is a knob and not a constant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Opponents {
+    /// Every opponent plays the move that hurts the root player most.
+    ///
+    /// The textbook reduction: it collapses four scores to one and makes the
+    /// game two-valued, so alpha-beta prunes soundly. It is also false —
+    /// three opponents do not coordinate — and the error is not random. It
+    /// systematically overrates lines whose refutation costs the refuter
+    /// nothing and underrates anything an opponent would have to hurt itself
+    /// to punish.
+    Paranoid,
+    /// Every opponent plays the move its own evaluation likes best, and nothing
+    /// else is considered at that ply.
+    ///
+    /// A `max^n` model with a width-1 opponent beam. It cannot prune — there is
+    /// only one child, so there is nothing to cut — but it is far cheaper for
+    /// the same reason, which buys depth. It matches what the agents in the
+    /// arena actually do, at the cost of never seeing a move an opponent
+    /// happens to have available and the model did not pick.
+    Greedy,
+}
+
 /// How wide the search is at each ply, and when it must stop.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// What the other three seats are assumed to do. See [`Opponents`].
+    pub opponents: Opponents,
     /// Plies to look ahead, counting the root's own move as ply 1. Four is one
     /// full round: my move and one reply from each opponent.
     pub max_depth: u8,
@@ -64,15 +92,24 @@ pub struct Config {
     /// slice the last entry repeats.
     pub widths: Vec<usize>,
     /// Candidate moves enumerated at an *interior* node before the walk is cut
-    /// short. The root ignores this.
+    /// short, **per move kind**. Placements and retrievals get this budget
+    /// each; the root ignores it entirely.
     pub interior_cap: usize,
     /// Rollout-policy draws mixed into an interior node's candidates when the
     /// walk above was cut short. See [`Search::candidates`].
     pub top_up: usize,
-    /// Wall-clock budget for one `search` call. An iteration that runs out is
-    /// discarded whole, so a truncated search returns the last depth that
-    /// finished rather than a half-updated ranking.
+    /// Wall-clock budget for *deepening*. The exhaustive first ply is not
+    /// covered by it — see [`Config::root_budget`] — so a turn costs up to the
+    /// two added together.
     pub budget: Duration,
+    /// Wall-clock budget for the exhaustive first ply.
+    ///
+    /// `None` means walk the whole move list however long that takes, which is
+    /// right when a human is waiting on one position and wrong for anything
+    /// driving a game: the widest turns a strong player reaches run to millions
+    /// of moves. A search that hit this reports `exhaustive: false` rather than
+    /// claiming a shortlist it did not earn.
+    pub root_budget: Option<Duration>,
     /// Ranked root moves to report.
     pub keep: usize,
 }
@@ -80,20 +117,30 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            opponents: Opponents::Paranoid,
             max_depth: 4,
             widths: vec![12, 6, 4, 3, 2],
-            interior_cap: 3_000,
-            top_up: 24,
-            budget: Duration::from_millis(1_500),
+            interior_cap: 400,
+            top_up: 16,
+            budget: Duration::from_millis(600),
+            root_budget: Some(crate::eval::FULL_BUDGET),
             keep: 10,
         }
     }
 }
 
 impl Config {
-    /// A budget in milliseconds, at the default shape.
+    /// A deepening budget in milliseconds, and a root budget scaled to match.
+    ///
+    /// The two move together because a caller asking for a 120 ms search is
+    /// asking for a fast turn, and paying the default 2.5 s root would make
+    /// that number meaningless. The root gets the larger share: it is the one
+    /// ply that has to see everything, and a beam over a shortlist it never
+    /// finished building is worth less than a shallower search over a complete
+    /// one.
     pub fn with_budget_ms(mut self, ms: u64) -> Self {
         self.budget = Duration::from_millis(ms);
+        self.root_budget = Some(Duration::from_millis(ms.saturating_mul(3).max(50)));
         self
     }
 
@@ -197,6 +244,11 @@ impl Search {
     /// Ply 1 is exhaustive: every legal move is generated and scored. The best
     /// `widths[0]` of those are then deepened by iterative deepening until the
     /// budget runs out.
+    ///
+    /// `p` must be the player to move. The seat is written into the working
+    /// copy rather than asserted, so that a caller analysing a position out of
+    /// turn gets the answer it asked for instead of a search that hands the
+    /// turn to the wrong player at every round boundary.
     pub fn search(&mut self, g: &GameState, p: PlayerId) -> Ranking {
         let started = Instant::now();
         self.deadline = started + self.cfg.budget;
@@ -204,9 +256,17 @@ impl Search {
         self.stats = Stats::default();
         self.tt.clear();
 
+        let g = &{
+            let mut probe = *g;
+            probe.current = p;
+            probe
+        };
+
         // ---- ply 1: every move, scored ----------------------------------
         let keep = self.cfg.keep.max(self.cfg.width_at(0));
-        let mut roots = eval::rank_all(g, p, keep);
+        let mut roots = eval::rank_all_within(g, p, keep, self.cfg.root_budget, |s| {
+            eval::margin(s, p)
+        });
         self.stats.root_moves = roots.total;
         if roots.moves.is_empty() {
             roots.note = "no legal move".into();
@@ -286,9 +346,16 @@ impl Search {
         } else {
             format!("depth {best_depth} on top {beam}")
         };
+        let root_note = if roots.exhaustive {
+            format!("all {} root moves{restated}", self.stats.root_moves)
+        } else {
+            format!(
+                "{} root moves{restated} — the list is wider than the root budget",
+                self.stats.root_moves
+            )
+        };
         roots.note = format!(
-            "{depth_note} of all {} root moves{restated} · {} nodes, {} cutoffs · {:.0} ms",
-            self.stats.root_moves,
+            "{depth_note} of {root_note} · {} nodes, {} cutoffs · {:.0} ms",
             self.stats.nodes,
             self.stats.cutoffs,
             self.stats.elapsed.as_secs_f64() * 1e3
@@ -344,7 +411,15 @@ impl Search {
         let maximizing = mover == self.root;
         let (alpha0, beta0) = (alpha, beta);
 
-        let cands = self.candidates(g, mover, self.cfg.width_at(ply));
+        // Under `Greedy`, an opponent's ply is one move wide: whichever its own
+        // evaluation prefers. The min over a single child is that child, so the
+        // rest of this function needs no special case.
+        let width = if maximizing || self.cfg.opponents == Opponents::Paranoid {
+            self.cfg.width_at(ply)
+        } else {
+            1
+        };
+        let cands = self.candidates(g, mover, width);
         if cands.is_empty() {
             // No legal move at all should be impossible — the pity rule always
             // leaves something — but a search must not invent a score for a
@@ -397,14 +472,19 @@ impl Search {
 
     /// The moves an interior node will actually search, best first.
     ///
-    /// This is where culling happens. The walk is cut off at
-    /// [`Config::interior_cap`], which covers the great majority of positions
-    /// whole — the median node has 42 moves — but a wide one gets a *prefix* in
-    /// traversal order, and traversal order is not a sample: placements come
-    /// before retrievals, and retrievals come worker by worker. So when the walk
-    /// is cut short, [`Config::top_up`] draws from `sample_legal_move` are mixed
-    /// in, which is the project's own rollout policy and is shaped like real
-    /// play. The beam is then the best `width` by one-ply static score.
+    /// This is where culling happens, and it is the one place in the search
+    /// where a legal move can go unconsidered. Three things keep that honest:
+    ///
+    /// * **The budget is per kind.** Placements and retrievals are walked
+    ///   separately, each capped at [`Config::interior_cap`]. A single capped
+    ///   walk would spend the whole budget on placements — they come first in
+    ///   traversal order and three workers in hand already make a couple of
+    ///   hundred — and never reach a retrieval, which is where the points are.
+    /// * **A cut-short walk is topped up by sampling.** Within a kind the
+    ///   prefix is still traversal order, not a sample, so
+    ///   [`Config::top_up`] draws from `sample_legal_move` are mixed in — the
+    ///   project's own rollout policy, shaped like real play.
+    /// * **The root does none of this.** Ply 1 is exhaustive.
     ///
     /// Ordering uses the *mover's* own estimate rather than the root's margin:
     /// it is a quarter of the cost (one `heuristic` call, not four) and ordering
@@ -412,20 +492,32 @@ impl Search {
     fn candidates(&mut self, g: &GameState, mover: PlayerId, width: usize) -> Vec<Move> {
         let cap = self.cfg.interior_cap;
         let mut seen: Vec<(Move, f32)> = Vec::new();
-        let mut n = 0usize;
+        let mut capped = false;
 
-        let flow = moves::visit_legal_moves(g, mover, |m| {
-            n += 1;
-            let succ = eval::successor(g, mover, m);
-            seen.push((m.clone(), eval::heuristic(&succ, mover)));
-            if n >= cap {
-                ControlFlow::Break(())
-            } else {
+        for kind in [moves::Kinds::Placements, moves::Kinds::Retrievals] {
+            let mut n = 0usize;
+            let flow = moves::visit_moves_of(g, mover, kind, |m| {
+                n += 1;
+                let succ = eval::successor(g, mover, m);
+                seen.push((m.clone(), eval::heuristic(&succ, mover)));
+                if n >= cap {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+            capped |= flow.is_break();
+        }
+
+        if seen.is_empty() {
+            // No ordinary move exists, so the gods take pity. That set is tiny
+            // and `visit_legal_moves` is the only thing that generates it.
+            let _ = moves::visit_legal_moves(g, mover, |m| {
+                let succ = eval::successor(g, mover, m);
+                seen.push((m.clone(), eval::heuristic(&succ, mover)));
                 ControlFlow::Continue(())
-            }
-        });
-
-        if flow.is_break() {
+            });
+        } else if capped {
             for _ in 0..self.cfg.top_up {
                 let Some(m) = moves::sample_legal_move(g, mover, &mut self.rng) else {
                     break;

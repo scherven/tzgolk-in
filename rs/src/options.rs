@@ -366,6 +366,9 @@ pub fn corn_exchange(g: &GameState, p: PlayerId) -> Vec<Choice> {
     dedup(out)
 }
 
+// SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+pub static PRUNE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// Sort and deduplicate. Generation is naturally redundant -- several routes
 /// reach the same bundle of effects -- and identical choices are worth
 /// collapsing before they multiply through move generation.
@@ -373,6 +376,66 @@ pub fn dedup(mut v: Vec<Choice>) -> Vec<Choice> {
     v.sort();
     v.dedup();
     v
+}
+
+/// Sort, deduplicate, and drop every choice another choice buys more cheaply.
+///
+/// Two choices that agree on every non-corn effect, in the same order, and
+/// differ only in how much corn they move are not two decisions: whoever takes
+/// the dearer one arrives at exactly the position the cheaper one reaches, with
+/// less corn in hand. Nothing in the game pays a player for holding *less*
+/// corn -- the one rule that reads a corn ceiling is begging, which requires
+/// fewer than three and hands back three plus a step *down* a temple, so it is
+/// a worse position on both axes than simply keeping the corn. The dearer
+/// choice is therefore dominated, not merely unattractive.
+///
+/// This is the same argument `choices_for_worker` already made for "paying corn
+/// to reach a space that does nothing", generalised from the empty choice to
+/// every choice. It matters because the board offers the *same action at two
+/// prices* all over the place once a worker is high on a gear: Uxmal's mirror
+/// sells any lower action for one corn while stepping down to that action
+/// costs one corn per space, and the free-choice spaces at the top of every
+/// gear repeat the whole gear for nothing.
+///
+/// Corn deltas commute with everything else in an affordable choice -- no
+/// generated effect reads the corn count at execution time, and generation
+/// never emits a sequence whose running corn balance dips below zero -- so
+/// comparing the net is comparing the position reached. The non-corn effects
+/// are keyed *in order* rather than as a multiset, which leaves two spellings
+/// of the same bundle standing: `Effect::TempleStep` clamps, so re-ordering is
+/// not free in general and is not worth the proof here.
+///
+/// The empty choice is exempt. "Pick the worker up and do nothing" is one of
+/// the three options the rules name, not a degenerate corn gain, and every
+/// space is required to offer it (`doing_nothing_is_always_an_option`) --
+/// without the exemption a space whose action is pure corn, like Palenque 1,
+/// would lose it to its own payout.
+pub fn dominated_dedup(v: Vec<Choice>) -> Vec<Choice> {
+    // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+    if !PRUNE.load(std::sync::atomic::Ordering::Relaxed) {
+        return dedup(v);
+    }
+    // `(is skip, non-corn effects, -net corn, choice)`: sorting on that puts
+    // every rival spelling of one outcome in a run, cheapest first, and parks
+    // the empty choice in a bucket of its own.
+    let mut keyed: Vec<(bool, Effects, i32, Choice)> = v
+        .into_iter()
+        .map(|c| {
+            let key: Effects = c
+                .0
+                .iter()
+                .copied()
+                .filter(|e| !matches!(e, Effect::Corn(_)))
+                .collect();
+            let cost = -c.net_corn();
+            (c.is_skip(), key, cost, c)
+        })
+        .collect();
+    keyed.sort_unstable();
+    keyed.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    let mut out: Vec<Choice> = keyed.into_iter().map(|(_, _, _, c)| c).collect();
+    out.sort();
+    out
 }
 
 /// Monument definitions are static; this is here so callers don't reach past

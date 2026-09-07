@@ -6,7 +6,7 @@
 
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
-use tzolkin::eval::heuristic;
+use tzolkin::eval::{self, margin, Ranking};
 use tzolkin::game::Game;
 use tzolkin::moves::sample_legal_move;
 use tzolkin::ui::{self, App, MoveSource};
@@ -22,32 +22,35 @@ fn main() {
         game.play_round();
     }
 
-    let ranked = std::env::args().any(|a| a == "--ranked");
+    let full = std::env::args().any(|a| a == "--full" || a == "--ranked");
     let p = game.state.current;
-    let mut candidates = Vec::new();
-    let mut total = None;
 
-    if ranked {
-        let all = tzolkin::moves::legal_moves_capped(&game.state, p, 20_000);
-        total = Some(all.len());
-        for (i, s) in tzolkin::eval::rank(&game.state, p, &all).into_iter().take(10) {
-            candidates.push((all[i].clone(), s));
-        }
+    let ranking = if full {
+        eval::rank_all(&game.state, p, 10)
     } else {
+        let mut moves = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
-            if candidates.len() >= 10 {
+            if moves.len() >= 10 {
                 break;
             }
             if let Some(m) = sample_legal_move(&game.state, p, &mut game.rng) {
                 if seen.insert(m.clone()) {
-                    let mut probe = game.state;
-                    tzolkin::moves::apply_move(&mut probe, p, &m);
-                    candidates.push((m, heuristic(&probe, p)));
+                    let succ = eval::successor(&game.state, p, &m);
+                    moves.push((m, margin(&succ, p)));
                 }
             }
         }
-    }
+        moves.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let n = moves.len();
+        Ranking {
+            moves,
+            total: n,
+            distinct: n,
+            exhaustive: false,
+            note: format!("{n} draws from the rollout policy"),
+        }
+    };
 
     // `--agent SPEC` plays one turn with that agent first, so the render shows
     // the search panel rather than the heuristic move list.
@@ -84,11 +87,10 @@ fn main() {
         agent: None,
         agent_name,
         last_decisions,
-        candidates,
+        ranking,
         selected: 0,
-        source: if ranked { MoveSource::Ranked } else { MoveSource::Sampled },
+        source: if full { MoveSource::Full } else { MoveSource::Sampled },
         autoplay: false,
-        total_moves: total,
         status: format!("seed {seed}, {rounds} rounds in"),
     };
 
