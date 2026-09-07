@@ -42,23 +42,31 @@ AGENT SPECS  (the same ones arena and selfplay take)
   heuristic:full                      one ply, over EVERY legal move
   minimax[:DEPTH[:MS[:WIDTH]]]        paranoid alpha-beta; exhaustive first ply
   greedy:K:EVAL / greedy:full:EVAL    one ply over any evaluator
-  mcts:SIMS[:EVAL]                    tree search
+  mcts:SIMS[:EVAL][:FLAGS]            tree search; FLAGS is a comma-separated
+                                      key=value list over MctsConfig, e.g.
+                                      mcts:2048:pri=1ply,ptemp=4
   PATH.safetensors                    shorthand for mcts on a trained net
 
 VIEWS  (cycle with `t`)
   sampled   ten draws from the rollout policy -- instant, and biased
   full      the ten best of EVERY legal move, by eval::margin
-  agent     the ten best of every legal move as --agent scores them. For
-            minimax those are backed-up search values, so they price the
-            opponents' replies; for a one-ply agent they are its evaluator's.
+  agent     the agent's own ranking. For minimax and the one-ply agents that
+            is every legal move, scored -- backed-up search values in the first
+            case, the evaluator's in the second. For mcts it is the whole turns
+            the tree actually walked, scored by visit share in percent, and the
+            status line says so: a tree holds only the paths its simulations
+            took, so that shortlist is not drawn from the whole move space and
+            the panel does not claim it is.
 
 KEYS
   j/k    move the selection        n    let the current player act
   enter  play the highlighted move r    recompute the list
   t      next view                 a    autoplay          q  quit
 
-Scores are `margin`: this player's estimated final score less the best
-opponent's. Positive means ahead.
+Scores are `margin` -- this player's estimated final score less the best
+opponent's, so positive means ahead -- except in the `agent` view under an mcts
+agent, where the column is a visit share in percent. The status line always
+names the scale in use.
 ";
 
 fn main() -> io::Result<()> {
@@ -80,11 +88,15 @@ fn main() -> io::Result<()> {
     let spec = std::env::args()
         .position(|a| a == "--agent")
         .and_then(|i| std::env::args().nth(i + 1));
-    // `record: true` is what makes the agent hand back its decision nodes;
-    // with `false` it plays the same move and reports nothing, which is how the
-    // search panel came up empty the first time.
+    // Records its decision nodes — that is what fills the search panel, and
+    // with plain `parse_agent(s, false)` the panel came up empty the first
+    // time. It does **not** explore: `record` used to imply self-play, so this
+    // viewer was running MCTS with 0.25 Dirichlet noise deliberately scrambling
+    // its root priors and playout-cap randomisation dropping seven turns in
+    // eight to an eighth of the budget. Noise is a replay-buffer device; a
+    // human watching wants the policy the search actually believes.
     let agent = match &spec {
-        Some(s) => match tzolkin::record::parse_agent(s, true) {
+        Some(s) => match tzolkin::record::parse_analysis_agent(s) {
             Ok(a) => Some(a),
             Err(e) => {
                 eprintln!("tui: --agent {s}: {e}");

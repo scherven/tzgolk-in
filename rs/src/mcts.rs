@@ -22,6 +22,25 @@
 //!   the turn, a `Take` three levels down a cold branch sees a handful — and one
 //!   constant cannot be right for both.
 //!
+//! # Against the alpha-beta, at matched work
+//!
+//! Worth knowing before spending another day tuning `search.rs`. On the same
+//! positions and at the same cost per turn — `mcts:2048` at 21.9 ms against
+//! `minimax:8:200::greedy:capw=25` at 19.8 ms — this search is **+9.32**
+//! centred score head to head (95% CI +6.09..+12.55, p < 0.0001, 39 blocks /
+//! 156 games, solo mode) and takes 40.4% of its games against three of them,
+//! where an equally strong agent would take 25%.
+//!
+//! The match is on *work* rather than on the clock, deliberately. Both sides
+//! are budget-invariant: this search runs its 2048 simulations whatever else
+//! the machine is doing, and the alpha-beta was given a budget too large to
+//! bind so that it stops at `max_depth` rather than on the clock. That matters
+//! because the two budgets are different kinds of thing, and a loaded machine
+//! silently favours the one counted in simulations — the same comparison with
+//! a 200 ms alpha-beta budget reads +11.79 (n = 23) instead of +9.46, and the
+//! difference is the contention, not the players. The 21.9-vs-19.8 ms figures
+//! are what make the two budgets comparable at all.
+//!
 //! Not done yet: this is single-threaded. Virtual loss is applied and removed
 //! for real, on the mover's component only, so the mechanism is exercised and
 //! the shape is right, but the statistics are plain `u32`/`f32` rather than
@@ -73,6 +92,45 @@ pub struct MctsConfig {
     /// is ~900 sub-decisions.
     pub max_depth: u32,
     pub seed: u64,
+    /// Where an edge's prior comes from. See [`Priors`].
+    pub priors: Priors,
+    /// Softmax temperature for [`Priors::OnePly`], **in points** — the same
+    /// scale `eval::heuristic` returns, so 4.0 means "a four-point edge over a
+    /// sibling is worth e times the prior".
+    pub prior_temp: f32,
+    /// Do not spend a one-ply pass on a node narrower than this.
+    ///
+    /// The pass costs an `apply_step` and an `eval::heuristic` per edge, so its
+    /// cost is linear in width while the *benefit* is not: a two-edge node is
+    /// resolved by three simulations whatever its prior says. Widths here run
+    /// 2..2293 with a median searched width of 3 (`phase.rs`), so the threshold
+    /// is where most of the saving is.
+    pub prior_min_edges: usize,
+}
+
+/// Where an edge's prior comes from.
+///
+/// # Why this is a knob rather than a decision
+///
+/// `phase::HeuristicEvaluator` fills `Evaluation::priors` with `1.0 / n_edges`,
+/// so with no network the search is told *nothing* about which sub-decision is
+/// worth exploring and PUCT's exploration term does the whole job of a policy
+/// head. A trained net's policy head is a real prior and must not be
+/// overwritten, so the source has to be selectable rather than wired in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Priors {
+    /// Whatever the evaluator returned.
+    Evaluator,
+    /// One ply per edge: apply the `Step` to a copy, score the result with
+    /// `eval::heuristic` for the *mover* (not the turn holder — they differ at
+    /// `ExtraDay`), and softmax at [`MctsConfig::prior_temp`].
+    ///
+    /// `eval::heuristic` is the same estimate the alpha-beta uses at its
+    /// leaves, and it prices a placed worker (`board_position`, and
+    /// `TEMPO_PER_ROUND` for riding a gear) rather than only what a player is
+    /// holding — which is what makes a one-ply score of "put a worker on gear
+    /// X" mean anything at all.
+    OnePly,
 }
 
 impl Default for MctsConfig {
@@ -92,7 +150,41 @@ impl Default for MctsConfig {
             virtual_loss: 1,
             max_depth: 2048,
             seed: 0,
+            priors: Priors::Evaluator,
+            prior_temp: 4.0,
+            prior_min_edges: 3,
         }
+    }
+}
+
+/// Something that can bias a node's priors without excluding anything.
+///
+/// This is the seam `src/plan.rs` is being written against. A game-long plan —
+/// a target monument, a temple being raced for, a research track — knows things
+/// a one-ply score cannot: that *this* building is on the way to *that*
+/// monument, four rounds out. The way it says so is by raising a prior, never
+/// by removing an edge, because PUCT still reaches a low-prior edge given
+/// enough simulations. A wrong plan then costs simulations, not correctness,
+/// and that is the whole reason to let a plan touch the search at all.
+///
+/// Weights are multiplicative and applied *before* renormalisation, so `1.0` is
+/// "no opinion" and the identity bias is exactly the unbiased search.
+pub trait PriorBias: Send + Sync {
+    /// Fill `out` — already `1.0` and the same length as `steps` — with a
+    /// non-negative weight per edge.
+    fn bias(
+        &self,
+        state: &GameState,
+        phase: Phase,
+        mover: PlayerId,
+        steps: &[Step],
+        out: &mut [f32],
+    );
+
+    /// For the agent label, so a run biased by a plan cannot be mistaken for
+    /// one that was not.
+    fn name(&self) -> String {
+        "bias".into()
     }
 }
 
@@ -119,6 +211,10 @@ struct Node {
     /// edge list is sorted by prior, so the open set is always the best
     /// `active` of them.
     active: usize,
+    /// Legal steps at this node before §2.6's cap dropped any. `edges.len()` is
+    /// already the truncated list, so without this there is nothing left that
+    /// remembers a wide node was ever wide.
+    n_legal: u32,
     visits: u32,
     w: [f32; N_PLAYERS],
     /// The evaluation this node was created with. `None` for a node the descent
@@ -166,6 +262,45 @@ impl SearchResult {
     }
 }
 
+/// One complete turn the tree searched, as the path of `Step`s that spells it.
+#[derive(Clone, Debug)]
+pub struct TurnLine {
+    pub steps: Vec<Step>,
+    /// Simulations that ran the whole turn out along this path — the numerator
+    /// of the search's policy over *turns*.
+    pub visits: u32,
+    /// Backed-up value for the searched player at the commit edge, on the
+    /// `z_rel` scale of §4.5 rather than in points.
+    pub value: f32,
+}
+
+/// What one root search knows about complete turns.
+///
+/// # What it is not
+///
+/// It is not a ranking of the legal move list. A turn is a chain of ~8
+/// sub-decisions and the tree only ever holds the paths its simulations walked,
+/// so `lines` is bounded by `sims` and is a *sample shaped by the search* —
+/// which is the interesting thing about it, and also why nothing here may claim
+/// to be exhaustive.
+pub struct TurnRanking {
+    /// Best first by `visits`, truncated to the caller's `keep`.
+    pub lines: Vec<TurnLine>,
+    /// Complete turns the tree reached, before `keep` truncated the list.
+    pub found: usize,
+    /// Simulations that reached a commit edge. Smaller than `sims`, because a
+    /// simulation that stops at a fresh node inside the turn never finishes
+    /// one; this is the honest denominator for a visit share.
+    pub committed: u32,
+    pub sims: u32,
+    /// True when every node on a searched path had all of its legal edges open
+    /// — nothing lost to §2.6's cap, nothing still waiting on progressive
+    /// widening — so every legal turn was at least *reachable*. It says nothing
+    /// about whether the search actually looked at them.
+    pub all_edges_open: bool,
+    pub nodes: usize,
+}
+
 /// One turn played out as a chain of searches.
 pub struct PlayedTurn {
     /// One entry per sub-decision, in the order they were taken. Each is a
@@ -193,6 +328,11 @@ pub struct Mcts<E: Evaluator> {
     /// environment. Reuse is **not** behaviour-neutral -- see `MctsConfig` --
     /// so being able to switch it off is how the two are compared.
     reuse_disabled: bool,
+    /// Optional plan-level steer on the priors. See [`PriorBias`].
+    bias: Option<std::sync::Arc<dyn PriorBias>>,
+    /// Scratch for the one-ply prior pass, so a node of width 2293 does not
+    /// allocate on every expansion.
+    scratch: Vec<f32>,
 }
 
 impl<E: Evaluator> Mcts<E> {
@@ -209,7 +349,18 @@ impl<E: Evaluator> Mcts<E> {
             reused: 0,
             discarded: 0,
             reuse_disabled,
+            bias: None,
+            scratch: Vec::new(),
         }
+    }
+
+    /// Install a plan-level steer on the priors. See [`PriorBias`].
+    pub fn set_bias(&mut self, bias: Option<std::sync::Arc<dyn PriorBias>>) {
+        self.bias = bias;
+    }
+
+    pub fn bias_name(&self) -> Option<String> {
+        self.bias.as_ref().map(|b| b.name())
     }
 
     pub fn evaluator(&self) -> &E {
@@ -337,7 +488,7 @@ impl<E: Evaluator> Mcts<E> {
             root_value,
             sims,
             nodes: self.nodes.len(),
-            legal_edges: node.edges.len(),
+            legal_edges: node.n_legal as usize,
         }
     }
 
@@ -376,8 +527,115 @@ impl<E: Evaluator> Mcts<E> {
         }
     }
 
+    /// Search one whole turn and rank the complete turns the tree explored.
+    ///
+    /// # Why this is not `play_turn`
+    ///
+    /// `play_turn` searches each link of the chain separately, so it spends
+    /// `sims` per sub-decision and never holds more than one turn's prefix.
+    /// This runs a *single* search rooted at `Beg` and reads complete
+    /// root-to-commit paths out of the resulting tree, which is the only place
+    /// the search's opinion about a whole turn exists as one number.
+    ///
+    /// It is an explanation hook — `Agent::ranked_moves`, the TUI's `agent`
+    /// view — and deliberately not what the agent plays, per that trait's note
+    /// that the two may cost very different amounts.
+    pub fn ranked_turns(
+        &mut self,
+        state: &GameState,
+        turn: PlayerId,
+        sims: u32,
+        keep: usize,
+    ) -> TurnRanking {
+        // A fresh arena, not the reuse path: a viewer asking about the same
+        // position twice must get the same answer, and a retained subtree makes
+        // the second answer depend on the first.
+        self.nodes.clear();
+        self.index.clear();
+        self.reused = 0;
+        self.discarded = 0;
+        let root = self.node_for(*state, Phase::Beg, turn, 0, true).0;
+        for _ in 0..sims {
+            self.simulate(root);
+        }
+
+        let seat = turn.idx();
+        let mut lines: Vec<TurnLine> = Vec::new();
+        let mut committed = 0u32;
+        let mut all_edges_open = true;
+        let mut stack: Vec<(u32, Vec<Step>)> = vec![(root, Vec::new())];
+        while let Some((idx, path)) = stack.pop() {
+            let node = &self.nodes[idx as usize];
+            if node.active < node.n_legal as usize {
+                all_edges_open = false;
+            }
+            // Collected first so the borrow ends before the recursion pushes.
+            let taken: Vec<(usize, u32, f32, bool)> = node.edges[..node.active]
+                .iter()
+                .filter(|e| e.n > 0 && e.child.is_some())
+                .map(|e| {
+                    let c = e.child.unwrap();
+                    (
+                        c as usize,
+                        e.n,
+                        e.w[seat] / e.n as f32,
+                        // `in_root_turn` is cleared by `create_child` exactly at
+                        // a commit edge, so a child without it is the start of
+                        // somebody else's turn.
+                        !self.nodes[c as usize].in_root_turn,
+                    )
+                })
+                .collect();
+            let steps: Vec<Step> = node.edges[..node.active]
+                .iter()
+                .filter(|e| e.n > 0 && e.child.is_some())
+                .map(|e| e.step.clone())
+                .collect();
+            for ((child, n, q, commits), step) in taken.into_iter().zip(steps) {
+                let mut next = path.clone();
+                next.push(step);
+                if commits {
+                    committed += n;
+                    lines.push(TurnLine {
+                        steps: next,
+                        visits: n,
+                        value: q,
+                    });
+                } else {
+                    stack.push((child as u32, next));
+                }
+            }
+        }
+        lines.sort_by(|a, b| b.visits.cmp(&a.visits).then(b.value.total_cmp(&a.value)));
+        let found = lines.len();
+        lines.truncate(keep.max(1));
+        TurnRanking {
+            lines,
+            found,
+            committed,
+            sims,
+            all_edges_open,
+            nodes: self.nodes.len(),
+        }
+    }
+
     pub fn arena_len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// `(legal edges, edges open)` for every node in the arena, interior ones
+    /// included.
+    ///
+    /// The roots of a turn's sub-decisions are narrow — p50 3 — so a
+    /// measurement taken there says nothing about whether §2.6's cap is set
+    /// sensibly. The wide nodes are `Take` nodes further down a descent, and
+    /// this is the only place they are visible.
+    pub fn node_widths(&self) -> Vec<(u32, u32)> {
+        self.nodes
+            .iter()
+            .filter(|n| !n.terminal)
+            .map(|n| (n.n_legal, n.active as u32))
+            .collect()
     }
 
     /// Total virtual loss still resting on edges anywhere in the arena.
@@ -693,8 +951,12 @@ impl<E: Evaluator> Mcts<E> {
             // approximately, so denying the leader really does raise your own
             // component.
             recentre(&mut value);
-            let priors = eval.priors;
-            debug_assert_eq!(priors.len(), n_legal, "evaluator returned the wrong prior count");
+            debug_assert_eq!(
+                eval.priors.len(),
+                n_legal,
+                "evaluator returned the wrong prior count"
+            );
+            let priors = self.priors_for(&state, phase, turn, done, &steps, eval.priors);
             let mut edges: Vec<Edge> = steps
                 .into_iter()
                 .enumerate()
@@ -739,6 +1001,7 @@ impl<E: Evaluator> Mcts<E> {
             mover: phase.mover(turn).idx(),
             edges: edges.into_boxed_slice(),
             active,
+            n_legal: n_legal as u32,
             visits: 0,
             w: [0.0; N_PLAYERS],
             value,
@@ -759,6 +1022,7 @@ impl<E: Evaluator> Mcts<E> {
             mover: state.current.idx(),
             edges: Vec::new().into_boxed_slice(),
             active: 0,
+            n_legal: 0,
             visits: 0,
             w: [0.0; N_PLAYERS],
             value: Some(z_rel(state.scores())),
@@ -766,6 +1030,91 @@ impl<E: Evaluator> Mcts<E> {
             in_root_turn: false,
         });
         idx
+    }
+
+    /// The prior over a node's edges, before the §2.6 cap and the §3.7 noise.
+    ///
+    /// The evaluator's own priors are the default because a trained policy head
+    /// *is* this, only better. [`Priors::OnePly`] exists because there is no
+    /// head yet and `HeuristicEvaluator` returns `1.0 / n_edges`, which tells
+    /// the search nothing.
+    fn priors_for(
+        &mut self,
+        state: &GameState,
+        phase: Phase,
+        turn: PlayerId,
+        done: u8,
+        steps: &[Step],
+        from_eval: Vec<f32>,
+    ) -> Vec<f32> {
+        let mover = phase.mover(turn);
+        let mut p = match self.cfg.priors {
+            Priors::OnePly if steps.len() >= self.cfg.prior_min_edges => {
+                self.one_ply(state, phase, turn, done, steps, mover)
+            }
+            _ => from_eval,
+        };
+        if let Some(bias) = self.bias.clone() {
+            self.scratch.clear();
+            self.scratch.resize(steps.len(), 1.0);
+            bias.bias(state, phase, mover, steps, &mut self.scratch);
+            for (x, w) in p.iter_mut().zip(self.scratch.iter()) {
+                // Clamped at zero, not renormalised here: node_for renormalises
+                // over the retained edges anyway, and a plan that zeroed every
+                // edge would fall through to that function's uniform fallback
+                // rather than to a NaN.
+                *x *= w.max(0.0);
+            }
+        }
+        p
+    }
+
+    /// One `apply_step` and one `eval::heuristic` per edge, softmaxed at
+    /// `prior_temp`.
+    ///
+    /// The alpha-beta work measured 2.16 µs to walk the move generator against
+    /// 2.29 µs to walk *and* apply *and* score, so scoring a candidate the
+    /// generator has already produced is the cheap end of expansion. What is
+    /// not cheap is doing it on a node three edges wide that three simulations
+    /// would have resolved anyway — hence `prior_min_edges`.
+    fn one_ply(
+        &self,
+        state: &GameState,
+        phase: Phase,
+        turn: PlayerId,
+        done: u8,
+        steps: &[Step],
+        mover: PlayerId,
+    ) -> Vec<f32> {
+        let mut out: Vec<f32> = Vec::with_capacity(steps.len());
+        let mut best = f32::NEG_INFINITY;
+        for step in steps {
+            let mut next = *state;
+            let _ = tree::apply_step(&mut next, phase, turn, done, step);
+            // The mover's own estimate, not `eval::margin`. Siblings of one
+            // node differ almost only in what the mover did, so the
+            // best-opponent term is common to them and subtracting it would
+            // cost three more `heuristic` calls an edge to change nothing.
+            let s = crate::eval::heuristic(&next, mover);
+            if s > best {
+                best = s;
+            }
+            out.push(s);
+        }
+        // Shifted by the max before exponentiating: `heuristic` runs to ~200
+        // points late in a game and `exp(200/4)` is not a number.
+        let t = self.cfg.prior_temp.max(1e-3);
+        let mut sum = 0.0;
+        for x in out.iter_mut() {
+            *x = ((*x - best) / t).exp();
+            sum += *x;
+        }
+        if sum > 0.0 {
+            for x in out.iter_mut() {
+                *x /= sum;
+            }
+        }
+        out
     }
 
     /// §3.7: noise on every node of the root player's turn, not only the literal

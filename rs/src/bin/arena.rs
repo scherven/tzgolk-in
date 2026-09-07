@@ -386,7 +386,11 @@ AGENT SPECS  (identical in selfplay; see src/record.rs AgentSpec)
                      exhaustive whatever W is. Budget it: `minimax:4:120` plays
                      a game in seconds, the 600 ms default takes minutes.
   greedy:K:EVAL      one-ply greedy over any evaluator
-  mcts:SIMS[:EVAL]   tree search; EVAL defaults to heuristic
+  mcts:SIMS[:EVAL][:FLAGS]  tree search; EVAL defaults to heuristic. FLAGS is a
+                     comma-separated key=value list over MctsConfig and shows up
+                     in the agent name, so two variants can be raced in one run:
+                     pri=eval|1ply, ptemp=, pmin=, cp=, cpb=, fpu=, k=, wc=,
+                     wa=, wcap=, vl=, reuse, noreuse
   net-random[:small|main]   an untrained net, for timing the pipeline
   PATH.safetensors   a checkpoint; same as mcts:3200:PATH
 
@@ -402,6 +406,10 @@ EXAMPLES
 
   # does search beat one ply?  the first thing to check after mcts lands.
   arena --candidate mcts:400 --baseline heuristic:32 --games 120
+
+  # do informed priors beat the uniform ones?  both sides in one process, so
+  # the answer does not depend on what else the machine was doing.
+  arena --candidate mcts:2048:pri=1ply --baseline mcts:2048 --games 600
 
   # the every-few-hours question: is generation 40 better than 39?
   arena --candidate ckpt/gen0040.safetensors --baseline ckpt/gen0039.safetensors \\

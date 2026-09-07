@@ -59,13 +59,15 @@ fn main() {
         .and_then(|i| std::env::args().nth(i + 1));
     let mut agent_name = String::new();
     let mut last_decisions = Vec::new();
+    let mut agent_ranking = None;
     if let Some(sp) = &spec {
         use rand::SeedableRng;
-        let agent = tzolkin::record::parse_agent(sp, true).expect("bad --agent");
+        let agent = tzolkin::record::parse_analysis_agent(sp).expect("bad --agent");
         agent_name = agent.name();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-        // Only about a quarter of turns run the full budget and record nodes,
-        // so keep playing until one does.
+        // Every turn is at the full budget now that recording no longer drags
+        // playout-cap randomisation along with it, so this loop is a guard
+        // against a forced turn rather than against a 1-in-4 write rate.
         for _ in 0..12 {
             let p = game.state.current;
             match agent.play_turn(&game.state, p, 0.0, &mut rng) {
@@ -74,6 +76,11 @@ fn main() {
                     game.play(p, &o.mv);
                     game.state.current = game.state.current.next(1);
                     if !last_decisions.is_empty() {
+                        // The `agent` view: the agent's own ranking of whole
+                        // turns, which is the thing the panel claims to show
+                        // and used to substitute a one-ply heuristic for.
+                        agent_ranking =
+                            agent.ranked_moves(&game.state, game.state.current, 10);
                         break;
                     }
                 }
@@ -82,6 +89,17 @@ fn main() {
         }
     }
 
+    let source = match (&agent_ranking, full) {
+        (Some(_), _) => MoveSource::Agent,
+        (None, true) => MoveSource::Full,
+        (None, false) => MoveSource::Sampled,
+    };
+    let ranking = agent_ranking.unwrap_or(ranking);
+    // The note is where a ranking says what its numbers mean -- for MCTS, that
+    // the column is a visit share and the shortlist is not the move list -- and
+    // the TUI puts it in the status line, so a dump that dropped it would be
+    // reviewing a different screen.
+    let status = format!("seed {seed}, {rounds} rounds in · {}", ranking.note);
     let app = App {
         game,
         agent: None,
@@ -89,9 +107,9 @@ fn main() {
         last_decisions,
         ranking,
         selected: 0,
-        source: if full { MoveSource::Full } else { MoveSource::Sampled },
+        source,
         autoplay: false,
-        status: format!("seed {seed}, {rounds} rounds in"),
+        status,
     };
 
     let mut term = Terminal::new(TestBackend::new(cols, rows)).unwrap();

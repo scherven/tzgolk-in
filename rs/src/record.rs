@@ -65,7 +65,7 @@ use rand::Rng;
 use crate::eval::Ranking;
 use crate::ids::*;
 use crate::moves::{apply_move, sample_legal_move, Move};
-use crate::mcts::{Mcts, MctsConfig, SearchResult};
+use crate::mcts::{Mcts, MctsConfig, Priors, SearchResult};
 use crate::phase::{Evaluation, Evaluator, HeuristicEvaluator, Phase, Step};
 use crate::tree;
 use crate::state::{Deck, GameState, GearState, Player, TileStack, WorkerLoc, MAX_GEAR_SPACES, N_DISPLAY};
@@ -2168,27 +2168,134 @@ pub struct SearchAgent {
     label: String,
 }
 
+/// Whether a searching agent is generating training data or answering a
+/// question, which is **not** the same as whether it hands back decision nodes.
+///
+/// Conflating the two cost the TUI both halves of this enum: it asks for
+/// `record: true` to populate its search panel, and used to get 0.25 Dirichlet
+/// noise scrambling its root priors *and* playout-cap randomisation running
+/// seven turns in eight at a eighth of the budget. A human watching a game
+/// wants the policy the search actually believes, at the budget they asked for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Exploration {
+    /// `SEARCH.md` §3.7 Dirichlet noise on the root turn, and `LEARNING.md`
+    /// §6.3 playout-cap randomisation. Both exist to diversify a replay buffer.
+    SelfPlay,
+    /// The search's own policy, every turn at the full budget.
+    Off,
+}
+
 impl SearchAgent {
+    /// Self-play when `record`, evaluation otherwise — the historical shape,
+    /// kept because it is what every caller but the TUI wants.
     pub fn new(ev: Arc<dyn Evaluator>, full_sims: u32, record: bool, seed: u64) -> SearchAgent {
-        let mut cfg = MctsConfig {
-            seed,
-            ..MctsConfig::default()
+        let explore = if record {
+            Exploration::SelfPlay
+        } else {
+            Exploration::Off
         };
-        // `SEARCH.md` §3.7: Dirichlet noise is a self-play exploration device.
-        // An evaluation game wants the policy the net actually believes.
-        if !record {
+        SearchAgent::with_config(ev, full_sims, record, explore, MctsConfig::default(), seed)
+    }
+
+    pub fn with_config(
+        ev: Arc<dyn Evaluator>,
+        full_sims: u32,
+        record: bool,
+        explore: Exploration,
+        cfg: MctsConfig,
+        seed: u64,
+    ) -> SearchAgent {
+        let mut cfg = MctsConfig { seed, ..cfg };
+        if explore == Exploration::Off {
             cfg.dirichlet_eps = 0.0;
         }
-        let label = format!("mcts{full_sims}/{}", ev.name());
+        let label = mcts_label(full_sims, &ev.name(), &cfg);
         SearchAgent {
             mcts: Mutex::new(Mcts::new(SharedEval(ev), cfg)),
             full_sims: full_sims.max(1),
             fast_sims: (full_sims / 8).max(1),
-            full_share: if record { FULL_BUDGET_SHARE } else { 1.0 },
+            full_share: if explore == Exploration::SelfPlay {
+                FULL_BUDGET_SHARE
+            } else {
+                1.0
+            },
             record,
             label,
         }
     }
+}
+
+impl SearchAgent {
+    /// The configuration the search is actually running.
+    ///
+    /// Exposed so a test can check that `record` no longer drags exploration in
+    /// with it, rather than inferring it from play — Dirichlet noise is seeded,
+    /// so a noised search and a clean one are both deterministic and a
+    /// behavioural test cannot tell them apart.
+    pub fn mcts_config(&self) -> MctsConfig {
+        *self.mcts.lock().expect("mcts poisoned").config()
+    }
+
+    /// Share of turns given the full simulation budget. 1.0 unless self-play
+    /// exploration is on.
+    pub fn full_share(&self) -> f64 {
+        self.full_share
+    }
+}
+
+/// The agent's name, with every knob that differs from `MctsConfig::default()`
+/// spelled out.
+///
+/// Derived from the config rather than from the spec string on purpose:
+/// `minimax_label` was written the other way, silently ignored the harness
+/// flags, and an arena run racing two variants printed the *same* name on both
+/// sides — a result file nobody can attribute. A label read off the config
+/// cannot drift from what the agent is actually doing.
+pub fn mcts_label(sims: u32, evaluator: &str, cfg: &MctsConfig) -> String {
+    let d = MctsConfig::default();
+    let mut s = format!("mcts{sims}/{evaluator}");
+    let mut f = |x: String| s.push_str(&x);
+    if cfg.priors != d.priors {
+        f(match cfg.priors {
+            Priors::Evaluator => ":pri=eval".into(),
+            Priors::OnePly => ":pri=1ply".into(),
+        });
+    }
+    if cfg.priors == Priors::OnePly {
+        // Only meaningful under a one-ply prior, but then always shown: they
+        // are the two knobs a sweep moves and an unlabelled sweep is a wasted
+        // one.
+        f(format!(":pt={}", cfg.prior_temp));
+        f(format!(":pmin={}", cfg.prior_min_edges));
+    }
+    if cfg.c_puct_init != d.c_puct_init {
+        f(format!(":cp={}", cfg.c_puct_init));
+    }
+    if cfg.c_puct_base != d.c_puct_base {
+        f(format!(":cpb={}", cfg.c_puct_base));
+    }
+    if cfg.fpu_reduction != d.fpu_reduction {
+        f(format!(":fpu={}", cfg.fpu_reduction));
+    }
+    if cfg.max_edges != d.max_edges {
+        f(format!(":k={}", cfg.max_edges));
+    }
+    if cfg.widen_c != d.widen_c {
+        f(format!(":wc={}", cfg.widen_c));
+    }
+    if cfg.widen_alpha != d.widen_alpha {
+        f(format!(":wa={}", cfg.widen_alpha));
+    }
+    if cfg.widen_cap != d.widen_cap {
+        f(format!(":wcap={}", cfg.widen_cap));
+    }
+    if cfg.tree_reuse != d.tree_reuse {
+        f(":noreuse".into());
+    }
+    if cfg.virtual_loss != d.virtual_loss {
+        f(format!(":vl={}", cfg.virtual_loss));
+    }
+    s
 }
 
 /// Turn one searched sub-decision into a record.
@@ -2311,6 +2418,78 @@ impl Agent for SearchAgent {
         Some(TurnOutcome { mv, nodes })
     }
 
+    /// The search's own ranking of **whole turns**, best first by visit share.
+    ///
+    /// # Why the score is a percentage and not points
+    ///
+    /// Everything else in this panel is `eval::margin` points, and a minimax
+    /// score genuinely is one. An MCTS score is not: the quantity the search
+    /// produces over turns is a visit distribution, and its backed-up value is
+    /// on §4.5's `z_rel` scale, which is a `tanh` of a *difference* of points
+    /// and would read as a plausible-looking number meaning something else. So
+    /// the column is the share of finished simulations that played this turn,
+    /// in percent, and the note says so.
+    ///
+    /// # Why `exhaustive` is false
+    ///
+    /// The panel's standing claim is that the shortlist was drawn from the
+    /// entire move space. This root cannot support it. A turn is a chain of ~8
+    /// sub-decisions; the tree holds only the paths its simulations walked, so
+    /// the candidate set is bounded by the simulation count and shaped by the
+    /// search's own priors. `total` is therefore the number of complete turns
+    /// the tree *reached*, not the number that are legal, and the note is
+    /// explicit about which.
+    fn ranked_moves(&self, g: &GameState, p: PlayerId, keep: usize) -> Option<Ranking> {
+        let mut m = self.mcts.lock().unwrap();
+        let saved = m.config().temperature;
+        m.config_mut().temperature = 0.0;
+        // `keep * 4` before deduplication: retrieval orderings that commute are
+        // distinct paths in the tree and the same `Move` to a reader, so a top
+        // ten drawn from exactly ten lines routinely shows five moves twice.
+        let r = m.ranked_turns(g, p, self.full_sims, keep.max(1) * 4);
+        m.config_mut().temperature = saved;
+        let (found, committed, all_open, nodes) = (r.found, r.committed, r.all_edges_open, r.nodes);
+        let lines = r.lines;
+        drop(m);
+
+        let denom = committed.max(1) as f32;
+        let mut moves: Vec<(Move, f32)> = Vec::with_capacity(lines.len());
+        for line in &lines {
+            let Some(mut mv) = tree::move_from_path(&line.steps) else {
+                continue;
+            };
+            tree::retag_workers(g, p, &mut mv);
+            match moves.iter_mut().find(|(x, _)| x.same_effect(&mv)) {
+                // Two spellings of one turn are one entry, and the share is the
+                // sum: the search split its visits between them but a reader is
+                // being told how much of it went to *this turn*.
+                Some((_, share)) => *share += 100.0 * line.visits as f32 / denom,
+                None => moves.push((mv, 100.0 * line.visits as f32 / denom)),
+            }
+        }
+        moves.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let distinct = moves.len();
+        moves.truncate(keep);
+
+        let reach = if all_open {
+            "every legal edge open"
+        } else {
+            "some edges still closed by the cap or widening"
+        };
+        Some(Ranking {
+            moves,
+            total: found,
+            distinct,
+            // Not a claim about the move list: see the doc comment.
+            exhaustive: false,
+            note: format!(
+                "{} · visit share (%) of {committed} finished sims over {found} turns \
+                 the tree reached, {nodes} nodes, {reach} — NOT the whole move space",
+                self.label
+            ),
+        })
+    }
+
     fn extra_day(&self, g: &GameState, p: PlayerId, _rng: &mut StdRng) -> (bool, Option<Node>) {
         let phase = Phase::ExtraDay { claimer: p };
         let mut m = self.mcts.lock().unwrap();
@@ -2362,7 +2541,7 @@ pub struct MinimaxAgent {
 /// greedy are different players and a run log that cannot tell them apart is
 /// not a run log.
 pub fn minimax_label(cfg: &crate::search::Config) -> String {
-    format!(
+    let mut s = format!(
         "minimax:d{}:{}ms:w{}:{}",
         cfg.max_depth,
         cfg.budget.as_millis(),
@@ -2371,7 +2550,60 @@ pub fn minimax_label(cfg: &crate::search::Config) -> String {
             crate::search::Opponents::Paranoid => "paranoid",
             crate::search::Opponents::Greedy => "greedy",
         }
-    )
+    );
+    // AB-HARNESS (temporary): the flags have to show, or an arena run that
+    // races two variants prints the same name on both sides and the progress
+    // file cannot say afterwards which one won.
+    let d = crate::search::Config::default();
+    if cfg.cache != d.cache {
+        s.push_str(if cfg.cache { ":cache" } else { ":nocache" });
+    }
+    if cfg.own_width != d.own_width {
+        s.push_str(":ownwidth");
+    }
+    if cfg.keep_tt != d.keep_tt {
+        s.push_str(":keeptt");
+    }
+    if cfg.beam_first != d.beam_first {
+        s.push_str(if cfg.beam_first { ":beamfirst" } else { ":scorefirst" });
+    }
+    if cfg.opp_width != d.opp_width {
+        s.push_str(&format!(":oppw{}", cfg.opp_width));
+    }
+    if cfg.cap_per_width != d.cap_per_width {
+        match cfg.cap_per_width {
+            Some(k) => s.push_str(&format!(":capw{k}")),
+            None => s.push_str(":nocapw"),
+        }
+    }
+    if cfg.interior_cap != d.interior_cap {
+        s.push_str(&format!(":cap{}", cfg.interior_cap));
+    }
+    if cfg.keep != d.keep {
+        s.push_str(&format!(":keep{}", cfg.keep));
+    }
+    // The `w{}` above already reports the root width, and the WIDTH field
+    // derives the whole taper from it -- so spell the taper out only when it is
+    // something the `w=` flag set and `w{}` therefore cannot imply.
+    let implied: Vec<usize> = std::iter::once(cfg.width_at(0))
+        .chain(
+            d.widths
+                .iter()
+                .skip(1)
+                .map(|&x| (x * cfg.width_at(0) / d.widths[0]).max(2)),
+        )
+        .collect();
+    if cfg.widths != implied {
+        s.push_str(&format!(
+            ":w[{}]",
+            cfg.widths
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(".")
+        ));
+    }
+    s
 }
 
 impl MinimaxAgent {
@@ -2499,8 +2731,13 @@ impl Agent for MinimaxAgent {
 ///   own best move; cannot prune but is far cheaper, so it buys depth). Its
 ///   first ply is always exhaustive whatever the width; the width bounds what
 ///   gets *deepened*.
-/// * `mcts:SIMS` / `mcts:SIMS:EVAL` — tree search from `src/mcts.rs`. `EVAL`
-///   defaults to `heuristic`.
+/// * `mcts:SIMS` / `mcts:SIMS:EVAL` / `mcts:SIMS[:EVAL]:FLAGS` — tree search
+///   from `src/mcts.rs`. `EVAL` defaults to `heuristic`. `FLAGS` is a
+///   comma-separated `key=value` list over [`MctsConfig`], recognised by shape
+///   so that an evaluator path is never mistaken for one:
+///   `pri=eval|1ply`, `ptemp=`, `pmin=`, `cp=`, `cpb=`, `fpu=`, `k=`, `wc=`,
+///   `wa=`, `wcap=`, `vl=`, `reuse`, `noreuse`. Every one of them appears in
+///   the agent's name — see [`mcts_label`].
 /// * `net-random` / `net-random:small` / `net-random:main` — an untrained
 ///   network. Not a player: it exists so the batched pipeline can be measured
 ///   at its real cost before any weights are trained.
@@ -2512,6 +2749,8 @@ pub struct AgentSpec {
     kind: SpecKind,
     backend: Backend,
     queue: Option<Arc<BatchQueue>>,
+    /// Self-play exploration, separately from `record`. See [`Exploration`].
+    explore: Exploration,
     /// Instances get distinct MCTS seeds, or every thread searches identically.
     next_seed: AtomicU64,
 }
@@ -2519,7 +2758,7 @@ pub struct AgentSpec {
 enum SpecKind {
     Random,
     Greedy { cands: Candidates },
-    Search { sims: u32 },
+    Search { sims: u32, cfg: MctsConfig },
     Minimax { cfg: crate::search::Config },
 }
 
@@ -2652,6 +2891,33 @@ fn parse_minimax(rest: Option<&str>) -> Result<crate::search::Config, String> {
                 "cache" => cfg.cache = true,
                 "ownwidth" => cfg.own_width = true,
                 "keeptt" => cfg.keep_tt = true,
+                "beamfirst" => cfg.beam_first = true,
+                "scorefirst" => cfg.beam_first = false,
+                "nocapw" => cfg.cap_per_width = None,
+                f if f.starts_with("oppw=") => {
+                    cfg.opp_width = f[5..]
+                        .parse::<usize>()
+                        .map_err(|_| "minimax oppw= needs a number".to_string())?
+                        .max(1);
+                }
+                f if f.starts_with("capw=") => {
+                    cfg.cap_per_width = f[5..].parse::<usize>().ok().filter(|k| *k > 0);
+                    if cfg.cap_per_width.is_none() {
+                        return Err("minimax capw= needs a positive number".into());
+                    }
+                }
+                f if f.starts_with("cap=") => {
+                    cfg.interior_cap = f[4..]
+                        .parse::<usize>()
+                        .map_err(|_| "minimax cap= needs a number".to_string())?
+                        .max(1);
+                }
+                f if f.starts_with("keep=") => {
+                    cfg.keep = f[5..]
+                        .parse::<usize>()
+                        .map_err(|_| "minimax keep= needs a number".to_string())?
+                        .max(1);
+                }
                 f if f.starts_with("w=") => {
                     cfg.widths = f[2..]
                         .split('.')
@@ -2669,6 +2935,52 @@ fn parse_minimax(rest: Option<&str>) -> Result<crate::search::Config, String> {
         return Err(format!(
             "minimax takes minimax:DEPTH[:MS[:WIDTH[:MODEL]]]; did not expect {extra:?}"
         ));
+    }
+    Ok(cfg)
+}
+
+/// The `FLAGS` field of `mcts:SIMS[:EVAL[:FLAGS]]` — a comma-separated
+/// `key=value` list over [`MctsConfig`].
+///
+/// It exists so two variants can be raced inside **one** arena process under
+/// identical machine load, which is the only comparison worth anything while
+/// `eval.rs` and `moves.rs` are being edited by other agents: legal moves per
+/// position moved 184 -> 644 mid-session during the last run, so two numbers
+/// from two processes are not comparable even an hour apart.
+fn parse_mcts_flags(flags: &str) -> Result<MctsConfig, String> {
+    let mut cfg = MctsConfig::default();
+    for f in flags.split(',').filter(|f| !f.is_empty()) {
+        let (k, v) = f.split_once('=').unwrap_or((f, ""));
+        let num = |what: &str| -> Result<f32, String> {
+            v.parse::<f32>()
+                .map_err(|_| format!("mcts {what}= needs a number, got {v:?}"))
+        };
+        let int = |what: &str| -> Result<usize, String> {
+            v.parse::<usize>()
+                .map_err(|_| format!("mcts {what}= needs a number, got {v:?}"))
+        };
+        match k {
+            "priors" | "pri" => {
+                cfg.priors = match v {
+                    "eval" | "evaluator" | "uniform" => Priors::Evaluator,
+                    "1ply" | "oneply" | "heuristic" => Priors::OnePly,
+                    other => return Err(format!("mcts priors= is eval or 1ply, got {other:?}")),
+                }
+            }
+            "ptemp" | "pt" => cfg.prior_temp = num("ptemp")?,
+            "pmin" => cfg.prior_min_edges = int("pmin")?.max(2),
+            "cpuct" | "cp" => cfg.c_puct_init = num("cpuct")?,
+            "cpbase" | "cpb" => cfg.c_puct_base = num("cpbase")?.max(1.0),
+            "fpu" => cfg.fpu_reduction = num("fpu")?,
+            "k" | "maxedges" => cfg.max_edges = int("k")?.max(1),
+            "wc" | "widenc" => cfg.widen_c = num("wc")?,
+            "wa" | "widenalpha" => cfg.widen_alpha = num("wa")?,
+            "wcap" => cfg.widen_cap = int("wcap")?.max(1),
+            "vl" => cfg.virtual_loss = int("vl")? as u32,
+            "reuse" => cfg.tree_reuse = true,
+            "noreuse" => cfg.tree_reuse = false,
+            other => return Err(format!("mcts flag {other:?} unknown")),
+        }
     }
     Ok(cfg)
 }
@@ -2703,6 +3015,15 @@ fn parse_backend(spec: &str) -> Result<Backend, String> {
 }
 
 impl AgentSpec {
+    /// The search configuration behind a `minimax:...` spec, for tests that
+    /// need to check a flag reached it rather than trusting the parser.
+    pub fn minimax_config(&self) -> Option<&crate::search::Config> {
+        match &self.kind {
+            SpecKind::Minimax { cfg } => Some(cfg),
+            _ => None,
+        }
+    }
+
     pub fn parse(spec: &str, record: bool) -> Result<AgentSpec, String> {
         let (kind, backend) = Self::parse_parts(spec)?;
         let name = match &kind {
@@ -2711,7 +3032,7 @@ impl AgentSpec {
                 Candidates::Sampled(k) => format!("{}:{k}", backend.name()),
                 Candidates::All => format!("{}:full", backend.name()),
             },
-            SpecKind::Search { sims } => format!("mcts{sims}/{}", backend.name()),
+            SpecKind::Search { sims, cfg } => mcts_label(*sims, &backend.name(), cfg),
             SpecKind::Minimax { cfg } => minimax_label(cfg),
         };
         Ok(AgentSpec {
@@ -2721,6 +3042,13 @@ impl AgentSpec {
             kind,
             backend,
             queue: None,
+            // Recording is what self-play does, so it is the right default —
+            // but it is only a default now, and the TUI turns it off.
+            explore: if record {
+                Exploration::SelfPlay
+            } else {
+                Exploration::Off
+            },
             next_seed: AtomicU64::new(0x51ED_5EED),
         })
     }
@@ -2762,25 +3090,54 @@ impl AgentSpec {
             )),
             "mcts" => {
                 let rest = rest.ok_or("mcts needs mcts:SIMS or mcts:SIMS:EVAL")?;
-                let (sims, ev) = match rest.split_once(':') {
+                let (sims, tail) = match rest.split_once(':') {
                     Some((s, e)) => (s, e),
                     None => (rest, "heuristic"),
+                };
+                // The evaluator may itself be a path, which has no colons but
+                // does have dots and slashes, so the flag field is recognised
+                // by *shape* rather than by position: every comma-separated
+                // item has to be a `key=value` or one of the two bare flags.
+                // Getting this wrong reads `mcts:64:noreuse` as an evaluator
+                // called "noreuse" and says so, which is the failure mode to
+                // want.
+                let is_flags = |f: &str| {
+                    !f.is_empty()
+                        && f.split(',')
+                            .all(|x| x.contains('=') || matches!(x, "noreuse" | "reuse"))
+                };
+                let (ev, flags) = match tail.rsplit_once(':') {
+                    Some((e, f)) if is_flags(f) => (e, f),
+                    _ if is_flags(tail) => ("heuristic", tail),
+                    _ => (tail, ""),
                 };
                 let sims = num(sims, "mcts:SIMS")? as u32;
                 if sims == 0 {
                     return Err("mcts:SIMS needs SIMS >= 1".into());
                 }
-                Ok((SpecKind::Search { sims }, parse_backend(ev)?))
+                Ok((
+                    SpecKind::Search {
+                        sims,
+                        cfg: parse_mcts_flags(flags)?,
+                    },
+                    parse_backend(ev)?,
+                ))
             }
             "net-random" => Ok((
-                SpecKind::Search { sims: DEFAULT_SIMS },
+                SpecKind::Search {
+                    sims: DEFAULT_SIMS,
+                    cfg: MctsConfig::default(),
+                },
                 parse_backend(spec)?,
             )),
             // A bare checkpoint path, checked *after* the named heads. Testing
             // the suffix first meant `mcts:800:ckpt.safetensors` was read as a
             // path called "mcts:800:ckpt.safetensors" and could never load.
             _ if spec.ends_with(".safetensors") || spec.ends_with(".tzw") => Ok((
-                SpecKind::Search { sims: DEFAULT_SIMS },
+                SpecKind::Search {
+                    sims: DEFAULT_SIMS,
+                    cfg: MctsConfig::default(),
+                },
                 parse_backend(spec)?,
             )),
             _ => Err(format!(
@@ -2802,6 +3159,24 @@ impl AgentSpec {
     /// rather than one per core (`COMPUTE.md` §2.1).
     pub fn searches(&self) -> bool {
         matches!(self.kind, SpecKind::Search { .. })
+    }
+
+    /// The search configuration behind an `mcts:...` spec, for tests that check
+    /// a flag reached it rather than trusting the parser.
+    pub fn mcts_config(&self) -> Option<&MctsConfig> {
+        match &self.kind {
+            SpecKind::Search { cfg, .. } => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Turn self-play exploration on or off independently of `record`.
+    ///
+    /// The TUI wants both: decision nodes for its search panel, and the policy
+    /// the search actually believes rather than one with 0.25 Dirichlet noise
+    /// mixed into it. Before this the two came as a pair.
+    pub fn set_exploration(&mut self, explore: Exploration) {
+        self.explore = explore;
     }
 
     /// True when a batch queue in front of the evaluator pays for itself.
@@ -2852,12 +3227,19 @@ impl AgentSpec {
                 cands: *cands,
                 record: self.record,
             }),
-            SpecKind::Search { sims } => {
+            SpecKind::Search { sims, cfg } => {
                 let ev: Arc<dyn Evaluator> = match &self.queue {
                     Some(q) => Arc::new(q.handle()),
                     None => self.backend.evaluator(),
                 };
-                Box::new(SearchAgent::new(ev, *sims, self.record, seed))
+                Box::new(SearchAgent::with_config(
+                    ev,
+                    *sims,
+                    self.record,
+                    self.explore,
+                    *cfg,
+                    seed,
+                ))
             }
             SpecKind::Minimax { cfg } => Box::new(MinimaxAgent::new(cfg.clone(), self.record)),
         }
@@ -2923,6 +3305,17 @@ pub fn reject_unknown_flags(known: &[&str]) -> Result<(), String> {
 
 pub fn parse_agent(spec: &str, record: bool) -> Result<Box<dyn Agent>, String> {
     Ok(AgentSpec::parse(spec, record)?.instance())
+}
+
+/// An agent that hands back its decision nodes but plays as if it were being
+/// evaluated: no Dirichlet noise, no playout-cap randomisation.
+///
+/// This is what a viewer wants — `bin/tui` and `bin/uidump` — and it is not
+/// what `parse_agent(spec, true)` gives, because `record` used to imply both.
+pub fn parse_analysis_agent(spec: &str) -> Result<Box<dyn Agent>, String> {
+    let mut spec = AgentSpec::parse(spec, true)?;
+    spec.set_exploration(Exploration::Off);
+    Ok(spec.instance())
 }
 
 // =======================================================================

@@ -582,6 +582,11 @@ fn minimax_specs_parse() {
         ("minimax:4:120:8", "minimax:d4:120ms:w8:greedy"),
         ("minimax:4:120:8:paranoid", "minimax:d4:120ms:w8:paranoid"),
         ("minimax:6:::paranoid", "minimax:d6:600ms:w12:paranoid"),
+        // The harness flags are part of the name: an arena run racing two
+        // variants has to be able to print which is which.
+        ("minimax:8:200::greedy:capw=50", "minimax:d8:200ms:w12:greedy:capw50"),
+        ("minimax:8:200::greedy:nocapw", "minimax:d8:200ms:w12:greedy:nocapw"),
+        ("minimax:8:200::greedy:ownwidth", "minimax:d8:200ms:w12:greedy:ownwidth"),
     ] {
         let got = AgentSpec::parse(spec, false)
             .unwrap_or_else(|e| panic!("{spec}: {e}"))
@@ -594,9 +599,106 @@ fn minimax_specs_parse() {
         "minimax:4:120:0",
         "minimax:4:120:8:cautious",
         "minimax:4:120:8:greedy:9",
+        "minimax:4:120:8:greedy:capw=0",
+        "minimax:4:120:8:greedy:capw=x",
         "minimax:x",
     ] {
         assert!(AgentSpec::parse(bad, false).is_err(), "{bad} should not parse");
+    }
+}
+
+/// The AB-harness flags have to actually reach the `Config`, or a whole arena
+/// run measures the default twice and reports the difference as noise.
+#[test]
+fn minimax_harness_flags_reach_the_config() {
+    use tzolkin::record::AgentSpec;
+
+    let cfg = |spec: &str| {
+        AgentSpec::parse(spec, false)
+            .unwrap_or_else(|e| panic!("{spec}: {e}"))
+            .minimax_config()
+            .unwrap_or_else(|| panic!("{spec} did not parse as minimax"))
+            .clone()
+    };
+
+    assert_eq!(cfg("minimax:8:200::greedy:capw=50").cap_per_width, Some(50));
+    assert_eq!(cfg("minimax:8:200::greedy:nocapw").cap_per_width, None);
+    // The measured default, not None -- see `Config::cap_per_width`.
+    assert_eq!(cfg("minimax:8:200::greedy").cap_per_width, Some(25));
+    assert_eq!(cfg("minimax:8:200::greedy:cap=64").interior_cap, 64);
+    assert_eq!(cfg("minimax:8:200::greedy:keep=40").keep, 40);
+    // Comma-separated, so one spec can carry a whole variant.
+    let both = cfg("minimax:8:200::greedy:capw=64,ownwidth,keep=36");
+    assert_eq!(both.cap_per_width, Some(64));
+    assert!(both.own_width);
+    assert_eq!(both.keep, 36);
+}
+
+/// Under a width-1 opponent this search cannot prune, and that is a theorem
+/// rather than an observation: only a min node lowers beta, every min node has
+/// exactly one child, and a node evaluates that child with the beta it
+/// inherited — so beta is `INF` everywhere and `alpha >= beta` needs an
+/// infinite alpha. Killer moves, a history heuristic, PVS and aspiration
+/// windows all act on the cutoff this test says never happens; widening the
+/// opponent is what gives them something to work on.
+#[test]
+fn a_width_one_opponent_makes_alpha_beta_inert() {
+    let ps = positions(3, &[0, 9, 18]);
+
+    let mut narrow = Search::new(Config {
+        opp_width: 1,
+        ..Config::default().with_depth(8).with_budget_ms(200)
+    });
+    for g in &ps {
+        let _ = narrow.search(g, g.current);
+        assert_eq!(
+            narrow.stats().cutoffs,
+            0,
+            "greedy width 1 cut something on day {} — beta must have left INF",
+            g.day
+        );
+    }
+
+    // Widening it is the whole point: min nodes gain siblings, beta tightens,
+    // and the pruning machinery finally has a bound to cut against.
+    let mut hedged = Search::new(Config {
+        opp_width: 3,
+        ..Config::default().with_depth(8).with_budget_ms(200)
+    });
+    let mut cuts = 0u64;
+    for g in &ps {
+        let r = hedged.search(g, g.current);
+        cuts += hedged.stats().cutoffs;
+        for (m, _) in &r.moves {
+            check_move(g, g.current, m)
+                .unwrap_or_else(|e| panic!("oppw=3 on day {}: {e}", g.day));
+        }
+    }
+    assert!(
+        cuts > 0,
+        "a hedged opponent produced no cutoff over {} positions",
+        ps.len()
+    );
+}
+
+/// `cap_per_width` narrows what an interior node enumerates, which is exactly
+/// the kind of change that can silently start returning a move the position
+/// does not allow. The root stays exhaustive either way -- that contract is not
+/// the cap's to break.
+#[test]
+fn a_width_scaled_cap_still_plays_legally() {
+    let mut s = Search::new(Config {
+        cap_per_width: Some(8),
+        ..Config::default().with_depth(6).with_budget_ms(150)
+    });
+    for g in positions(3, &[0, 9, 18]) {
+        let p = g.current;
+        let r = s.search(&g, p);
+        assert!(!r.moves.is_empty(), "capw found nothing on day {}", g.day);
+        assert_root_is_honest(&r, &g, p, "capw=8");
+        for (m, _) in &r.moves {
+            check_move(&g, p, m).unwrap_or_else(|e| panic!("capw=8 on day {}: {e}", g.day));
+        }
     }
 }
 
@@ -657,4 +759,291 @@ fn minimax_can_finish_a_game() {
         assert!(guard < 100, "game did not terminate");
     }
     assert!(state.day >= 27);
+}
+
+// ---- MCTS: priors, the plan seam, and what the TUI is shown -------------
+
+/// The first node of `p`'s turn with at least `want` legal steps.
+///
+/// Searching at `Phase::Beg` is nearly useless as a test fixture: begging needs
+/// corn < 3, so the node is width 1 in most positions and `search_at` returns
+/// the forced-move shortcut without running a simulation. The nodes with a real
+/// distribution are `Placing` and `Take`, several steps down the chain.
+fn wide_node(
+    g: &GameState,
+    p: PlayerId,
+    want: usize,
+) -> Option<(GameState, tzolkin::phase::Phase, PlayerId, u8)> {
+    use tzolkin::phase::Phase;
+    use tzolkin::tree;
+    let mut st = *g;
+    let mut at = (Phase::Beg, p, 0u8);
+    for _ in 0..32 {
+        let (phase, turn, done) = at;
+        let steps = tree::legal_steps(&st, phase, turn, done);
+        if steps.len() >= want {
+            return Some((st, phase, turn, done));
+        }
+        let t = tree::apply_step(&mut st, phase, turn, done, steps.first()?);
+        if t.committed() {
+            return None;
+        }
+        at = t.next()?;
+    }
+    None
+}
+
+/// The one-ply prior has to *move* the search, or it is a cost with no effect.
+///
+/// It is checked as a shift in the visit distribution rather than as a better
+/// move: at 96 simulations the two often agree on the argmax, and a test that
+/// asserted they disagreed would be asserting that the prior is bad.
+#[test]
+fn a_one_ply_prior_changes_where_the_search_looks() {
+    use tzolkin::mcts::{Mcts, MctsConfig, Priors};
+    use tzolkin::phase::{HeuristicEvaluator, Phase};
+
+    let _ = Phase::Beg;
+    let mut moved = 0usize;
+    let mut checked = 0usize;
+    for g in positions(3, &[0, 6, 12, 18]) {
+        let Some((st, phase, turn, done)) = wide_node(&g, g.current, 4) else {
+            continue;
+        };
+        let run = |priors: Priors| {
+            let cfg = MctsConfig {
+                priors,
+                dirichlet_eps: 0.0,
+                temperature: 0.0,
+                ..MctsConfig::default()
+            };
+            let mut m = Mcts::new(HeuristicEvaluator, cfg);
+            m.search_at(&st, phase, turn, done, 96).visits
+        };
+        let flat = run(Priors::Evaluator);
+        let informed = run(Priors::OnePly);
+        checked += 1;
+        assert_eq!(flat.len(), informed.len(), "the two saw different edge sets");
+        if flat != informed {
+            moved += 1;
+        }
+    }
+    assert!(checked > 0, "no position had a searchable root");
+    assert!(
+        moved > 0,
+        "the one-ply prior left every visit count identical on {checked} roots, \
+         so it is not reaching the tree"
+    );
+}
+
+/// The seam `src/plan.rs` is meant to steer: a bias raises a prior and never
+/// removes an edge, so a heavily favoured edge gains visits while its siblings
+/// keep some.
+#[test]
+fn a_prior_bias_steers_without_excluding() {
+    use std::sync::Arc;
+    use tzolkin::ids::PlayerId;
+    use tzolkin::mcts::{Mcts, MctsConfig, PriorBias};
+    use tzolkin::phase::{HeuristicEvaluator, Phase, Step};
+    use tzolkin::state::GameState;
+
+    /// Everything the plan does not like is left at 1.0; the last edge of every
+    /// node is what it wants.
+    struct Last;
+    impl PriorBias for Last {
+        fn bias(
+            &self,
+            _s: &GameState,
+            _ph: Phase,
+            _mover: PlayerId,
+            steps: &[Step],
+            out: &mut [f32],
+        ) {
+            if let Some(x) = out.last_mut() {
+                *x = 50.0;
+            }
+            let _ = steps;
+        }
+        fn name(&self) -> String {
+            "last-edge".into()
+        }
+    }
+
+    let cfg = MctsConfig {
+        dirichlet_eps: 0.0,
+        temperature: 0.0,
+        ..MctsConfig::default()
+    };
+    let mut steered = 0usize;
+    let mut checked = 0usize;
+    for g in positions(2, &[0, 9, 18]) {
+        let Some((st, phase, turn, done)) = wide_node(&g, g.current, 4) else {
+            continue;
+        };
+        let sims = 128;
+        let mut plain = Mcts::new(HeuristicEvaluator, cfg);
+        let a = plain.search_at(&st, phase, turn, done, sims);
+        let mut biased = Mcts::new(HeuristicEvaluator, cfg);
+        biased.set_bias(Some(Arc::new(Last)));
+        let b = biased.search_at(&st, phase, turn, done, sims);
+        checked += 1;
+        assert_eq!(a.visits.len(), b.visits.len());
+        // Nothing is excluded: every edge the unbiased search opened is still
+        // an edge here, whatever the plan thinks of it.
+        for ((sa, _), (sb, _)) in a.visits.iter().zip(b.visits.iter()) {
+            assert_eq!(sa, sb, "a bias reordered or dropped an edge");
+        }
+        let last = a.visits.len() - 1;
+        if b.visits[last].1 > a.visits[last].1 {
+            steered += 1;
+        }
+    }
+    assert!(checked > 0);
+    assert!(
+        steered > 0,
+        "a 50x bias on the last edge never raised its visit count over {checked} roots"
+    );
+    assert_eq!(
+        {
+            let mut m = Mcts::new(HeuristicEvaluator, cfg);
+            m.set_bias(Some(Arc::new(Last)));
+            m.bias_name()
+        },
+        Some("last-edge".to_string())
+    );
+}
+
+/// Every knob a sweep varies has to reach the config *and* the name.
+///
+/// The alpha-beta work lost a whole experiment to the other half of this:
+/// `minimax_label` ignored the harness flags, so an arena run racing two
+/// variants printed the same agent name on both sides and its result file
+/// cannot be attributed to either.
+#[test]
+fn mcts_flags_reach_the_config_and_the_label() {
+    use tzolkin::mcts::Priors;
+    use tzolkin::record::AgentSpec;
+
+    let spec = |s: &str| AgentSpec::parse(s, false).unwrap_or_else(|e| panic!("{s}: {e}"));
+    let cfg = |s: &str| *spec(s).mcts_config().expect("not an mcts spec");
+
+    assert_eq!(cfg("mcts:64").priors, Priors::Evaluator);
+    assert_eq!(cfg("mcts:64:heuristic:pri=1ply").priors, Priors::OnePly);
+    assert_eq!(cfg("mcts:64:pri=1ply").priors, Priors::OnePly);
+    assert_eq!(cfg("mcts:64:pri=1ply,ptemp=2.5").prior_temp, 2.5);
+    assert_eq!(cfg("mcts:64:pri=1ply,pmin=8").prior_min_edges, 8);
+    assert_eq!(cfg("mcts:64:cp=1.5,fpu=0.4,k=16").c_puct_init, 1.5);
+    assert_eq!(cfg("mcts:64:cp=1.5,fpu=0.4,k=16").fpu_reduction, 0.4);
+    assert_eq!(cfg("mcts:64:cp=1.5,fpu=0.4,k=16").max_edges, 16);
+    assert!(!cfg("mcts:64:noreuse").tree_reuse);
+    assert!(AgentSpec::parse("mcts:64:nonsense=3", false).is_err());
+
+    // No two variants may share a name, or the progress file cannot say which
+    // side of a race a block belongs to.
+    let names: Vec<String> = [
+        "mcts:64",
+        "mcts:64:pri=1ply",
+        "mcts:64:pri=1ply,ptemp=2",
+        "mcts:64:pri=1ply,pmin=8",
+        "mcts:64:cp=1.5",
+        "mcts:64:k=16",
+        "mcts:64:noreuse",
+        "mcts:128",
+    ]
+    .iter()
+    .map(|s| spec(s).name())
+    .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "two variants share a name: {names:?}");
+}
+
+/// Recording decision nodes and exploring are separate questions.
+///
+/// `bin/tui` asks for the first and used to get the second: 0.25 Dirichlet
+/// noise on its root priors and playout-cap randomisation running seven turns
+/// in eight at an eighth of the budget. Checked on the config rather than on
+/// play, because the noise is seeded and both searches are deterministic.
+#[test]
+fn recording_no_longer_forces_self_play_exploration() {
+    use std::sync::Arc;
+    use tzolkin::mcts::MctsConfig;
+    use tzolkin::phase::{Evaluator, HeuristicEvaluator};
+    use tzolkin::record::{Exploration, SearchAgent};
+
+    let ev = || Arc::new(HeuristicEvaluator) as Arc<dyn Evaluator>;
+
+    let selfplay = SearchAgent::new(ev(), 64, true, 0);
+    assert!(selfplay.mcts_config().dirichlet_eps > 0.0);
+    assert!(selfplay.full_share() < 1.0);
+
+    let arena = SearchAgent::new(ev(), 64, false, 0);
+    assert_eq!(arena.mcts_config().dirichlet_eps, 0.0);
+    assert_eq!(arena.full_share(), 1.0);
+
+    let viewer = SearchAgent::with_config(
+        ev(),
+        64,
+        true,
+        Exploration::Off,
+        MctsConfig::default(),
+        0,
+    );
+    assert_eq!(viewer.mcts_config().dirichlet_eps, 0.0);
+    assert_eq!(viewer.full_share(), 1.0);
+}
+
+/// The `agent` view of the TUI, for an MCTS agent.
+///
+/// It used to fall through to `eval::rank_all` — a one-ply heuristic ranking
+/// shown under a heading claiming to be the agent's own.
+#[test]
+fn mcts_ranks_its_own_turns_and_does_not_claim_the_whole_move_space() {
+    use tzolkin::record::parse_analysis_agent;
+
+    let agent = parse_analysis_agent("mcts:96").unwrap();
+    let mut ranked = 0usize;
+    for g in positions(2, &[0, 8, 16]) {
+        let p = g.current;
+        let r = agent
+            .ranked_moves(&g, p, 10)
+            .expect("a search agent has a ranking");
+        if r.moves.is_empty() {
+            continue;
+        }
+        ranked += 1;
+        for (m, _) in &r.moves {
+            check_move(&g, p, m).unwrap_or_else(|e| panic!("mcts ranked an illegal move: {e}"));
+        }
+        // Best first, and a visit share is a percentage.
+        for w in r.moves.windows(2) {
+            assert!(w[0].1 >= w[1].1, "not sorted best first");
+        }
+        let shown: f32 = r.moves.iter().map(|(_, s)| *s).sum();
+        assert!(
+            shown > 0.0 && shown <= 100.01,
+            "visit shares must be percentages of one distribution, got {shown}"
+        );
+        // The panel's standing claim is that the shortlist came out of the
+        // whole move space. A tree that only holds the paths it walked cannot
+        // support that, so it must not imply it.
+        assert!(!r.exhaustive);
+        assert!(r.note.contains("NOT the whole move space"), "note: {}", r.note);
+        assert!(r.distinct <= r.total);
+        assert!(r.moves.len() <= r.distinct);
+    }
+    assert!(ranked > 0, "no position produced a ranking");
+    // Two spellings of one turn are one row: retrieval orderings that commute
+    // are distinct paths in the tree and the same move to a reader.
+    for g in positions(1, &[12]) {
+        let p = g.current;
+        if let Some(r) = agent.ranked_moves(&g, p, 10) {
+            for (i, (a, _)) in r.moves.iter().enumerate() {
+                for (b, _) in r.moves.iter().skip(i + 1) {
+                    assert!(!a.same_effect(b), "the shortlist restates a move");
+                }
+            }
+        }
+    }
 }

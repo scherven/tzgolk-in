@@ -46,9 +46,60 @@
 //! Everything below the root is culled, and the static evaluation is what does
 //! the culling: at each interior node the candidate moves are scored one ply
 //! deep, sorted, and only the best [`Config::widths`] of them are searched.
-//! Good ordering is also what makes alpha-beta pay — a beam that is already
-//! sorted best-first produces a cutoff on the first or second child most of the
-//! time.
+//!
+//! **Enumeration is the cost, not evaluation.** Expanding one interior node
+//! walks ~200 moves to return one or two, and generating those moves is nearly
+//! the whole bill: 2.16 us/move to walk the generator alone against 2.29 us to
+//! walk it *and* apply *and* score each move, so `successor` plus `heuristic`
+//! are about 6% between them. A depth-8 turn enumerates 23k moves to reach 150
+//! leaves — 150 generated moves per leaf, where a textbook alpha-beta spends
+//! about one.
+//! Anything that makes this search faster has to enumerate less
+//! ([`Config::cap_per_width`]) or enumerate once and remember
+//! ([`Search::tt`]); nothing else is big enough to matter.
+//!
+//! # What was measured and did not work
+//!
+//! Recorded here because each of these is the obvious next thing to reach for,
+//! and the measurement says not to. Arena figures are head-to-head against
+//! `minimax:8:200::greedy`, solo mode, null 0.
+//!
+//! * **Depth.** The search is not short of it. A depth-8 turn finishes in
+//!   95 ms of its 200 ms budget because it ran out of *plies*, not time — and
+//!   spending the rest buys nothing: depth 16 scores **+0.26** centred
+//!   (-2.14..+2.65, p = 0.83, 60 blocks / 240 games) and a depth-40 single
+//!   line **-0.83** (-3.58..+1.92, p = 0.55, 60 blocks). Under `Greedy` the
+//!   extra plies are extra turns of a *fictional* opponent, and the fiction
+//!   stops paying long before the plies run out.
+//! * **Anything built on a beta cutoff.** This search does not prune. Under
+//!   `Greedy` every opponent node is one child wide, so beta never leaves
+//!   `INF`, and the measured cutoff count is **0.0 per turn** at depths 4, 8
+//!   and 12 alike. Killer moves, a history heuristic, PVS and aspiration
+//!   windows all sharpen a cutoff that never happens. [`Config::opp_width`]
+//!   above 1 is the only thing that would give them something to bite on.
+//! * **The horizon story.** The worry was that a placement scores nothing until
+//!   it is retrieved rounds later, so a one-ply root beam would rank every
+//!   placement below every retrieval and never deepen one. It is the other way
+//!   round: placements are 8.8% of the legal move list (3420/38724) but 40.8%
+//!   of the root beam of 12 and 51.9% of the one-ply best pick. The beam
+//!   *over*-selects placements more than fourfold, and deepening overturns the
+//!   one-ply choice on 61% of positions, so it is not rubber-stamping either.
+//!   A retrieval-selective extension would be solving a problem this search
+//!   does not have. (210 positions from `heuristic:16` games.)
+//! * **A wider root beam.** Doubling it to 24 on top of the cheap enumeration
+//!   below is **+1.38** (-7.79..+10.55, p = 0.74, 11 blocks / 44 games) — a
+//!   run stopped early because the interval was going nowhere. The exhaustive
+//!   first ply already ranks every move; the 13th-best is not where the points
+//!   are.
+//!
+//! The one thing that did work is [`Config::cap_per_width`], and it worked by
+//! making nodes cheaper rather than by searching more of them.
+//!
+//! And the larger result, which is not about this file: at the same ~20 ms a
+//! turn, `mcts:2048` beats the tuned alpha-beta by **+9.32** centred (95% CI
+//! +6.09..+12.55, 39 blocks / 156 games). See the header of `crate::mcts`.
+//! Whole-turn alpha-beta over a four-player game with a fabricated opponent
+//! model is not obviously the right instrument here, and the arena says so.
 
 use crate::eval::{self, Ranking};
 use crate::ids::*;
@@ -131,6 +182,58 @@ pub struct Config {
     pub own_width: bool,
     /// AB-HARNESS (temporary): keep the shortlist cache across turns of a game.
     pub keep_tt: bool,
+    /// Rank moves the search deepened above moves it did not.
+    ///
+    /// Without it the deepening loop sorts the whole retained list on score
+    /// alone, and a move holding only its one-ply margin can finish first and
+    /// be played — see [`Stats::best_deepened`]. Sorting the deepened set ahead
+    /// of the rest restores what the module header describes: the beam is the
+    /// best `widths[0]` at one ply, and the answer comes from inside it.
+    pub beam_first: bool,
+    /// How many moves an opponent is allowed under [`Opponents::Greedy`].
+    ///
+    /// One is the model as originally written: the opponent plays its own best
+    /// move and nothing else is tried. Raising it hedges — the opponent is
+    /// assumed to play one of the `k` moves *its own* evaluator likes, and the
+    /// search takes the worst of those for the root player. That is weaker than
+    /// paranoia, which lets an opponent play any move at all however much it
+    /// costs them, and stronger than assuming they find exactly the move the
+    /// model predicted.
+    ///
+    /// It is also the only way this search prunes. Under width-1 opponents no
+    /// min node has a sibling, so beta never moves off `INF` and the measured
+    /// cutoff count is **0.0 per turn** at every depth — killer moves, history
+    /// ordering and PVS all have nothing to bite on. At `k >= 2` min nodes
+    /// branch, beta tightens, and alpha-beta starts doing its job.
+    ///
+    /// Cheap in the place that matters: the extra moves come out of the same
+    /// `candidates` call, so it costs subtree and not enumeration, and
+    /// enumeration is 94% of a node.
+    pub opp_width: usize,
+    /// Per-kind enumeration cap scaled by the node's own beam width,
+    /// `k * width`, clamped above by [`Config::interior_cap`]. `None` restores
+    /// the flat [`Config::interior_cap`] everywhere.
+    ///
+    /// This is the one change that made the search both faster and stronger,
+    /// and it works because of what a node actually costs. Expanding one
+    /// interior node enumerates ~200 moves to return one or two, and
+    /// enumeration is 94% of that; under `Greedy` three quarters of those
+    /// expansions are opponent plies of width 1, spending the full 400-per-kind
+    /// budget to report a single argmax. Scaling the cap by width spends the
+    /// budget only where the beam is wide enough to use a ranked list.
+    ///
+    /// At `Some(25)` a turn costs **19.8 ms against 95.3 ms** flat — 4.8x — and
+    /// reaches depth 8.0 on 11.2 of 12 root moves where the flat cap manages
+    /// 7.7 on 10.2. It is worth **+3.24** centred score head to head against
+    /// the flat-cap search (95% CI +0.35..+6.13, p = 0.022, 32 blocks / 128
+    /// games), so the narrower opponent model costs nothing measurable and
+    /// finishing the beam is worth real points. Cheaper *and* stronger, which
+    /// is only surprising until you notice the flat cap was spending 400 moves
+    /// per kind to pick an opponent's single reply.
+    ///
+    /// Note this is *not* the same as lowering `interior_cap` to 25, which
+    /// would starve the root player's own turns too; the point is the taper.
+    pub cap_per_width: Option<usize>,
 }
 
 impl Default for Config {
@@ -144,6 +247,13 @@ impl Default for Config {
             // and it prunes far harder, but it is modelling opponents that do
             // not exist; the cheaper, truer assumption wins and keeps winning
             // as it goes deeper, which is why the depth default follows it up.
+            //
+            // It stops paying at 8. Depth 16 is +0.26 centred against depth 8
+            // head to head (-2.14..+2.65, p = 0.83, 60 blocks / 240 games) and
+            // a depth-40 single line is -0.83 (-3.58..+1.92) -- so 8 is not a
+            // compromise with the clock, it is where the greedy opponent model
+            // stops being worth believing. A depth-8 turn finishes in 95 ms of
+            // its 200 ms budget; the rest of the budget has nowhere to go.
             opponents: Opponents::Greedy,
             max_depth: 8,
             widths: vec![12, 6, 4, 3, 2],
@@ -155,6 +265,12 @@ impl Default for Config {
             cache: true,
             own_width: false,
             keep_tt: false,
+            // Both measured; see each field. `beam_first` is a correctness
+            // fix worth no points, `cap_per_width` is worth +3.24 at 4.8x less
+            // wall clock, and the pair of them is what this default is for.
+            beam_first: true,
+            opp_width: 1,
+            cap_per_width: Some(25),
         }
     }
 }
@@ -212,6 +328,21 @@ pub struct Stats {
     pub deepened: usize,
     /// Whether the budget cut the last iteration short.
     pub partial: bool,
+    /// Whether the move finally returned is one the search actually deepened.
+    ///
+    /// It can fail to be. `MinimaxAgent` raises `Config::keep` to `MAX_VISITS`
+    /// (24) so a recorded turn has a ranked list to store, but the beam is
+    /// `widths[0]` (12) — and the deepening loop sorts all 24 together, so a
+    /// move carrying nothing but its one-ply margin competes against moves that
+    /// were searched eight plies, and can win.
+    ///
+    /// In practice it almost never does: **1 turn in 210** at depth 8, because
+    /// the deep score of a move the one-ply pass already liked stays near the
+    /// top. So [`Config::beam_first`] is a correctness fix rather than a
+    /// strength one — an effect this rare is far below what the arena can
+    /// resolve, and this counter, not a match result, is the instrument that
+    /// settles it.
+    pub best_deepened: bool,
     /// Legal moves at the root. Always the whole set.
     pub root_moves: usize,
     /// How long the exhaustive first ply took. The rest of `elapsed` is
@@ -229,9 +360,19 @@ pub struct Stats {
 /// all. Caching the shortlist instead hits on nearly every node above the
 /// frontier, for the reason iterative deepening is supposed to be cheap: pass
 /// `d + 1` walks the same nodes pass `d` did. It matters far more here than in
-/// a normal alpha-beta because a node in this game costs ~100 static
-/// evaluations to *expand* — `visit_moves_of` plus a `successor` and a
-/// `heuristic` per candidate — and almost nothing to search.
+/// a normal alpha-beta because a node in this game costs ~200 enumerated moves
+/// to *expand* — `visit_moves_of` plus a `successor` and a `heuristic` per
+/// candidate — and almost nothing to search.
+///
+/// **It earns its place on cost, not on strength.** At depth 8 and a 200 ms
+/// budget the cache hits 70% of nodes and gets the turn done in 73 ms at depth
+/// 7.9 on 11.2 of 12 root moves; without it the same turn takes 159 ms and
+/// reaches depth 7.2 on 8.5 of 12. That is a 2.2x saving and a deeper answer —
+/// and it is worth **+1.73** centred score head to head (95% CI -0.84..+4.29,
+/// p = 0.18, 60 blocks / 240 games), which is to say not measurably anything.
+/// Keep it because it is free, not because it wins games: the extra depth it
+/// buys is depth the arena has already shown does not pay (see the module
+/// header). The `nocache` spec flag is what raced the two.
 struct Entry {
     /// Best first, already deduplicated by `Move::same_effect`.
     moves: Vec<Move>,
@@ -334,21 +475,32 @@ impl Search {
         let mut best_depth = 1u8;
         let mut deepened = beam;
 
+        // The third field is whether this move's score came from a real
+        // deepening rather than from the one-ply root pass. It has to ride
+        // along rather than be recomputed, because a move can be deepened in
+        // one iteration and fall outside the beam in the next while keeping the
+        // deep score it earned.
+        let mut work: Vec<(Move, f32, bool)> = roots
+            .moves
+            .iter()
+            .map(|(m, s)| (m.clone(), *s, false))
+            .collect();
+
         for depth in 2..=self.cfg.max_depth {
             self.out_of_time = false;
-            let mut scored: Vec<(Move, f32)> = Vec::with_capacity(roots.moves.len());
+            let mut scored: Vec<(Move, f32, bool)> = Vec::with_capacity(work.len());
             let mut done = 0usize;
 
-            for (i, (m, prev)) in roots.moves.iter().enumerate() {
+            for (i, (m, prev, was_deep)) in work.iter().enumerate() {
                 // Outside the beam, or out of time: carry the previous score
                 // forward. It is an honest number, just a shallower one.
                 if i >= beam || self.out_of_time {
-                    scored.push((m.clone(), *prev));
+                    scored.push((m.clone(), *prev, *was_deep));
                     continue;
                 }
                 if self.expired() {
                     self.out_of_time = true;
-                    scored.push((m.clone(), *prev));
+                    scored.push((m.clone(), *prev, *was_deep));
                     continue;
                 }
                 let child = after_turn(g, p, m);
@@ -361,10 +513,10 @@ impl Search {
                 if self.out_of_time {
                     // The budget ran out *inside* this subtree, so its value is
                     // a truncated search's guess. Keep the shallower number.
-                    scored.push((m.clone(), *prev));
+                    scored.push((m.clone(), *prev, *was_deep));
                     continue;
                 }
-                scored.push((m.clone(), v));
+                scored.push((m.clone(), v, true));
                 done += 1;
             }
 
@@ -376,14 +528,23 @@ impl Search {
             if done == 0 {
                 break;
             }
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-            roots.moves = scored;
+            if self.cfg.beam_first {
+                // See [`Config::beam_first`]: searched beats unsearched before
+                // score is even consulted.
+                scored.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.total_cmp(&a.1)));
+            } else {
+                scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+            work = scored;
             best_depth = depth;
             deepened = done;
             if self.out_of_time {
                 break;
             }
         }
+
+        self.stats.best_deepened = work.first().map(|t| t.2).unwrap_or(false);
+        roots.moves = work.into_iter().map(|(m, s, _)| (m, s)).collect();
 
         self.stats.depth = best_depth;
         self.stats.deepened = deepened;
@@ -462,7 +623,9 @@ impl Search {
                 self.cfg.width_at(ply)
             }
         } else {
-            1
+            // See [`Config::opp_width`]: 1 is the pure greedy model, and the
+            // reason this search records 0.0 cutoffs a turn.
+            self.cfg.opp_width.max(1)
         };
         let cands = self.candidates(g, mover, width);
         if cands.is_empty() {
@@ -476,7 +639,7 @@ impl Search {
         self.stats.nodes += 1;
         let mut best = if maximizing { -INF } else { INF };
 
-        for m in &cands {
+        for (i, m) in cands.iter().enumerate() {
             let child = after_turn(g, mover, m);
             let v = self.ab(&child, depth - 1, ply + 1, alpha, beta);
             if maximizing {
@@ -495,7 +658,14 @@ impl Search {
                 }
             }
             if alpha >= beta {
-                self.stats.cutoffs += 1;
+                // Only a break that skips a sibling is a cutoff. Under
+                // `Greedy` every opponent node is one child wide, so the
+                // window test fires on the last child constantly and the old
+                // unconditional count read 89 per turn at depth 8 where the
+                // true figure is a fifth of that.
+                if i + 1 < cands.len() {
+                    self.stats.cutoffs += 1;
+                }
                 break;
             }
         }
@@ -535,7 +705,12 @@ impl Search {
             }
         }
         }
-        let cap = self.cfg.interior_cap;
+        // A width-1 node needs an argmax, not a ranked shortlist, so it has no
+        // use for the full budget -- see [`Config::cap_per_width`].
+        let cap = match self.cfg.cap_per_width {
+            Some(k) => k.saturating_mul(width).clamp(k.max(1), self.cfg.interior_cap),
+            None => self.cfg.interior_cap,
+        };
         let mut seen: Vec<(Move, f32)> = Vec::new();
         let mut capped = false;
 

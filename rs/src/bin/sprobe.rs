@@ -41,7 +41,7 @@ fn positions(games: u64, every: usize) -> Vec<GameState> {
 
 fn run(label: &str, cfg: Config, ps: &[GameState]) {
     let mut s = Search::new(cfg);
-    let (mut nodes, mut leaves, mut tt, mut cm) = (0u64, 0u64, 0u64, 0u64);
+    let (mut nodes, mut leaves, mut tt, mut cm, mut cc, mut cut) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut depth, mut deep, mut rootn, mut rootms) = (0f64, 0f64, 0f64, 0f64);
     let t = Instant::now();
     for g in ps {
@@ -51,20 +51,30 @@ fn run(label: &str, cfg: Config, ps: &[GameState]) {
         leaves += st.leaves;
         tt += st.tt_hits;
         cm += st.cand_moves;
+        cc += st.cand_calls;
+        cut += st.cutoffs;
         depth += st.depth as f64;
         deep += st.deepened as f64;
         rootn += st.root_moves as f64;
         rootms += st.root_elapsed.as_secs_f64() * 1e3;
     }
     let n = ps.len() as f64;
+    // `per-expand` is the number that matters: enumerating and statically
+    // scoring the candidates of one *fresh* node. `cut` proves whether
+    // alpha-beta is doing anything -- under Greedy no min node has a sibling,
+    // so beta never moves and the answer is zero.
     println!(
-        "{label:<40} {:>7.0}ms/turn (root {:>6.0}ms)  nodes {:>7.1}  leaves {:>7.1}  tt {:>7.1}  candmoves {:>8.0}  depth {:>4.1}  deep {:>4.1}  rootmoves {:>9.0}",
+        "{label:<34} {:>6.0}ms (root {:>5.0}ms) nodes {:>7.1} leaves {:>6.1} tt {:>7.1} ({:>3.0}%) expand {:>6.1} candmv {:>8.0} per-expand {:>5.0} cut {:>6.1} depth {:>4.1} deep {:>4.1} rootmv {:>7.0}",
         t.elapsed().as_secs_f64() * 1e3 / n,
         rootms / n,
         nodes as f64 / n,
         leaves as f64 / n,
         tt as f64 / n,
+        100.0 * tt as f64 / (tt + cc).max(1) as f64,
+        cc as f64 / n,
         cm as f64 / n,
+        cm as f64 / cc.max(1) as f64,
+        cut as f64 / n,
         depth / n,
         deep / n,
         rootn / n
@@ -146,20 +156,150 @@ fn main() {
             println!("one-ply best:     {:.1}% placements ({top_plc}/{top_n})", 100.0 * top_plc as f64 / top_n as f64);
             println!("deep search overturned the one-ply pick on {changed}/{} positions ({:.0}%)", ps.len(), 100.0 * changed as f64 / ps.len() as f64);
         }
+        "beam" => {
+            // How often does the move the agent actually plays come from
+            // outside the deepened beam? `MinimaxAgent` sets `keep` to
+            // MAX_VISITS = 24 while the beam is widths[0] = 12, and the
+            // deepening loop sorts all 24 on score alone -- so a move holding
+            // nothing but its one-ply margin can finish first.
+            for (label, keep, bf) in [
+                ("as MinimaxAgent plays it (keep=24, beam=12)", 24usize, false),
+                ("beamfirst                                  ", 24, true),
+                ("keep=12 == beam (no tail to lose to)       ", 12, false),
+            ] {
+                let mut s = Search::new(Config { keep, beam_first: bf, max_depth: 8, ..Config::default() }.with_budget_ms(200));
+                let (mut undeep, mut n) = (0usize, 0usize);
+                for g in &ps {
+                    let _ = s.search(g, g.current);
+                    n += 1;
+                    if !s.stats().best_deepened { undeep += 1; }
+                }
+                println!("{label}  played an un-deepened move on {undeep}/{n} turns ({:.0}%)", 100.0 * undeep as f64 / n as f64);
+            }
+        }
         "mcts" => {
             use rand::SeedableRng;
             // Wall-clock per turn for each agent spec, on the same positions,
-            // so an mcts budget can be matched to a minimax one.
-            for spec in argv.iter().skip(2) {
-                let a = AgentSpec::parse(spec, false).unwrap_or_else(|e| panic!("{spec}: {e}"));
-                let inst = a.instance();
-                let mut rng = rand::rngs::StdRng::seed_from_u64(7);
-                let t = Instant::now();
+            // so an mcts simulation budget can be matched to a minimax depth.
+            //
+            // **Interleaved, position by position, not spec by spec.** The
+            // whole point of this number is to say two budgets are the same
+            // size, and running one spec to completion and then the next
+            // charges whichever went second for whatever else started on the
+            // machine in between. Interleaving makes contention a common-mode
+            // error instead of a bias, which is the same reason the arena
+            // rotates seats within a block.
+            let specs: Vec<_> = argv
+                .iter()
+                .skip(2)
+                .map(|s| {
+                    let a = AgentSpec::parse(s, false).unwrap_or_else(|e| panic!("{s}: {e}"));
+                    let inst = a.instance();
+                    (a.name(), inst, 0f64, 0usize)
+                })
+                .collect();
+            let mut specs = specs;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+            for _ in 0..3 {
                 for g in &ps {
-                    let _ = inst.play_turn(g, g.current, 0.0, &mut rng);
+                    for (_, inst, secs, n) in specs.iter_mut() {
+                        let t = Instant::now();
+                        let _ = inst.play_turn(g, g.current, 0.0, &mut rng);
+                        *secs += t.elapsed().as_secs_f64();
+                        *n += 1;
+                    }
                 }
-                println!("{:<28} {:>8.1} ms/turn", a.name(), t.elapsed().as_secs_f64() * 1e3 / ps.len() as f64);
             }
+            for (name, _, secs, n) in &specs {
+                println!("{name:<46} {:>8.2} ms/turn  ({n} turns)", secs * 1e3 / *n as f64);
+            }
+        }
+        "nodes" => {
+            // Is §2.6's cap set anywhere near where the widths actually are?
+            // `cap_per_width` was the alpha-beta's biggest single win and the
+            // principle behind it -- do not spend enumeration budget out of
+            // proportion to how much of the result you will use -- has exactly
+            // one analogue here, which is `max_edges` plus widening.
+            use tzolkin::mcts::{Mcts, MctsConfig, Priors};
+            use tzolkin::phase::{HeuristicEvaluator, Phase};
+            let sims: u32 = argv.get(2).and_then(|v| v.parse().ok()).unwrap_or(2048);
+            let priors = match argv.get(3).map(|s| s.as_str()) {
+                Some("1ply") => Priors::OnePly,
+                _ => Priors::Evaluator,
+            };
+            let cfg = MctsConfig { priors, dirichlet_eps: 0.0, temperature: 0.0, ..MctsConfig::default() };
+            let mut m = Mcts::new(HeuristicEvaluator, cfg);
+            let mut widths: Vec<usize> = Vec::new();
+            let (mut capped, mut widened, mut opened, mut n) = (0usize, 0usize, 0usize, 0usize);
+            let (mut nodes, mut decisions, mut reused, mut discarded) = (0usize, 0usize, 0usize, 0usize);
+            let mut all: Vec<(u32, u32)> = Vec::new();
+            let (mut conc, mut uniform, mut nconc) = (0f64, 0f64, 0usize);
+            let t = Instant::now();
+            for g in ps.iter().take(60) {
+                let mut st = *g;
+                let mut at = (Phase::Beg, st.current, 0u8);
+                for _ in 0..32 {
+                    let (phase, turn, done) = at;
+                    let r = m.search_at(&st, phase, turn, done, sims);
+                    decisions += 1;
+                    nodes += r.nodes;
+                    let (ru, di) = m.reuse_stats();
+                    reused += ru;
+                    discarded += di;
+                    if r.sims > 0 {
+                        n += 1;
+                        widths.push(r.legal_edges);
+                        opened += r.visits.len();
+                        // How concentrated is the visit distribution? With
+                        // PUCT's exploration term tuned for a value scale it
+                        // does not have, the root comes out near-uniform and
+                        // the search is spending its budget proving that every
+                        // edge is about the same.
+                        let tot: u32 = r.visits.iter().map(|(_, n)| n).sum();
+                        if tot > 0 {
+                            let top = r.visits.iter().map(|(_, n)| *n).max().unwrap_or(0);
+                            conc += top as f64 / tot as f64;
+                            uniform += 1.0 / r.visits.len() as f64;
+                            nconc += 1;
+                        }
+                        if r.legal_edges > cfg.max_edges {
+                            capped += 1;
+                            if r.visits.len() > cfg.max_edges {
+                                widened += 1;
+                            }
+                        }
+                    }
+                    all.extend(m.node_widths());
+                    let tr = tzolkin::tree::apply_step(&mut st, phase, turn, done, &r.step);
+                    let committed = tr.committed();
+                    match tr.next() { None => break, Some(nx) => at = nx }
+                    if committed { break; }
+                }
+            }
+            // Interior nodes as well: the roots of a chain are narrow by
+            // construction and say nothing about where the cap sits.
+            let mut inner: Vec<u32> = all.iter().map(|&(l, _)| l).collect();
+            inner.sort_unstable();
+            if !inner.is_empty() {
+                let iq = |f: f64| inner[((inner.len() - 1) as f64 * f) as usize];
+                let over = all.iter().filter(|&&(l, _)| l as usize > cfg.max_edges).count();
+                let part = all.iter().filter(|&&(l, a)| a < l && (l as usize) <= cfg.max_edges).count();
+                println!(
+                    "arena nodes (interior included) n={}  legal p50 {} p90 {} p99 {} max {}  \
+                     over max_edges={} on {} ({:.2}%)  still-widening below the cap {} ({:.1}%)",
+                    inner.len(), iq(0.5), iq(0.9), iq(0.99), inner[inner.len() - 1],
+                    cfg.max_edges, over, 100.0 * over as f64 / inner.len() as f64,
+                    part, 100.0 * part as f64 / inner.len() as f64
+                );
+            }
+            widths.sort_unstable();
+            let q = |f: f64| widths[((widths.len() - 1) as f64 * f) as usize];
+            println!("{n} searched nodes over {decisions} sub-decisions, {:.0} ms/decision", t.elapsed().as_secs_f64() * 1e3 / decisions as f64);
+            println!("legal edges  p50 {}  p90 {}  p99 {}  max {}  mean {:.1}", q(0.5), q(0.9), q(0.99), widths[widths.len()-1], widths.iter().sum::<usize>() as f64 / n as f64);
+            println!("mean edges opened {:.1} of {:.1} legal ({:.0}%)", opened as f64 / n as f64, widths.iter().sum::<usize>() as f64 / n as f64, 100.0 * opened as f64 / widths.iter().sum::<usize>() as f64);
+            println!("wider than max_edges={} on {capped}/{n} ({:.1}%); widening opened past it on {widened}", cfg.max_edges, 100.0 * capped as f64 / n as f64);
+            println!("top-edge visit share {:.1}% at searched roots; a uniform split would be {:.1}%", 100.0 * conc / nconc as f64, 100.0 * uniform / nconc as f64);
+            println!("arena {:.0} nodes/decision; reuse kept {:.0} and threw {:.0} per decision", nodes as f64 / decisions as f64, reused as f64 / decisions as f64, discarded as f64 / decisions as f64);
         }
         "shape" => {
             let v = |w: Vec<usize>, d: u8, ow: bool| Config { max_depth: d, widths: w, own_width: ow, ..Config::default() }.with_budget_ms(200);
