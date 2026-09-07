@@ -26,6 +26,7 @@ pub mod moves;
 pub mod net;
 pub mod options;
 pub mod phase;
+pub mod plan;
 pub mod record;
 pub mod tree;
 pub mod research;
