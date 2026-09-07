@@ -1217,3 +1217,420 @@ fn evaluator_discrimination() {
     );
     assert!(!place.is_empty() && !retrieve.is_empty());
 }
+
+// ---- evaluator calibration ---------------------------------------------
+
+/// Ordinary least squares with a ridge term, by Gauss-Jordan on the normal
+/// equations. `x` rows are already augmented with a 1 for the intercept.
+///
+/// Ridge rather than plain OLS because the evaluator's terms are correlated by
+/// construction — a player with a big engine also holds blocks — and an
+/// unregularised solve of a near-singular Gram matrix reports coefficients of
+/// ±40 that flip sign between runs. λ is small enough to leave a well-posed
+/// column alone and large enough that the answer is stable across seeds.
+#[cfg(test)]
+fn ridge(x: &[Vec<f64>], y: &[f64], lambda: f64) -> Vec<f64> {
+    let k = x[0].len();
+    let mut a = vec![vec![0.0f64; k + 1]; k];
+    for (row, &yi) in x.iter().zip(y) {
+        for i in 0..k {
+            for j in 0..k {
+                a[i][j] += row[i] * row[j];
+            }
+            a[i][k] += row[i] * yi;
+        }
+    }
+    // No penalty on the intercept (column 0).
+    for i in 1..k {
+        a[i][i] += lambda * x.len() as f64;
+    }
+    for i in 0..k {
+        let piv = (i..k).max_by(|&r, &s| a[r][i].abs().total_cmp(&a[s][i].abs())).unwrap();
+        a.swap(i, piv);
+        if a[i][i].abs() < 1e-12 {
+            continue;
+        }
+        let d = a[i][i];
+        for j in i..=k {
+            a[i][j] /= d;
+        }
+        for r in 0..k {
+            if r == i {
+                continue;
+            }
+            let f = a[r][i];
+            if f == 0.0 {
+                continue;
+            }
+            for j in i..=k {
+                a[r][j] -= f * a[i][j];
+            }
+        }
+    }
+    (0..k).map(|i| a[i][k]).collect()
+}
+
+/// Is `eval::heuristic` actually predicting the final score, and where is it
+/// wrong?
+///
+///     cargo test --release --test rules -- --ignored --nocapture evaluator_calibration
+///     TZ_CAL_GAMES=200 TZ_CAL_AGENT=heuristic:full cargo test --release ...   (slower)
+///
+/// The evaluator's contract is a number in points that estimates a seat's final
+/// score, so the claim is directly testable: play games with a decent agent,
+/// record the estimate at every turn root alongside that seat's realised final
+/// score, and look at the four things that matter.
+///
+/// * **Bias and error by day.** A term that decays wrongly shows up as bias
+///   that drifts with the calendar, which one pooled number hides.
+/// * **Which component carries it.** `eval::components` is a linear
+///   decomposition, so the realised score can be regressed on the eight terms.
+///   A coefficient of 1.0 means the term is already scaled right; 2.0 means it
+///   is worth double what it is being paid; ~0 means it is noise. That is the
+///   number that says what to change, and it is why the decomposition exists.
+/// * **Ordering.** For a search, ranking the seats right matters more than the
+///   magnitude, so the pairwise concordance between estimated and realised
+///   standings is reported separately from the error.
+/// * **Scale.** `phase.rs::HeuristicEvaluator` squashes with
+///   `tanh((raw - mean)/25.0)`, so the spread of the centred estimate has to be
+///   compared against the spread of the centred final score.
+#[test]
+#[ignore]
+fn evaluator_calibration() {
+    use rand::SeedableRng;
+    use rayon::prelude::*;
+    use tzolkin::eval::{components, heuristic, margin, Components};
+    use tzolkin::record::{flags, parse_agent, play_game, GameConfig};
+
+    let games: u64 = std::env::var("TZ_CAL_GAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let spec = std::env::var("TZ_CAL_AGENT").unwrap_or_else(|_| "heuristic:32".into());
+
+    /// One recorded turn root: the estimate for every seat, and what every seat
+    /// finally scored.
+    struct Row {
+        day: u8,
+        est: [f32; N_PLAYERS],
+        parts: [Components; N_PLAYERS],
+        margin: [f32; N_PLAYERS],
+        outcome: [f32; N_PLAYERS],
+    }
+
+    let started = std::time::Instant::now();
+    let rows: Vec<Row> = (0..games)
+        .into_par_iter()
+        .flat_map(|seed| {
+            // One agent instance per game: a searching agent owns per-game state.
+            let a = parse_agent(&spec, true).unwrap();
+            let agents: [&dyn tzolkin::record::Agent; N_PLAYERS] =
+                [a.as_ref(), a.as_ref(), a.as_ref(), a.as_ref()];
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0xCA11B);
+            let r = play_game(seed, &agents, &GameConfig::evaluation(), &mut rng);
+            let outcome: [f32; N_PLAYERS] = std::array::from_fn(|i| r.scores[i] as f32);
+            r.nodes
+                .iter()
+                .filter(|n| n.flags & flags::TURN_ROOT != 0 && !n.state.over)
+                .map(|n| Row {
+                    day: n.state.day,
+                    est: std::array::from_fn(|i| heuristic(&n.state, PlayerId(i as u8))),
+                    parts: std::array::from_fn(|i| components(&n.state, PlayerId(i as u8))),
+                    margin: std::array::from_fn(|i| margin(&n.state, PlayerId(i as u8))),
+                    outcome,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let elapsed = started.elapsed().as_secs_f64();
+    assert!(!rows.is_empty());
+
+    // ---- helpers -------------------------------------------------------
+    fn mean(v: &[f64]) -> f64 {
+        v.iter().sum::<f64>() / v.len().max(1) as f64
+    }
+    fn sd(v: &[f64]) -> f64 {
+        if v.len() < 2 {
+            return f64::NAN;
+        }
+        let m = mean(v);
+        (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt()
+    }
+    fn corr(x: &[f64], y: &[f64]) -> f64 {
+        let (mx, my) = (mean(x), mean(y));
+        let mut sxy = 0.0;
+        let mut sxx = 0.0;
+        let mut syy = 0.0;
+        for i in 0..x.len() {
+            sxy += (x[i] - mx) * (y[i] - my);
+            sxx += (x[i] - mx).powi(2);
+            syy += (y[i] - my).powi(2);
+        }
+        sxy / (sxx * syy).sqrt()
+    }
+
+    println!(
+        "\n=== evaluator calibration ===\n{games} games of {spec}, \
+         {} turn roots, {} (position, seat) pairs, {elapsed:.0}s",
+        rows.len(),
+        rows.len() * N_PLAYERS,
+    );
+
+    // ---- 1. error and bias by day --------------------------------------
+    //
+    // Buckets of three days. The calendar is 27 long and the interesting
+    // structure is at the ends, so finer than a per-age split and coarser than
+    // per-day, which at a few hundred games is too thin to read.
+    println!(
+        "\n-- accuracy by day (estimate vs that seat's final score) --\n\
+         {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>6}",
+        "days", "n", "est", "actual", "bias", "MAE", "r"
+    );
+    let bucket_of = |d: u8| (d / 3).min(8) as usize;
+    let mut by_bucket: Vec<(Vec<f64>, Vec<f64>)> = vec![(Vec::new(), Vec::new()); 9];
+    for r in &rows {
+        for i in 0..N_PLAYERS {
+            let b = &mut by_bucket[bucket_of(r.day)];
+            b.0.push(r.est[i] as f64);
+            b.1.push(r.outcome[i] as f64);
+        }
+    }
+    for (b, (est, act)) in by_bucket.iter().enumerate() {
+        if est.len() < 10 {
+            continue;
+        }
+        let err: Vec<f64> = est.iter().zip(act).map(|(e, a)| e - a).collect();
+        println!(
+            "{:>7}  {:>7}  {:>7.1}  {:>7.1}  {:>+7.2}  {:>7.2}  {:>6.3}",
+            format!("{}-{}", b * 3, b * 3 + 2),
+            est.len(),
+            mean(est),
+            mean(act),
+            mean(&err),
+            mean(&err.iter().map(|e| e.abs()).collect::<Vec<_>>()),
+            corr(est, act),
+        );
+    }
+    let all_est: Vec<f64> = rows.iter().flat_map(|r| r.est.iter().map(|&x| x as f64)).collect();
+    let all_act: Vec<f64> = rows.iter().flat_map(|r| r.outcome.iter().map(|&x| x as f64)).collect();
+    let all_err: Vec<f64> = all_est.iter().zip(&all_act).map(|(e, a)| e - a).collect();
+    println!(
+        "{:>7}  {:>7}  {:>7.1}  {:>7.1}  {:>+7.2}  {:>7.2}  {:>6.3}",
+        "all",
+        all_est.len(),
+        mean(&all_est),
+        mean(&all_act),
+        mean(&all_err),
+        mean(&all_err.iter().map(|e| e.abs()).collect::<Vec<_>>()),
+        corr(&all_est, &all_act),
+    );
+
+    // ---- 2. which component carries the error --------------------------
+    //
+    // Regress the realised final score on the eight terms. The fitted
+    // coefficient is what the term *should* be multiplied by; the printed
+    // `bias` column is that term's own mean signed error contribution,
+    // `(coef - 1) * mean(term)`, which is the points per position the current
+    // weight is getting wrong.
+    let names = Components::NAMES;
+    let build = |sel: &dyn Fn(&Row) -> bool| -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for r in rows.iter().filter(|r| sel(r)) {
+            for i in 0..N_PLAYERS {
+                let t = r.parts[i].terms();
+                let mut row = vec![1.0];
+                row.extend(t.iter().map(|&v| v as f64));
+                x.push(row);
+                y.push(r.outcome[i] as f64);
+            }
+        }
+        (x, y)
+    };
+
+    println!(
+        "\n-- what each term is worth: OLS(final score ~ terms), whole game --\n\
+         {:>12}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "term", "mean", "coef", "should be", "pts/pos"
+    );
+    let (x, y) = build(&|_| true);
+    let coefs = ridge(&x, &y, 1e-3);
+    println!("{:>12}  {:>8}  {:>+8.2}", "(intercept)", "", coefs[0]);
+    for (k, name) in names.iter().enumerate() {
+        let col: Vec<f64> = x.iter().map(|r| r[k + 1]).collect();
+        let m = mean(&col);
+        println!(
+            "{:>12}  {:>8.2}  {:>8.2}  {:>8.2}  {:>+8.2}",
+            name,
+            m,
+            coefs[k + 1],
+            coefs[k + 1] * m,
+            (1.0 - coefs[k + 1]) * m,
+        );
+    }
+
+    // The same fit split by phase, because a term that decays wrongly has a
+    // coefficient that moves with the calendar.
+    for (label, lo, hi) in [("day 0-8", 0u8, 8u8), ("day 9-17", 9, 17), ("day 18-26", 18, 27)] {
+        let (x, y) = build(&|r| r.day >= lo && r.day <= hi);
+        if y.len() < 200 {
+            continue;
+        }
+        let c = ridge(&x, &y, 1e-3);
+        print!("\n{label:>12} (n={:>6}) coef:", y.len());
+        for (k, name) in names.iter().enumerate() {
+            print!("  {name}={:.2}", c[k + 1]);
+        }
+        println!();
+    }
+
+    // ---- 2b. the same fit *within* a position --------------------------
+    //
+    // This is the one that matters, and the pooled fit above cannot answer it.
+    // Two thirds of the variance in a raw term is the calendar (`engine` is
+    // mostly `rounds_left`), and the calendar says nothing about who wins. So
+    // centre every term and every outcome across the four seats of the *same*
+    // position: what is left is exactly the quantity `margin` reduces to, and a
+    // coefficient here says what that term is worth as a discriminator.
+    //
+    // A term whose coefficient is near zero is dead weight in the margin. A
+    // negative one is actively pointing the search the wrong way.
+    let fe = |sel: &dyn Fn(&Row) -> bool| -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for r in rows.iter().filter(|r| sel(r)) {
+            let t: Vec<[f32; 8]> = (0..N_PLAYERS).map(|i| r.parts[i].terms()).collect();
+            let tbar: [f64; 8] = std::array::from_fn(|k| {
+                (0..N_PLAYERS).map(|i| t[i][k] as f64).sum::<f64>() / N_PLAYERS as f64
+            });
+            let ybar = r.outcome.iter().sum::<f32>() as f64 / N_PLAYERS as f64;
+            for i in 0..N_PLAYERS {
+                let mut row = vec![1.0];
+                row.extend((0..8).map(|k| t[i][k] as f64 - tbar[k]));
+                x.push(row);
+                y.push(r.outcome[i] as f64 - ybar);
+            }
+        }
+        (x, y)
+    };
+    println!(
+        "\n-- what each term is worth as a *discriminator*: the same fit with \n\
+           every term and outcome centred across the four seats of one position --\n\
+         {:>12}  {:>8}  {:>8}  {:>8}",
+        "term", "sd", "coef", "coef*sd"
+    );
+    let (x, y) = fe(&|_| true);
+    for (k, name) in names.iter().enumerate() {
+        let col: Vec<f64> = x.iter().map(|r| r[k + 1]).collect();
+        let s = sd(&col);
+        println!(
+            "{:>12}  {:>8.2}  {:>8.2}  {:>8.2}",
+            name,
+            s,
+            ridge(&x, &y, 1e-3)[k + 1],
+            ridge(&x, &y, 1e-3)[k + 1] * s,
+        );
+    }
+    println!("  (centred outcome sd {:.2})", sd(&y));
+
+    println!("\n-- discriminator coefficients by day --");
+    print!("{:>12}", "days");
+    for name in names.iter() {
+        print!("  {name:>11}");
+    }
+    println!();
+    for b in 0..9 {
+        let (x, y) = fe(&|r| bucket_of(r.day) == b);
+        if y.len() < 200 {
+            continue;
+        }
+        let c = ridge(&x, &y, 1e-3);
+        print!("{:>12}", format!("{}-{}", b * 3, b * 3 + 2));
+        for k in 0..8 {
+            print!("  {:>11.2}", c[k + 1]);
+        }
+        println!();
+    }
+
+    // ---- 3. ordering ---------------------------------------------------
+    //
+    // For a search, ranking beats calibration: what matters is whether the
+    // seat the evaluator likes is the seat that wins. Concordance is over the
+    // six seat pairs at each position, skipping pairs that tied on the day.
+    let mut agree = 0u64;
+    let mut pairs = 0u64;
+    let mut top1 = 0u64;
+    let mut top1_n = 0u64;
+    let mut by_bucket_conc = vec![(0u64, 0u64); 9];
+    for r in &rows {
+        for i in 0..N_PLAYERS {
+            for j in (i + 1)..N_PLAYERS {
+                if r.outcome[i] == r.outcome[j] {
+                    continue;
+                }
+                let ok = (r.est[i] > r.est[j]) == (r.outcome[i] > r.outcome[j]);
+                pairs += 1;
+                agree += ok as u64;
+                let b = &mut by_bucket_conc[bucket_of(r.day)];
+                b.0 += ok as u64;
+                b.1 += 1;
+            }
+        }
+        let lead_est = (0..N_PLAYERS).max_by(|&a, &b| r.est[a].total_cmp(&r.est[b])).unwrap();
+        let best = (0..N_PLAYERS).map(|i| r.outcome[i]).fold(f32::MIN, f32::max);
+        top1_n += 1;
+        top1 += (r.outcome[lead_est] == best) as u64;
+    }
+    println!(
+        "\n-- ordering --\npairwise concordance {:.3} over {pairs} seat pairs \
+         (0.5 is a coin flip)\nthe estimator's leader is the eventual winner {:.3} \
+         of the time (0.25 is chance)",
+        agree as f64 / pairs as f64,
+        top1 as f64 / top1_n as f64,
+    );
+    print!("by day: ");
+    for (b, (ok, n)) in by_bucket_conc.iter().enumerate() {
+        if *n < 10 {
+            continue;
+        }
+        print!("{}-{}:{:.3}  ", b * 3, b * 3 + 2, *ok as f64 / *n as f64);
+    }
+    println!();
+
+    // ---- 4. scale ------------------------------------------------------
+    //
+    // `HeuristicEvaluator` divides the centred estimate by 25 before a tanh.
+    // If the centred estimate's spread is far from the centred outcome's, that
+    // constant is squashing the wrong range.
+    let centred = |v: &[f32; N_PLAYERS]| -> Vec<f64> {
+        let m = v.iter().sum::<f32>() as f64 / N_PLAYERS as f64;
+        v.iter().map(|&x| x as f64 - m).collect()
+    };
+    let ce: Vec<f64> = rows.iter().flat_map(|r| centred(&r.est)).collect();
+    let ca: Vec<f64> = rows.iter().flat_map(|r| centred(&r.outcome)).collect();
+    let mg: Vec<f64> = rows.iter().flat_map(|r| r.margin.iter().map(|&x| x as f64)).collect();
+    println!(
+        "\n-- scale --\ncentred estimate  sd {:>6.2}   centred final score sd {:>6.2}   \
+         r {:.3}\nmargin mean {:>6.2} sd {:>6.2}; tanh(centred/25) uses \
+         {:.0}% of its range on 1 sd",
+        sd(&ce),
+        sd(&ca),
+        corr(&ce, &ca),
+        mean(&mg),
+        sd(&mg),
+        100.0 * (sd(&ce) / 25.0).tanh(),
+    );
+
+    // How much of the final spread is explained by the estimate at each day.
+    println!("\n-- centred estimate vs centred outcome, by day --");
+    print!("r: ");
+    for b in 0..9 {
+        let e: Vec<f64> = rows.iter().filter(|r| bucket_of(r.day) == b).flat_map(|r| centred(&r.est)).collect();
+        let a: Vec<f64> = rows.iter().filter(|r| bucket_of(r.day) == b).flat_map(|r| centred(&r.outcome)).collect();
+        if e.len() < 10 {
+            continue;
+        }
+        print!("{}-{}:{:.3}({:.1}/{:.1})  ", b * 3, b * 3 + 2, corr(&e, &a), sd(&e), sd(&a));
+    }
+    println!("\n");
+}

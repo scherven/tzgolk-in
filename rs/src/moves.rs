@@ -461,7 +461,7 @@ pub fn choices_for_worker(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> V
     // used to generate the whole gear eight times over, once per fee.
     let lowest = if crate::spaces::is_free_choice(gear, pos)
         // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
-        && crate::options::PRUNE.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::options::pruning_on()
     {
         pos.0
     } else {

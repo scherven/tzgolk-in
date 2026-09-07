@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
+use rand::SeedableRng;
 use ratatui::prelude::*;
 
 use tzolkin::eval::{self, margin, Ranking};
@@ -112,8 +113,21 @@ fn main() -> io::Result<()> {
         None => MoveSource::Full,
     };
 
+    // With an agent named, let it draft its own starting tiles — otherwise the
+    // board you are watching it play was set up by a coin flip.
+    let mut game = Game::new(seed);
+    if let Some(a) = &agent {
+        let (fresh, deal) = Game::new_undrafted(seed);
+        game = fresh;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0xD8AF7);
+        for p in PlayerId::ALL {
+            let kept = a.draft(&game.state, p, deal[p.idx()], &mut rng);
+            game.keep_tiles(p, kept);
+        }
+    }
+
     let mut app = App {
-        game: Game::new(seed),
+        game,
         agent,
         agent_name,
         last_decisions: Vec::new(),

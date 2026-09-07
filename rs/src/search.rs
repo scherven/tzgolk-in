@@ -1,19 +1,27 @@
 //! Paranoid minimax with alpha-beta pruning over whole turns.
 //!
-//! # Why paranoid
+//! # What the other three seats are assumed to do
 //!
 //! Alpha-beta is a two-player, zero-sum algorithm and Tzolk'in seats four. The
-//! standard reduction is *paranoid* search: collapse the four scores into the
+//! textbook reduction is *paranoid* search: collapse the four scores into the
 //! single quantity [`eval::margin`] — how far the root player stands ahead of
 //! whichever opponent is currently doing best — and let every opponent minimise
 //! it. That is a genuine two-valued game, so alpha-beta prunes soundly rather
 //! than "mostly", which is the failure mode of pruning a `max^n` tree.
 //!
-//! It is pessimistic by construction: three opponents will not in fact
-//! coordinate against one player. The price is that the search underrates moves
-//! whose refutation requires an opponent to hurt themselves, and that is the
-//! right way to be wrong for a game where the alternative — assuming everyone
-//! plays their own best move — cannot prune at all.
+//! It is also false, and measurably so. Three opponents do not coordinate, and
+//! against agents that simply play their own best move the paranoid search is
+//! **not distinguishable from no search at all**: +0.98 centred score against
+//! `heuristic:full` over 120 games, 95% CI -3.74..+5.70. Swapping in
+//! [`Opponents::Greedy`] — each opponent plays the move its own evaluator likes
+//! best, and nothing else is tried at that ply — gives +5.80 (+1.86..+9.75) at
+//! the same depth and +12.95 (+8.89..+17.01) at depth 8. The greedy model
+//! cannot prune, because a one-child node has nothing to cut; it wins anyway,
+//! because being cheap buys depth and because it is *true*.
+//!
+//! Both are kept and both are the default of nothing: [`Config::opponents`]
+//! chooses, and `Greedy` is what `Config::default` picks. Paranoid is the one
+//! to reach for against an opponent that is actually trying to stop you.
 //!
 //! # The shape of the tree
 //!
@@ -112,19 +120,32 @@ pub struct Config {
     pub root_budget: Option<Duration>,
     /// Ranked root moves to report.
     pub keep: usize,
+    /// AB-HARNESS (temporary): turn the shortlist cache off, to race the two
+    /// against each other in one arena process. Delete with the `nocache` spec
+    /// flag once the measurement is banked.
+    pub cache: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            opponents: Opponents::Paranoid,
-            max_depth: 4,
+            // Measured against `heuristic:full` over 120 games each: paranoid
+            // at depth 4 scores +0.98 centred (95% CI -3.74..+5.70, p = 0.66 --
+            // not distinguishable from one ply), greedy at the same depth
+            // +5.80 (+1.86..+9.75, p = 0.003), and greedy at depth 8 +12.95
+            // (+8.89..+17.01). Paranoid is the model alpha-beta was built for
+            // and it prunes far harder, but it is modelling opponents that do
+            // not exist; the cheaper, truer assumption wins and keeps winning
+            // as it goes deeper, which is why the depth default follows it up.
+            opponents: Opponents::Greedy,
+            max_depth: 8,
             widths: vec![12, 6, 4, 3, 2],
             interior_cap: 400,
             top_up: 16,
             budget: Duration::from_millis(600),
             root_budget: Some(crate::eval::FULL_BUDGET),
             keep: 10,
+            cache: true,
         }
     }
 }
@@ -171,6 +192,11 @@ pub struct Stats {
     pub cutoffs: u64,
     /// Nodes answered from the transposition table.
     pub tt_hits: u64,
+    /// Calls to [`Search::candidates`] -- one per interior node expanded.
+    pub cand_calls: u64,
+    /// Moves enumerated *and statically scored* inside those calls. This is the
+    /// search's real unit of work: one `successor` + one `heuristic` each.
+    pub cand_moves: u64,
     /// Deepest ply reached. When `partial`, only `deepened` root moves got it.
     pub depth: u8,
     /// Root moves searched at `depth`. The rest carry `depth - 1` scores.
@@ -182,33 +208,48 @@ pub struct Stats {
     pub elapsed: Duration,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Bound {
-    Exact,
-    /// The true value is at least this.
-    Lower,
-    /// The true value is at most this.
-    Upper,
-}
-
-/// The depth an entry was proved to is part of the key, not the payload, so
-/// a probe can never read a shallower search's answer as a deeper one's.
-#[derive(Clone, Copy)]
+/// One node's shortlist, kept so the next deepening pass does not rebuild it.
+///
+/// The table this lives in used to hold *values* keyed on `(GameState, depth)`,
+/// which measured 0.3 hits per turn against ~100 interior nodes — because the
+/// depth was in the key, so iteration `d + 1` could never read iteration `d`'s
+/// answer, and because a turn-granular tree of this shape barely transposes at
+/// all. Caching the shortlist instead hits on nearly every node above the
+/// frontier, for the reason iterative deepening is supposed to be cheap: pass
+/// `d + 1` walks the same nodes pass `d` did. It matters far more here than in
+/// a normal alpha-beta because a node in this game costs ~100 static
+/// evaluations to *expand* — `visit_moves_of` plus a `successor` and a
+/// `heuristic` per candidate — and almost nothing to search.
 struct Entry {
-    value: f32,
-    bound: Bound,
+    /// Best first, already deduplicated by `Move::same_effect`.
+    moves: Vec<Move>,
+    /// How many were asked for when it was built. A probe wanting more has to
+    /// rebuild; in practice a state always recurs at the same ply, so it never
+    /// does.
+    width: usize,
 }
 
-/// One search. Owns the transposition table, so reusing it across turns of the
-/// same game keeps the table warm.
+/// Shortlists retained before the table is dropped wholesale.
+///
+/// Nodes per search run to the low thousands, so this is a guard against a
+/// pathological position rather than a working limit. Clearing outright beats
+/// evicting: entries are worth something only within one search, and the cost
+/// of getting it wrong is one recomputation.
+const MAX_ENTRIES: usize = 60_000;
+
+/// One search. Owns the shortlist cache, which is scoped to a single
+/// `search` call.
 pub struct Search {
     pub cfg: Config,
     root: PlayerId,
     /// Keyed on the whole state rather than a hash of it. `GameState` is 312
     /// bytes and `Copy`, so this is a memcpy per insert and no collision can
-    /// ever return another position's score — worth it for a table that also
-    /// backs an analysis display.
-    tt: FxHashMap<(GameState, u8), Entry>,
+    /// ever hand one position another's shortlist — which would be an *illegal
+    /// move*, not merely a wrong score, so the key stays exact.
+    ///
+    /// `g.current` is the mover at every interior node, so the state alone
+    /// pins the player too.
+    tt: FxHashMap<GameState, Entry>,
     rng: StdRng,
     stats: Stats,
     deadline: Instant,
@@ -388,28 +429,8 @@ impl Search {
             return eval::margin(g, self.root);
         }
 
-        if let Some(e) = self.tt.get(&(*g, depth)) {
-            let e = *e;
-            match e.bound {
-                Bound::Exact => {
-                    self.stats.tt_hits += 1;
-                    return e.value;
-                }
-                Bound::Lower if e.value >= beta => {
-                    self.stats.tt_hits += 1;
-                    return e.value;
-                }
-                Bound::Upper if e.value <= alpha => {
-                    self.stats.tt_hits += 1;
-                    return e.value;
-                }
-                _ => {}
-            }
-        }
-
         let mover = g.current;
         let maximizing = mover == self.root;
-        let (alpha0, beta0) = (alpha, beta);
 
         // Under `Greedy`, an opponent's ply is one move wide: whichever its own
         // evaluation prefers. The min over a single child is that child, so the
@@ -455,18 +476,6 @@ impl Search {
             }
         }
 
-        // A value found after the budget expired is not a value; do not poison
-        // the table with it.
-        if !self.out_of_time {
-            let bound = if best <= alpha0 {
-                Bound::Upper
-            } else if best >= beta0 {
-                Bound::Lower
-            } else {
-                Bound::Exact
-            };
-            self.tt.insert((*g, depth), Entry { value: best, bound });
-        }
         best
     }
 
@@ -490,10 +499,23 @@ impl Search {
     /// it is a quarter of the cost (one `heuristic` call, not four) and ordering
     /// only has to be roughly right. `ab` computes the real value.
     fn candidates(&mut self, g: &GameState, mover: PlayerId, width: usize) -> Vec<Move> {
+        let width = width.max(1);
+        if self.cfg.cache {
+        if let Some(e) = self.tt.get(g) {
+            if e.width >= width || e.moves.len() < e.width {
+                // `moves.len() < width` means the node really is that narrow,
+                // so a shorter list is the whole list and not a truncation.
+                self.stats.tt_hits += 1;
+                let n = width.min(e.moves.len());
+                return e.moves[..n].to_vec();
+            }
+        }
+        }
         let cap = self.cfg.interior_cap;
         let mut seen: Vec<(Move, f32)> = Vec::new();
         let mut capped = false;
 
+        self.stats.cand_calls += 1;
         for kind in [moves::Kinds::Placements, moves::Kinds::Retrievals] {
             let mut n = 0usize;
             let flow = moves::visit_moves_of(g, mover, kind, |m| {
@@ -507,6 +529,7 @@ impl Search {
                 }
             });
             capped |= flow.is_break();
+            self.stats.cand_moves += n as u64;
         }
 
         if seen.is_empty() {
@@ -539,7 +562,6 @@ impl Search {
         // Fill the beam with moves that actually differ. Equivalent placements
         // score identically and so land adjacent after the sort; without this
         // a width of six is routinely two positions searched three times each.
-        let width = width.max(1);
         let mut out: Vec<Move> = Vec::with_capacity(width);
         for (m, _) in seen {
             if out.iter().any(|k| k.same_effect(&m)) {
@@ -550,6 +572,20 @@ impl Search {
                 break;
             }
         }
+
+        if !self.cfg.cache {
+            return out;
+        }
+        if self.tt.len() >= MAX_ENTRIES {
+            self.tt.clear();
+        }
+        self.tt.insert(
+            *g,
+            Entry {
+                moves: out.clone(),
+                width,
+            },
+        );
         out
     }
 }

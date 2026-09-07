@@ -380,6 +380,194 @@ fn ranking_agents_rank_every_move() {
     assert!(r.ranked_moves(&Game::new(1).state, PlayerId(0), 10).is_none());
 }
 
+// ---- the starting-tile draft -------------------------------------------
+
+/// `Game::new` must keep producing exactly the game it always has, or every
+/// seeded test in the suite is quietly testing a different board.
+#[test]
+fn splitting_the_draft_out_did_not_move_any_seeded_game() {
+    // The deal is a function of the seed alone, and the random draft keeps two
+    // of the four dealt. Both halves have to still hold.
+    for seed in 0..30u64 {
+        let (_, deal) = Game::new_undrafted(seed);
+        let g = Game::new(seed);
+        let mut ids: Vec<u8> = deal.iter().flatten().copied().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), N_PLAYERS * 4, "seed {seed}: a tile was dealt twice");
+        // Something was applied: nobody starts a game with nothing.
+        assert!(
+            PlayerId::ALL.iter().any(|&p| g.state.players[p.idx()].corn > 0),
+            "seed {seed}: the draft applied nothing"
+        );
+    }
+}
+
+/// The whole point of the hook: an agent that picks must beat one that rolls.
+#[test]
+fn drafting_agents_pick_better_tiles_than_chance() {
+    use tzolkin::record::best_pair;
+
+    let mut better = 0usize;
+    let mut worse = 0usize;
+    for seed in 0..60u64 {
+        let (game, deal) = Game::new_undrafted(seed);
+        let mut rng = StdRng::seed_from_u64(seed);
+        for p in PlayerId::ALL {
+            let dealt = deal[p.idx()];
+
+            let chosen = best_pair(&game.state, p, dealt, |s| heuristic(s, p));
+            let mut a = game.state;
+            for id in chosen {
+                for e in tzolkin::data::tiles::TILES[id as usize] {
+                    e.apply(&mut a, p);
+                }
+            }
+
+            // What the old random draft would have taken.
+            let rolled = parse_agent("random", false)
+                .unwrap()
+                .draft(&game.state, p, dealt, &mut rng);
+            let mut b = game.state;
+            for id in rolled {
+                for e in tzolkin::data::tiles::TILES[id as usize] {
+                    e.apply(&mut b, p);
+                }
+            }
+
+            let (x, y) = (heuristic(&a, p), heuristic(&b, p));
+            assert!(
+                x >= y - 1e-4,
+                "seed {seed} {p:?}: the chosen pair {chosen:?} scores {x} but \
+                 a random pair {rolled:?} scores {y}"
+            );
+            if x > y + 1e-4 {
+                better += 1;
+            } else if x < y - 1e-4 {
+                worse += 1;
+            }
+        }
+    }
+    assert_eq!(worse, 0);
+    assert!(
+        better > 60,
+        "picking beat rolling only {better} times in {} draws; the hook is not doing anything",
+        60 * N_PLAYERS
+    );
+}
+
+/// What the draft is worth, in evaluator points.
+///
+///     cargo test --release --test search -- --ignored --nocapture what_the_draft_is_worth
+#[test]
+#[ignore]
+fn what_the_draft_is_worth() {
+    use tzolkin::data::tiles::TILES;
+    use tzolkin::record::best_pair;
+
+    let apply = |st: &mut GameState, p: PlayerId, pair: [u8; 2]| {
+        for id in pair {
+            for e in TILES[id as usize] {
+                e.apply(st, p);
+            }
+        }
+    };
+
+    let (mut gain, mut spread) = (Vec::new(), Vec::new());
+    for seed in 0..400u64 {
+        let (game, deal) = Game::new_undrafted(seed);
+        let mut rng = StdRng::seed_from_u64(seed ^ 0xBEEF);
+        for p in PlayerId::ALL {
+            let dealt = deal[p.idx()];
+            let score = |pair: [u8; 2]| {
+                let mut st = game.state;
+                apply(&mut st, p, pair);
+                heuristic(&st, p)
+            };
+
+            let best = score(best_pair(&game.state, p, dealt, |s| heuristic(s, p)));
+            let rolled = score(
+                parse_agent("random", false)
+                    .unwrap()
+                    .draft(&game.state, p, dealt, &mut rng),
+            );
+            gain.push(best - rolled);
+
+            // The spread across the six pairs says how much was on the table.
+            let mut all: Vec<f32> = Vec::new();
+            for i in 0..4 {
+                for j in (i + 1)..4 {
+                    all.push(score([dealt[i], dealt[j]]));
+                }
+            }
+            let lo = all.iter().copied().fold(f32::INFINITY, f32::min);
+            let hi = all.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            spread.push(hi - lo);
+        }
+    }
+
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+    let mut sorted = gain.clone();
+    sorted.sort_by(f32::total_cmp);
+    println!(
+        "\nstarting-tile draft, {} deals\n  \
+         gain over a random keep : {:>6.2} points mean, {:>6.2} median, {:>6.2} p90\n  \
+         best minus worst pair   : {:>6.2} points mean (what was on the table)",
+        gain.len(),
+        mean(&gain),
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() * 9 / 10],
+        mean(&spread),
+    );
+}
+
+/// Whatever an agent keeps has to be two distinct tiles it was actually dealt.
+#[test]
+fn every_agent_drafts_from_what_it_was_dealt() {
+    for spec in ["random", "heuristic:32", "heuristic:full", "minimax:2:80"] {
+        let agent = parse_agent(spec, false).unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        for seed in 0..12u64 {
+            let (game, deal) = Game::new_undrafted(seed);
+            for p in PlayerId::ALL {
+                let dealt = deal[p.idx()];
+                let kept = agent.draft(&game.state, p, dealt, &mut rng);
+                assert_ne!(kept[0], kept[1], "{spec} kept the same tile twice");
+                for k in kept {
+                    assert!(dealt.contains(&k), "{spec} kept {k}, not dealt {dealt:?}");
+                }
+            }
+        }
+    }
+}
+
+/// A drafted game is a real game: all 21 tiles are accounted for and the board
+/// is playable from it.
+#[test]
+fn a_drafted_game_is_playable() {
+    use tzolkin::record::new_drafted_game;
+
+    let agent = parse_agent("heuristic:32", false).unwrap();
+    let refs: [&dyn tzolkin::record::Agent; N_PLAYERS] =
+        [&*agent, &*agent, &*agent, &*agent];
+    let mut rng = StdRng::seed_from_u64(1);
+
+    for seed in 0..6u64 {
+        let state = new_drafted_game(seed, &refs, &mut rng);
+        tzolkin::invariants::validate(&state).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert_eq!(state.day, 0);
+        assert!(!state.over);
+        assert!(moves::has_legal_move(&state, state.current));
+        // A drafted board is not an empty one.
+        assert!(
+            PlayerId::ALL
+                .iter()
+                .all(|&p| state.players[p.idx()].corn > 0 || state.n_unlocked(p) > 3),
+            "seed {seed}: a seat came out of the draft with nothing"
+        );
+    }
+}
+
 /// The spec grammar, including the fields that are easy to get wrong: empty
 /// fields take the default, and the opponent model has to survive into the name
 /// or two very different players are logged as one.
@@ -388,12 +576,12 @@ fn minimax_specs_parse() {
     use tzolkin::record::AgentSpec;
 
     for (spec, want) in [
-        ("minimax", "minimax:d4:600ms:w12:paranoid"),
-        ("minimax:3", "minimax:d3:600ms:w12:paranoid"),
-        ("minimax:4:120", "minimax:d4:120ms:w12:paranoid"),
-        ("minimax:4:120:8", "minimax:d4:120ms:w8:paranoid"),
-        ("minimax:4:120:8:greedy", "minimax:d4:120ms:w8:greedy"),
-        ("minimax:6:::greedy", "minimax:d6:600ms:w12:greedy"),
+        ("minimax", "minimax:d8:600ms:w12:greedy"),
+        ("minimax:3", "minimax:d3:600ms:w12:greedy"),
+        ("minimax:4:120", "minimax:d4:120ms:w12:greedy"),
+        ("minimax:4:120:8", "minimax:d4:120ms:w8:greedy"),
+        ("minimax:4:120:8:paranoid", "minimax:d4:120ms:w8:paranoid"),
+        ("minimax:6:::paranoid", "minimax:d6:600ms:w12:paranoid"),
     ] {
         let got = AgentSpec::parse(spec, false)
             .unwrap_or_else(|e| panic!("{spec}: {e}"))

@@ -1,41 +1,41 @@
-//! A hand-written position evaluator, and exhaustive move ranking on top of it.
+//! SCRATCH — A/B arena for `src/eval.rs`. Delete before finishing.
 //!
-//! [`heuristic`] estimates a player's **final score**. The contract is the one
-//! the value head will inherit — `(&GameState, PlayerId) -> f32`, in points —
-//! so swapping a trained net in stays local.
+//! `bin/arena` cannot answer "is the new evaluator better than the old one",
+//! because both of its agent specs resolve to whatever `eval::heuristic` is in
+//! the binary being run. This holds a **frozen copy** of the evaluator as it
+//! stood at commit cbb61a2 and plays the live one against it, using the same
+//! rotation-block design `bin/arena` documents: one candidate rotated through
+//! all four seats against three baselines, the block (not the game) as the
+//! independent unit, null centred score 0 and null win rate 25%.
 //!
-//! The shape it is built to is worth stating, because it is what the first
-//! version got wrong. A Tzolk'in position is not a pile of resources; it is an
-//! *engine* plus a set of *scheduled payouts*. So the estimate is
+//!     cargo run --release --bin evalab -- --games 400 [--k full|32] [--resume]
 //!
-//! ```text
-//!   points already banked
-//! + what liquidation pays today   (exact: the same arithmetic as `end_game`)
-//! + the temple payouts still to come, projected from where everyone stands
-//! + the engine, valued at what it can still convert before the calendar ends
-//! - the food the engine will fail to pay for
-//! ```
-//!
-//! Everything below the first line is an estimate of a game that has not
-//! finished, so once `over` is set they all go away and `heuristic` is simply
-//! `state.scores()[p]` — `end_game` has by then folded the liquidation into
-//! `points` itself. A leaf evaluation and a real result are therefore the same
-//! number, which is what lets the search compare a forced win against a guess.
-//!
-//! [`margin`] is the zero-sum reduction the search runs on: how far ahead of the
-//! best opponent a player stands. It is what makes denying an opponent — a
-//! contested temple top, the last monument, the skull bank — score as a gain
-//! rather than as nothing at all.
+//! Progress is appended to a JSONL file as each block completes, so a Ctrl-C
+//! loses nothing and `--resume` picks up where it stopped.
 
-use crate::data::monuments::def as mdef;
-use crate::data::temples::TEMPLES;
-use crate::ids::*;
-use crate::moves::Move;
-use crate::state::{GameState, LAST_DAY, POINT_DAYS, RESOURCE_DAYS};
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-use std::ops::ControlFlow;
-use std::time::{Duration, Instant};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use rayon::prelude::*;
+use tzolkin::ids::*;
+use tzolkin::phase::{Evaluation, Evaluator, Phase};
+use tzolkin::record::{
+    play_game, Agent, Candidates, GameConfig, GreedyAgent, Summary,
+};
+use tzolkin::state::GameState;
+
+// =======================================================================
+// The frozen baseline: `src/eval.rs` exactly as it stood at cbb61a2.
+// =======================================================================
+#[allow(dead_code)]
+mod frozen {
+    use tzolkin::data::monuments::def as mdef;
+    use tzolkin::data::temples::TEMPLES;
+    use tzolkin::ids::*;
+    use tzolkin::state::{GameState, LAST_DAY, POINT_DAYS, RESOURCE_DAYS};
 
 // ---- tuning ------------------------------------------------------------
 
@@ -76,105 +76,39 @@ const ROUNDS_PER_ACTION: f32 = 2.6;
 
 // ---- the evaluator -----------------------------------------------------
 
-/// The estimate, term by term. Every field is in points and they sum to
-/// [`heuristic`].
-///
-/// This exists so error can be *attributed*. A single number cannot say which
-/// half of the estimate is wrong, and the calibration study in
-/// `tests/rules.rs::evaluator_calibration` reads these to decide what to fix:
-/// it regresses the realised final score on each term and reports which one
-/// moves when the estimate misses.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Components {
-    /// Points already on the scorepad. Exact.
-    pub banked: f32,
-    /// What `end_game` would pay for held corn, skulls and monuments. Exact.
-    pub liquidation: f32,
-    pub held: f32,
-    pub temple: f32,
-    pub engine: f32,
-    pub board: f32,
-    pub monument: f32,
-    /// Already signed as a *penalty*: the total subtracts it.
-    pub starvation: f32,
-}
-
-impl Components {
-    /// Field names in the order [`Components::terms`] returns them.
-    pub const NAMES: [&'static str; 8] = [
-        "banked",
-        "liquidation",
-        "held",
-        "temple",
-        "engine",
-        "board",
-        "monument",
-        "starvation",
-    ];
-
-    /// The terms as a slice, signed the way they enter the sum.
-    pub fn terms(&self) -> [f32; 8] {
-        [
-            self.banked,
-            self.liquidation,
-            self.held,
-            self.temple,
-            self.engine,
-            self.board,
-            self.monument,
-            -self.starvation,
-        ]
-    }
-
-    #[inline]
-    pub fn total(&self) -> f32 {
-        self.terms().iter().sum()
-    }
-}
-
 /// Estimated final score for `p`, in points.
 ///
 /// Exactly `g.scores()[p]` once `g.over`, so a finished line and a guess about
 /// one are the same kind of number and the search can compare them.
-#[inline]
 pub fn heuristic(g: &GameState, p: PlayerId) -> f32 {
-    components(g, p).total()
-}
-
-/// [`heuristic`], with the sum left unfolded. See [`Components`].
-#[inline]
-pub fn components(g: &GameState, p: PlayerId) -> Components {
     let pl = &g.players[p.idx()];
-    let mut c = Components {
-        banked: pl.points as f32,
-        ..Components::default()
-    };
+    let mut v = pl.points as f32;
 
     // A finished game needs no estimate. `end_game` has already folded corn,
     // skulls and monuments into `points`, and the resources it converted are
     // still sitting in the player — so adding `liquidation` here would pay for
     // them a second time.
     if g.over {
-        return c;
+        return v;
     }
 
     // What liquidation would pay if the game ended now, by the same arithmetic
     // `end_game` uses. Exact, unlike everything below it.
-    c.liquidation = liquidation(g, p);
+    v += liquidation(g, p);
 
     let rounds_left = (LAST_DAY.saturating_sub(g.day)) as f32;
     // 1.0 at the start of the game, 0.0 on the last day. Everything speculative
     // is scaled by some function of this.
     let horizon = rounds_left / LAST_DAY as f32;
 
-    c.held = held_premium(g, p, rounds_left);
-    c.temple = temple_outlook(g, p);
-    c.engine = engine_value(g, p, rounds_left, horizon);
-    c.board = board_position(g, p, rounds_left);
-    c.monument = monument_outlook(g, p, horizon);
-    c.starvation = starvation_risk(g, p);
+    v += held_premium(g, p, rounds_left);
+    v += temple_outlook(g, p);
+    v += engine_value(g, p, rounds_left, horizon);
+    v += board_position(g, p, rounds_left);
+    v += monument_outlook(g, p, horizon);
+    v -= starvation_risk(g, p);
 
-    c
+    v
 }
 
 /// How far ahead of the best opponent `p` stands.
@@ -606,257 +540,223 @@ fn starvation_risk(g: &GameState, p: PlayerId) -> f32 {
     unfed * STARVE_POINTS * urgency
 }
 
-// ---- ranking -----------------------------------------------------------
-
-/// A scored, ordered slice of a position's move list.
-#[derive(Clone, Debug, Default)]
-pub struct Ranking {
-    /// Best first. Scores are [`margin`]-scale points unless a search says
-    /// otherwise.
-    pub moves: Vec<(Move, f32)>,
-    /// Legal moves at this position, counting every spelling.
-    pub total: usize,
-    /// Legal moves that do something different from each other, as far as the
-    /// scan could tell — `total` less the restatements it dropped. Equal to
-    /// `total` when nothing was deduplicated.
-    pub distinct: usize,
-    /// Whether `total` is the whole move list rather than a capped walk.
-    pub exhaustive: bool,
-    /// What produced the ranking, for the status line.
-    pub note: String,
 }
 
-impl Ranking {
-    pub fn best(&self) -> Option<&Move> {
-        self.moves.first().map(|(m, _)| m)
+/// `phase::Evaluator` over the frozen heuristic, so `GreedyAgent` can be built
+/// on it exactly as it is built on `HeuristicEvaluator`.
+struct FrozenEvaluator;
+
+impl Evaluator for FrozenEvaluator {
+    fn evaluate(&self, s: &GameState, _ph: Phase, _t: PlayerId, n_edges: usize) -> Evaluation {
+        let raw: Vec<f32> = PlayerId::ALL.iter().map(|&q| frozen::heuristic(s, q)).collect();
+        let mean = raw.iter().sum::<f32>() / N_PLAYERS as f32;
+        let value = std::array::from_fn(|i| ((raw[i] - mean) / 25.0).tanh());
+        let p = if n_edges == 0 { 0.0 } else { 1.0 / n_edges as f32 };
+        Evaluation { priors: vec![p; n_edges], value }
+    }
+    fn name(&self) -> String {
+        "frozen".into()
     }
 }
 
-/// Keeps the best `k` distinct moves of a stream without holding the rest.
-///
-/// The point of this type: the widest node measured is ~1.9M moves at 264 bytes
-/// each, so the exhaustive pass has to *score* every move without ever *owning*
-/// more than `k` of them. Amortised O(n): the buffer grows to `2k` and is
-/// pruned by a single sort.
-///
-/// Distinctness is [`Move::same_effect`], not `Eq`. Without it a shortlist of
-/// ten is routinely five moves written out twice — placement enumerates every
-/// assignment of interchangeable workers to the same set of spaces — and the
-/// search wastes most of its root beam re-deepening one position.
-struct TopK {
-    k: usize,
-    buf: Vec<(Move, f32)>,
-    /// The lowest score currently kept, once the buffer has been pruned once.
-    floor: f32,
-    /// Moves dropped as restatements of one already held.
-    dupes: usize,
-}
+/// The live evaluator, wired the same way. (`phase::HeuristicEvaluator` is
+/// exactly this; it is restated so the two sides differ in one line only.)
+struct LiveEvaluator;
 
-impl TopK {
-    fn new(k: usize) -> Self {
-        TopK {
-            k: k.max(1),
-            buf: Vec::with_capacity(k.max(1) * 2),
-            floor: f32::NEG_INFINITY,
-            dupes: 0,
-        }
+impl Evaluator for LiveEvaluator {
+    fn evaluate(&self, s: &GameState, _ph: Phase, _t: PlayerId, n_edges: usize) -> Evaluation {
+        let raw: Vec<f32> = PlayerId::ALL
+            .iter()
+            .map(|&q| tzolkin::eval::heuristic(s, q))
+            .collect();
+        let mean = raw.iter().sum::<f32>() / N_PLAYERS as f32;
+        let value = std::array::from_fn(|i| ((raw[i] - mean) / 25.0).tanh());
+        let p = if n_edges == 0 { 0.0 } else { 1.0 / n_edges as f32 };
+        Evaluation { priors: vec![p; n_edges], value }
     }
-
-    fn offer(&mut self, m: &Move, score: f32) {
-        // The score test comes first: it rejects the overwhelming majority for
-        // the price of one comparison, so the linear distinctness scan below
-        // only runs on moves that were going to be kept anyway.
-        if score <= self.floor {
-            return;
-        }
-        if self.buf.iter().any(|(x, _)| x.same_effect(m)) {
-            self.dupes += 1;
-            return;
-        }
-        self.buf.push((m.clone(), score));
-        if self.buf.len() >= self.k * 2 {
-            self.prune();
-        }
-    }
-
-    fn prune(&mut self) {
-        self.buf.sort_by(|a, b| b.1.total_cmp(&a.1));
-        self.buf.truncate(self.k);
-        if self.buf.len() == self.k {
-            self.floor = self.buf[self.k - 1].1;
-        }
-    }
-
-    fn finish(mut self) -> Vec<(Move, f32)> {
-        self.buf.sort_by(|a, b| b.1.total_cmp(&a.1));
-        self.buf.truncate(self.k);
-        self.buf
+    fn name(&self) -> String {
+        "live".into()
     }
 }
 
-/// The state a move leads to, as the next player will actually see it.
-///
-/// `refill_buildings` is part of `Game::play`, so leaving it out evaluates a
-/// building row no player is ever shown.
-#[inline]
-pub fn successor(g: &GameState, p: PlayerId, m: &Move) -> GameState {
-    let mut probe = *g;
-    crate::moves::apply_move(&mut probe, p, m);
-    probe.refill_buildings();
-    probe
+// =======================================================================
+// Rotation blocks
+// =======================================================================
+
+#[derive(Clone, Copy)]
+struct Out {
+    centred: f64,
+    vs_base: f64,
+    win: f64,
+    cand: f64,
+    base: f64,
 }
 
-/// Rank an already-materialised move list by one-ply [`margin`].
-pub fn rank(g: &GameState, p: PlayerId, moves: &[Move]) -> Vec<(usize, f32)> {
-    let mut scored: Vec<(usize, f32)> = moves
-        .iter()
-        .enumerate()
-        .map(|(i, m)| (i, margin(&successor(g, p, m), p)))
-        .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored
+fn play_block(seed: u64, cand: &dyn Agent, base: &dyn Agent) -> Vec<Out> {
+    let cfg = GameConfig::evaluation();
+    let mut out = Vec::new();
+    for c in 0..N_PLAYERS {
+        let seats: [bool; N_PLAYERS] = std::array::from_fn(|i| i == c);
+        let agents: [&dyn Agent; N_PLAYERS] =
+            std::array::from_fn(|s| if seats[s] { cand } else { base });
+        let mut rng =
+            <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed.wrapping_mul(0x9E37_79B9) ^ c as u64);
+        let r = play_game(seed, &agents, &cfg, &mut rng);
+        let sc: [f64; N_PLAYERS] = std::array::from_fn(|s| r.scores[s] as f64);
+        let table = sc.iter().sum::<f64>() / N_PLAYERS as f64;
+        let cand_score = sc[c];
+        let base_score =
+            (0..N_PLAYERS).filter(|&s| s != c).map(|s| sc[s]).sum::<f64>() / (N_PLAYERS - 1) as f64;
+        out.push(Out {
+            centred: cand_score - table,
+            vs_base: cand_score - base_score,
+            win: r.win_share[c] as f64,
+            cand: cand_score,
+            base: base_score,
+        });
+    }
+    out
 }
 
-/// How long an exhaustive walk may run before it gives up and says so.
-///
-/// Exhaustive is the contract, and on all but a handful of positions it costs
-/// under a millisecond. But the move space is not bounded by anything a caller
-/// can see in advance — a strong player holding six workers and a pile of corn
-/// reaches turns whose retrieval space runs into the millions — and an agent
-/// that can stall for minutes on one turn is not an agent. So the walk carries
-/// a deadline, and a `Ranking` that hit it says `exhaustive: false` rather than
-/// quietly implying it saw everything.
-pub const FULL_BUDGET: Duration = Duration::from_millis(2_500);
+fn mean(v: &[Out], f: impl Fn(&Out) -> f64) -> f64 {
+    v.iter().map(&f).sum::<f64>() / v.len() as f64
+}
 
-/// Moves scored between deadline checks. `Instant::now` is ~20 ns, which is a
-/// real fraction of the ~1 us it costs to score a move, so it is not worth
-/// asking on every one.
-const DEADLINE_STRIDE: usize = 1024;
+fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    let get = |n: &str| argv.iter().position(|a| a == n).and_then(|i| argv.get(i + 1)).cloned();
+    let games: usize = get("--games").and_then(|v| v.parse().ok()).unwrap_or(400);
+    let seed0: u64 = get("--seed").and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
+    let k = get("--k").unwrap_or_else(|| "full".into());
+    let cands = if k == "full" {
+        Candidates::All
+    } else {
+        Candidates::Sampled(k.parse().unwrap_or(32))
+    };
+    let out = PathBuf::from(get("--out").unwrap_or_else(|| "evalab-progress.jsonl".into()));
+    let resume = argv.iter().any(|a| a == "--resume");
+    // Swap the sides, to check the harness itself is unbiased.
+    let flip = argv.iter().any(|a| a == "--flip");
 
-/// Sampled draws mixed in when the walk gave up, to counter the fact that a
-/// prefix of traversal order is all placements and first-worker retrievals.
-const GIVE_UP_TOP_UP: usize = 64;
+    let blocks = games.div_ceil(N_PLAYERS);
+    let done: std::collections::HashSet<u64> = if resume && out.exists() {
+        std::fs::read_to_string(&out)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let at = l.find("\"seed\":")? + 7;
+                l[at..].split(',').next()?.trim_end_matches('}').parse().ok()
+            })
+            .collect()
+    } else {
+        Default::default()
+    };
+    if !resume {
+        let _ = std::fs::remove_file(&out);
+    }
 
-/// Score **every** legal move with `score` and keep the best `keep`.
-///
-/// `score` is handed the successor state, already refilled. This is the
-/// primitive `heuristic:full` and the search root are both built on: no cap, no
-/// sampling, no traversal-order bias. It is affordable because scoring is
-/// streamed — `visit_legal_moves` hands over one move at a time, it is applied
-/// to a copy of the state, scored, and dropped unless it is good enough to keep
-/// — so a six-figure node costs time but not memory.
-///
-/// `budget` bounds that time. `None` means genuinely unbounded, which is right
-/// where a human is waiting on one position and wrong anywhere a turn has to
-/// come back. Cost is one `score` call per legal move, so an evaluator that is
-/// not cheap has no business here either way.
-pub fn rank_all_within<F>(
-    g: &GameState,
-    p: PlayerId,
-    keep: usize,
-    budget: Option<Duration>,
-    mut score: F,
-) -> Ranking
-where
-    F: FnMut(&GameState) -> f32,
-{
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    {
+        let s = stop.clone();
+        let _ = ctrlc_lite(move || s.store(true, Ordering::SeqCst));
+    }
+
+    let file = Mutex::new(
+        std::fs::OpenOptions::new().create(true).append(true).open(&out).unwrap(),
+    );
+    let rows: Mutex<Vec<(u64, Vec<Out>)>> = Mutex::new(Vec::new());
+    let n_done = AtomicUsize::new(0);
     let started = Instant::now();
-    let deadline = budget.map(|b| started + b);
-    let mut top = TopK::new(keep);
-    let mut total = 0usize;
 
-    let flow = crate::moves::visit_legal_moves(g, p, |m| {
-        total += 1;
-        top.offer(m, score(&successor(g, p, m)));
-        if let Some(d) = deadline {
-            if total % DEADLINE_STRIDE == 0 && Instant::now() >= d {
-                return ControlFlow::Break(());
-            }
+    eprintln!(
+        "evalab: live vs frozen, {} blocks x {} games, cands={k}{}",
+        blocks,
+        N_PLAYERS,
+        if flip { " (FLIPPED)" } else { "" }
+    );
+
+    (0..blocks as u64).into_par_iter().for_each(|b| {
+        let seed = seed0 + b;
+        if done.contains(&seed) || stop.load(Ordering::SeqCst) {
+            return;
         }
-        ControlFlow::Continue(())
-    });
-
-    let gave_up = flow.is_break();
-    if gave_up {
-        // What was walked is a prefix of traversal order, which is placements
-        // and then retrievals worker by worker — not a slice of the move space.
-        // These draws come from the rollout policy, which is shaped like real
-        // play, so the shortlist is at least not blind to a whole move kind.
-        // Seeded from the position, so the same turn ranks the same way twice.
-        let mut rng = StdRng::seed_from_u64(
-            (g.day as u64) << 32 | (p.0 as u64) << 8 | g.current.0 as u64,
+        let live = GreedyAgent { ev: LiveEvaluator, cands, record: false };
+        let froz = GreedyAgent { ev: FrozenEvaluator, cands, record: false };
+        let (c, bs): (&dyn Agent, &dyn Agent) =
+            if flip { (&froz, &live) } else { (&live, &froz) };
+        let games = play_block(seed, c, bs);
+        let line = format!(
+            r#"{{"seed":{seed},"centred":{:.4},"vs_base":{:.4},"win":{:.4},"cand":{:.3},"base":{:.3}}}"#,
+            mean(&games, |o| o.centred),
+            mean(&games, |o| o.vs_base),
+            mean(&games, |o| o.win),
+            mean(&games, |o| o.cand),
+            mean(&games, |o| o.base),
         );
-        for _ in 0..GIVE_UP_TOP_UP {
-            let Some(m) = crate::moves::sample_legal_move(g, p, &mut rng) else {
-                break;
-            };
-            top.offer(&m, score(&successor(g, p, &m)));
+        {
+            let mut f = file.lock().unwrap();
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
         }
-    }
-
-    let ms = started.elapsed().as_secs_f64() * 1e3;
-    let dupes = top.dupes;
-    Ranking {
-        moves: top.finish(),
-        total,
-        distinct: total.saturating_sub(dupes),
-        exhaustive: !gave_up,
-        note: if gave_up {
-            format!("gave up at {total} moves after {ms:.0} ms — the list is wider than that")
-        } else {
-            format!("all {total} moves scored in {ms:.0} ms")
-        },
-    }
-}
-
-/// [`rank_all_within`] with no deadline. Only for a caller that can wait.
-pub fn rank_all_by<F>(g: &GameState, p: PlayerId, keep: usize, score: F) -> Ranking
-where
-    F: FnMut(&GameState) -> f32,
-{
-    rank_all_within(g, p, keep, None, score)
-}
-
-/// Every legal move, scored by [`margin`], with no deadline.
-pub fn rank_all(g: &GameState, p: PlayerId, keep: usize) -> Ranking {
-    rank_all_by(g, p, keep, |s| margin(s, p))
-}
-
-/// The same under a deadline, which is what anything driving a game wants.
-pub fn rank_all_capped(g: &GameState, p: PlayerId, keep: usize, budget: Duration) -> Ranking {
-    rank_all_within(g, p, keep, Some(budget), |s| margin(s, p))
-}
-
-/// The same, stopping after `cap` moves.
-///
-/// Not a sample: it takes the *first* `cap` in traversal order, which is
-/// systematically "place one worker low on Palenque". Use it where a bounded
-/// prefix is genuinely wanted, not where a representative slice is.
-pub fn rank_capped(g: &GameState, p: PlayerId, keep: usize, cap: usize) -> Ranking {
-    let mut top = TopK::new(keep);
-    let mut total = 0usize;
-
-    let flow = crate::moves::visit_legal_moves(g, p, |m| {
-        total += 1;
-        top.offer(m, margin(&successor(g, p, m), p));
-        if total >= cap {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
+        rows.lock().unwrap().push((seed, games));
+        let n = n_done.fetch_add(1, Ordering::SeqCst) + 1;
+        if n % 10 == 0 {
+            eprintln!("  {n} blocks, {:.0}s", started.elapsed().as_secs_f64());
         }
     });
 
-    let capped = flow.is_break();
-    let dupes = top.dupes;
-    Ranking {
-        moves: top.finish(),
-        total,
-        distinct: total.saturating_sub(dupes),
-        exhaustive: !capped,
-        note: if capped {
-            format!("first {total} moves in traversal order")
-        } else {
-            format!("all {total} moves scored")
-        },
+    // Everything on disk, including anything a previous run left.
+    let mut centred = Vec::new();
+    let mut vs_base = Vec::new();
+    let mut win = Vec::new();
+    let mut cand = Vec::new();
+    let mut base = Vec::new();
+    for l in std::fs::read_to_string(&out).unwrap_or_default().lines() {
+        let num = |k: &str| -> Option<f64> {
+            let at = l.find(&format!("\"{k}\":"))? + k.len() + 3;
+            let r = &l[at..];
+            let e = r.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')).unwrap_or(r.len());
+            r[..e].parse().ok()
+        };
+        if let (Some(c), Some(v), Some(w), Some(a), Some(bb)) =
+            (num("centred"), num("vs_base"), num("win"), num("cand"), num("base"))
+        {
+            centred.push(c);
+            vs_base.push(v);
+            win.push(w);
+            cand.push(a);
+            base.push(bb);
+        }
     }
+    let s = Summary::of(&centred);
+    let v = Summary::of(&vs_base);
+    let w = Summary::of(&win);
+    println!(
+        "\n{} blocks ({} games), {:.0}s\n\
+         mean centred score  {:+.2}  95% CI [{:+.2}, {:+.2}]   (null 0)\n\
+         mean vs baseline    {:+.2}  95% CI [{:+.2}, {:+.2}]   (null 0)\n\
+         win rate            {:.3}  95% CI [{:.3}, {:.3}]   (null 0.25)\n\
+         mean score          candidate {:.1}   baseline {:.1}\n\
+         {}",
+        s.n,
+        s.n * N_PLAYERS,
+        started.elapsed().as_secs_f64(),
+        s.mean, s.mean - s.ci, s.mean + s.ci,
+        v.mean, v.mean - v.ci, v.mean + v.ci,
+        w.mean, w.mean - w.ci, w.mean + w.ci,
+        Summary::of(&cand).mean,
+        Summary::of(&base).mean,
+        if s.mean.abs() > s.ci {
+            "DISTINGUISHABLE from zero at 95%."
+        } else {
+            "not distinguishable from zero: the interval covers 0."
+        }
+    );
+}
+
+/// Minimal Ctrl-C hook without pulling in a dependency: a thread that watches
+/// for the signal is overkill here, so this just returns Ok and relies on the
+/// per-block JSONL flush to make a kill lossless.
+fn ctrlc_lite(_f: impl Fn() + Send + 'static) -> Result<(), ()> {
+    Ok(())
 }

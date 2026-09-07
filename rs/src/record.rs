@@ -1726,6 +1726,23 @@ pub trait Agent: Send + Sync {
         (rng.gen_bool(0.5), None)
     }
 
+    /// Which two of the four dealt starting tiles to keep, by tile id.
+    ///
+    /// Defaults to a uniform pick, which is what `Game::new` has always done
+    /// and what `RandomAgent` should keep doing. Anything with an evaluator
+    /// should override it with [`best_pair`]: the draft is worth real points —
+    /// tile 4 is a free worker outright, tile 5 is eight corn and a gold — and
+    /// it is the one decision in the game where a player can see the entire
+    /// option set.
+    fn draft(&self, g: &GameState, p: PlayerId, dealt: [u8; 4], rng: &mut StdRng) -> [u8; 2] {
+        let _ = (g, p);
+        let mut idx = [0usize, 1, 2, 3];
+        for i in (1..4).rev() {
+            idx.swap(i, rng.gen_range(0..=i));
+        }
+        [dealt[idx[0]], dealt[idx[1]]]
+    }
+
     /// This agent's own ranking of the position's moves, best first.
     ///
     /// `None` from an agent that has no ranking to show — `RandomAgent` draws
@@ -1742,6 +1759,85 @@ pub trait Agent: Send + Sync {
     }
 
     fn name(&self) -> String;
+}
+
+/// The best two of the four dealt tiles, by trying all six pairs.
+///
+/// # Why this is not a search
+///
+/// Six pairs is the entire decision, so this is exhaustive on its own terms.
+/// Searching *past* it would mean looking ahead through a board nobody has
+/// touched — no worker is placed, no gear has turned — and what the tiles are
+/// worth is almost entirely what they hand you: corn, blocks, a research level,
+/// a temple step, a worker. `value` prices those directly, and one more ply
+/// would price a guess about the first placement instead.
+///
+/// # Why order is part of the answer
+///
+/// The pair is returned in the order it should be applied. Two tiles that both
+/// step the same temple can land differently depending on which goes first,
+/// because the top step of a track is exclusive — so the pair is scored as an
+/// ordered application and handed back that way.
+pub fn best_pair<F>(g: &GameState, p: PlayerId, dealt: [u8; 4], value: F) -> [u8; 2]
+where
+    F: Fn(&GameState) -> f32,
+{
+    use crate::data::tiles::TILES;
+
+    let apply = |st: &mut GameState, id: u8| {
+        for e in TILES[id as usize] {
+            e.apply(st, p);
+        }
+    };
+
+    let mut best = [dealt[0], dealt[1]];
+    let mut best_score = f32::NEG_INFINITY;
+    for i in 0..4 {
+        for j in 0..4 {
+            if i == j {
+                continue;
+            }
+            let pair = [dealt[i], dealt[j]];
+            let mut probe = *g;
+            apply(&mut probe, pair[0]);
+            apply(&mut probe, pair[1]);
+            let s = value(&probe);
+            if s > best_score {
+                best_score = s;
+                best = pair;
+            }
+        }
+    }
+    best
+}
+
+/// Setup with each seat's starting-tile draft taken by its own agent.
+///
+/// The deal comes from `seed` alone, so a rotation block that reuses a seed
+/// puts every agent in front of the same four tiles — the draft joins the
+/// matched design rather than adding variance to it.
+///
+/// Seats draft in order, which is the model `tree.rs` already encodes for
+/// `Phase::DraftTile`. It means a later seat sees where the earlier ones have
+/// stepped on the temples; agents that score their own position rather than
+/// their margin are unaffected by that, which is the other reason to score it
+/// that way.
+pub fn new_drafted_game(
+    seed: u64,
+    agents: &[&dyn Agent; N_PLAYERS],
+    rng: &mut StdRng,
+) -> GameState {
+    let (mut game, deal) = crate::game::Game::new_undrafted(seed);
+    for p in PlayerId::ALL {
+        let kept = agents[p.idx()].draft(&game.state, p, deal[p.idx()], rng);
+        debug_assert!(
+            kept[0] != kept[1] && kept.iter().all(|k| deal[p.idx()].contains(k)),
+            "{p:?} kept {kept:?}, which was not two of {:?}",
+            deal[p.idx()]
+        );
+        game.keep_tiles(p, kept);
+    }
+    game.state
 }
 
 /// The rollout policy from `moves.rs`, wrapped as an agent.
@@ -1956,6 +2052,10 @@ impl<E: Evaluator> Agent for GreedyAgent<E> {
             temperature: 0.0,
         });
         (take > decline, node)
+    }
+
+    fn draft(&self, g: &GameState, p: PlayerId, dealt: [u8; 4], _rng: &mut StdRng) -> [u8; 2] {
+        best_pair(g, p, dealt, |s| self.value(s, p)[p.idx()])
     }
 
     fn ranked_moves(&self, g: &GameState, p: PlayerId, keep: usize) -> Option<Ranking> {
@@ -2348,6 +2448,13 @@ impl Agent for MinimaxAgent {
         (crate::search::prefers_extra_day(g, p), None)
     }
 
+    fn draft(&self, g: &GameState, p: PlayerId, dealt: [u8; 4], _rng: &mut StdRng) -> [u8; 2] {
+        // Its own estimate, not its margin: at setup the opponents to a later
+        // seat have drafted and the ones to an earlier seat have not, so a
+        // comparative score would be measuring the seat.
+        best_pair(g, p, dealt, |s| crate::eval::heuristic(s, p))
+    }
+
     fn ranked_moves(&self, g: &GameState, p: PlayerId, keep: usize) -> Option<Ranking> {
         Some(self.ranking(g, p, keep))
     }
@@ -2533,6 +2640,18 @@ fn parse_minimax(rest: Option<&str>) -> Result<crate::search::Config, String> {
             return Err(format!(
                 "minimax MODEL is `paranoid` or `greedy`, got {other:?}"
             ))
+        }
+    }
+    // AB-HARNESS (temporary): a comma-separated flag list, so two search
+    // variants can be raced in one arena process under identical machine load.
+    // Delete once the measurements are banked.
+    if let Some(flags) = parts.next() {
+        for f in flags.split(',').filter(|f| !f.is_empty()) {
+            match f {
+                "nocache" => cfg.cache = false,
+                "cache" => cfg.cache = true,
+                other => return Err(format!("minimax flag {other:?} unknown")),
+            }
         }
     }
     if let Some(extra) = parts.next() {
@@ -2861,13 +2980,13 @@ pub fn play_game(
     cfg: &GameConfig,
     rng: &mut StdRng,
 ) -> GameResult {
-    use crate::game::Game;
     use crate::invariants::validate;
     use crate::moves::check_move;
 
-    // `Game::new` owns setup: three shuffles and the starting-tile draft. Reuse
-    // it rather than restating it, then drive the state directly.
-    let mut state = Game::new(seed).state;
+    // Setup, with each seat drafting its own starting tiles. `Game::new` would
+    // draft them at random, which is two tiles a game of pure luck in a
+    // measurement whose whole design is about removing exactly that.
+    let mut state = new_drafted_game(seed, agents, rng);
     let mut nodes: Vec<Node> = Vec::new();
     let mut aborted = false;
     let mut guard = 0u32;

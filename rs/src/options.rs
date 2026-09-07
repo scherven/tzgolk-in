@@ -80,10 +80,30 @@ pub fn research_choices(g: &GameState, p: PlayerId, n: u8, free: bool) -> Vec<Ch
     let mut out = Vec::new();
     let res = g.players[p.idx()].res;
     let lvls = g.research[p.idx()];
-    recurse(g, p, res, lvls, n, free, &Choice::new(), &mut out);
+    recurse(g, p, res, lvls, n, free, 0, EMPTY, &Choice::new(), &mut out);
     dedup(out)
 }
 
+/// Two spellings of one decision, collapsed.
+///
+/// `floor` is the lowest track index this step may still take. Advancing
+/// agriculture then extraction and extraction then agriculture are one
+/// decision wearing two spellings: the two advances are independent, and both
+/// orders reach every total block payment, because `pay_blocks` offers every
+/// split of it. Only a *maxed* track breaks that independence -- its one-off
+/// payoff can hand back blocks, and blocks in hand may be what pays for a
+/// track this walk has already passed -- so a payoff that grants a resource
+/// reopens the whole range. Nothing else an advance does is visible to a later
+/// one: `top_payoffs` reads the unmutated `g`, and a level change is only ever
+/// read by the same track.
+///
+/// `owed` is the same argument applied to the *bill*. Paying wood for the
+/// first advance and stone for the second reaches the position paying stone
+/// then wood reaches, so the payments are carried as one running bundle and
+/// settled in a single block, and the two splits become the same `Choice`.
+/// The bundle is settled early -- before a payoff that grants a resource --
+/// because deferring past that point would let a choice read as affordable on
+/// blocks the payoff had not handed over yet.
 #[allow(clippy::too_many_arguments)]
 fn recurse(
     g: &GameState,
@@ -92,14 +112,22 @@ fn recurse(
     lvls: [u8; 4],
     n: u8,
     free: bool,
+    floor: usize,
+    owed: Bundle,
     acc: &Choice,
     out: &mut Vec<Choice>,
 ) {
     if n == 0 {
-        out.push(acc.clone());
+        let mut done = acc.clone();
+        payment_effects(owed, &mut done.0);
+        out.push(done);
         return;
     }
     for s in Science::ALL {
+        // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+        if pruning_on() && s.idx() < floor {
+            continue;
+        }
         let lvl = lvls[s.idx()];
         // Levels 1/2/3 cost 1/2/3 blocks; the one-off payoff past level 3
         // costs 1. Go charged 3 for it, which put it nearly out of reach.
@@ -118,18 +146,35 @@ fn recurse(
             for r in Resource::BLOCKS {
                 res2[r.idx()] -= pay[r.idx()] as u8;
             }
+            let mut owed2 = owed;
+            for r in Resource::BLOCKS {
+                owed2[r.idx()] += pay[r.idx()];
+            }
+            // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+            let defer = pruning_on();
 
             if lvl < 3 {
                 let mut next = acc.clone();
-                payment_effects(pay, &mut next.0);
+                if !defer {
+                    payment_effects(pay, &mut next.0);
+                }
                 next.0.push(Effect::AdvanceResearch(s));
                 let mut l2 = lvls;
                 l2[s.idx()] += 1;
-                recurse(g, p, res2, l2, n - 1, free, &next, out);
+                let carry = if defer { owed2 } else { EMPTY };
+                recurse(g, p, res2, l2, n - 1, free, s.idx(), carry, &next, out);
             } else {
                 for gain in top_payoffs(g, p, s) {
                     let mut next = acc.clone();
-                    payment_effects(pay, &mut next.0);
+                    // Extraction's payoff is two blocks, which may be exactly
+                    // what an earlier track needs; a skull cannot pay for
+                    // research, but the bill is settled for any resource
+                    // rather than resting on that.
+                    let reopen = gain.iter().any(|e| matches!(e, Effect::Res(..)));
+                    let carry = if defer && !reopen { owed2 } else { EMPTY };
+                    if !defer || reopen {
+                        payment_effects(if defer { owed2 } else { pay }, &mut next.0);
+                    }
                     let mut res3 = res2;
                     for e in &gain {
                         if let Effect::Res(r, d) = e {
@@ -137,7 +182,8 @@ fn recurse(
                         }
                     }
                     next.0.extend_from_slice(&gain);
-                    recurse(g, p, res3, lvls, n - 1, free, &next, out);
+                    let next_floor = if reopen { 0 } else { s.idx() };
+                    recurse(g, p, res3, lvls, n - 1, free, next_floor, carry, &next, out);
                 }
             }
         }
@@ -198,14 +244,27 @@ pub fn building_choices(
     dedup(out)
 }
 
-/// The listed cost, plus every one-block discount the architecture track allows.
+/// Every one-block discount the architecture track allows, or the listed cost
+/// when it allows none.
 ///
 /// `discount` is off for the second half of a double build, which costs full
 /// price and grants no corn or victory points.
+///
+/// *Which* block to knock off is a real decision, so all of them are offered.
+/// Declining the discount altogether is not: the card, its payoff and the
+/// architecture bonus are identical either way and the extra block is simply
+/// handed back to the bank, where it scores nothing and buys nothing. So the
+/// full price is only generated when no discount is available -- a track short
+/// of level 3, the second half of a double build, or a cost the player cannot
+/// quite reduce. That the payoff is unaffected is not an assumption: it is
+/// expanded against a probe with the cost already paid, and every generator is
+/// monotone in the player's holdings, so the cheaper branch's payoffs are a
+/// superset of the dearer one's.
 fn affordable_costs(g: &GameState, p: PlayerId, cost: Bundle, discount: bool) -> Vec<Bundle> {
     let player = &g.players[p.idx()];
     let mut out = Vec::new();
-    if player.can_pay(cost) {
+    // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+    if !pruning_on() && player.can_pay(cost) {
         out.push(cost);
     }
     if discount && g.builder(p) {
@@ -218,6 +277,9 @@ fn affordable_costs(g: &GameState, p: PlayerId, cost: Bundle, discount: bool) ->
                 }
             }
         }
+    }
+    if out.is_empty() && player.can_pay(cost) {
+        out.push(cost);
     }
     out
 }
@@ -368,6 +430,10 @@ pub fn corn_exchange(g: &GameState, p: PlayerId) -> Vec<Choice> {
 
 // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
 pub static PRUNE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+// SCRATCH: measurement switch, delete with src/bin/movestats.rs.
+pub fn pruning_on() -> bool {
+    PRUNE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Sort and deduplicate. Generation is naturally redundant -- several routes
 /// reach the same bundle of effects -- and identical choices are worth
@@ -412,7 +478,7 @@ pub fn dedup(mut v: Vec<Choice>) -> Vec<Choice> {
 /// would lose it to its own payout.
 pub fn dominated_dedup(v: Vec<Choice>) -> Vec<Choice> {
     // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
-    if !PRUNE.load(std::sync::atomic::Ordering::Relaxed) {
+    if !pruning_on() {
         return dedup(v);
     }
     // `(is skip, non-corn effects, -net corn, choice)`: sorting on that puts

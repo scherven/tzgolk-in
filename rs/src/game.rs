@@ -23,8 +23,17 @@ pub struct Game {
     pub max_branching_day: u8,
 }
 
+/// The four starting tiles dealt to each seat, before any are kept.
+pub type Deal = [[u8; 4]; N_PLAYERS];
+
 impl Game {
-    pub fn new(seed: u64) -> Self {
+    /// Setup up to but not including the starting-tile draft.
+    ///
+    /// Returns the board and what each seat was dealt. Nothing has been applied
+    /// yet, so the caller decides — [`Game::keep_tiles`] takes the answer. The
+    /// deal comes from `seed` alone, which is what lets the arena's rotation
+    /// blocks put four different agents in front of the same four tiles.
+    pub fn new_undrafted(seed: u64) -> (Self, Deal) {
         let mut rng = StdRng::seed_from_u64(seed);
 
         let mut a1 = age1_ids();
@@ -80,32 +89,56 @@ impl Game {
             state.monuments_up[i] = state.monument_deck.draw().map(MonumentId);
         }
 
-        // Each player is dealt four starting tiles and keeps two.
-        //
-        // Which two is a real decision; with no agent yet it is drawn at
-        // random. It belongs in the search once there is one.
-        let mut t = 0usize;
-        for p in PlayerId::ALL {
-            let dealt: [u8; 4] = std::array::from_fn(|i| tiles[t + i]);
-            t += 4;
-            let mut idx = [0usize, 1, 2, 3];
-            for i in (1..4).rev() {
-                idx.swap(i, rng.gen_range(0..=i));
-            }
-            for &k in &idx[..2] {
-                for e in TILES[dealt[k] as usize] {
-                    e.apply(&mut state, p);
-                }
-            }
-        }
+        // Each player is dealt four starting tiles and keeps two. Which two is
+        // a real decision, so it is left to the caller: see `new_undrafted`.
+        let deal: Deal = std::array::from_fn(|i| std::array::from_fn(|j| tiles[i * 4 + j]));
 
-        Game {
+        let game = Game {
             state,
             rng,
             log: Vec::new(),
             trace: false,
             max_branching: 0,
             max_branching_day: 0,
+        };
+        (game, deal)
+    }
+
+    /// Setup with the starting-tile draft taken uniformly at random.
+    ///
+    /// The draft is worth real points — one tile is a free worker outright —
+    /// so an agent should be making it. [`new_undrafted`](Game::new_undrafted)
+    /// plus [`Agent::draft`](crate::record::Agent::draft) is that path, and
+    /// `record::new_drafted_game` is the ready-made version of it. This stays
+    /// for the tests, the fuzzer and every caller that wants a board without
+    /// having to name a player.
+    pub fn new(seed: u64) -> Self {
+        let (mut game, deal) = Game::new_undrafted(seed);
+        for p in PlayerId::ALL {
+            // A shuffle of the four, keeping the first two. Written this way
+            // rather than as two draws because it is the exact sequence of rng
+            // calls the draft has always made, and changing it would silently
+            // renumber every seeded game in the test suite.
+            let mut idx = [0usize, 1, 2, 3];
+            for i in (1..4).rev() {
+                idx.swap(i, game.rng.gen_range(0..=i));
+            }
+            let d = deal[p.idx()];
+            game.keep_tiles(p, [d[idx[0]], d[idx[1]]]);
+        }
+        game
+    }
+
+    /// Take the two tiles `p` keeps, in the order given.
+    ///
+    /// Order is respected rather than sorted: two tiles that both step a temple
+    /// can land differently depending on which goes first, because the top step
+    /// of a track is exclusive.
+    pub fn keep_tiles(&mut self, p: PlayerId, kept: [u8; 2]) {
+        for id in kept {
+            for e in TILES[id as usize] {
+                e.apply(&mut self.state, p);
+            }
         }
     }
 

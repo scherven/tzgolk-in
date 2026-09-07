@@ -1,21 +1,22 @@
 //! SCRATCH: where does the late-game move space actually come from?
 //!
-//! Plays whole games with a real agent (random play never reaches the positions
-//! that hurt) and, at every turn, measures both the size of the move space and
-//! the structure that produced it: workers on board, options per worker, how
-//! much of each worker's option list is the pay-to-step-down multiplier, and how
-//! fat the two combinatorial spaces (Uxmal's mirror, Tikal's double build) are.
+//! Phase 1 plays whole games with a real agent (random play never reaches the
+//! positions that hurt) and keeps every turn's position. Phase 2 replays each
+//! position twice -- pruning off, then on -- so before/after is measured on
+//! *identical* positions rather than on two different games. Phase 3 attributes
+//! the option count to workers and spaces.
 //!
 //! Delete before finishing.
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 use tzolkin::effect::Effect;
 use tzolkin::game::Game;
 use tzolkin::ids::*;
-use tzolkin::moves::{self, Kinds, MoveKind};
+use tzolkin::moves::{self, Kinds};
 use tzolkin::record::parse_agent;
 use tzolkin::spaces::choices_at;
 use tzolkin::state::GameState;
@@ -24,90 +25,38 @@ fn set_prune(on: bool) {
     tzolkin::options::PRUNE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-struct Turn {
-    day: u8,
-    on_board: usize,
-    corn: u8,
+#[derive(Clone, Copy)]
+struct Sized_ {
     place: usize,
     retrieve: usize,
     nanos: u128,
     capped: bool,
-    /// Product of per-worker option counts: the retrieval tree before the
-    /// state memo collapses commuting orders.
-    product: f64,
-    worker_opts: Vec<usize>,
-    /// Same, if a worker could only take the action of its own space.
-    own_opts: Vec<usize>,
 }
 
-fn measure(g: &GameState, p: PlayerId, cap: Duration) -> Turn {
+fn size_of_move_space(g: &GameState, p: PlayerId, cap: Duration) -> Sized_ {
     let mut place = 0usize;
     let mut retrieve = 0usize;
     let mut capped = false;
-
     let t = Instant::now();
-    let mut n = 0u64;
     let _ = moves::visit_moves_of(g, p, Kinds::Placements, |_| {
         place += 1;
         ControlFlow::Continue(())
     });
+    let mut n = 0u64;
     let _ = moves::visit_moves_of(g, p, Kinds::Retrievals, |_| {
         retrieve += 1;
         n += 1;
-        if n % 4096 == 0 && t.elapsed() > cap {
+        if n % 2048 == 0 && t.elapsed() > cap {
             capped = true;
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
     });
-    let nanos = t.elapsed().as_nanos();
-
-    let mut worker_opts = Vec::new();
-    let mut own_opts = Vec::new();
-    let mut product = 1.0f64;
-    for w in g.on_board(p) {
-        let Some((gear, pos)) = g.loc(w).on_board() else {
-            continue;
-        };
-        let total = moves::choices_for_worker(g, p, gear, pos).len();
-        // The "no step-down" counterfactual: the space's own action plus skip.
-        let mut own = choices_at(g, p, gear, pos);
-        own.retain(|c| !c.is_skip());
-        worker_opts.push(total);
-        own_opts.push(own.len() + 1);
-        product *= total as f64;
-    }
-
-    Turn {
-        day: g.day,
-        on_board: g.on_board(p).count(),
-        corn: g.players[p.idx()].corn,
+    Sized_ {
         place,
         retrieve,
-        nanos,
+        nanos: t.elapsed().as_nanos(),
         capped,
-        product,
-        worker_opts,
-        own_opts,
-    }
-}
-
-/// Per-space option counts, so the fat spaces name themselves.
-fn space_census(g: &GameState, p: PlayerId, census: &mut Vec<(Gear, u8, usize, usize, usize)>) {
-    for gear in Gear::ALL {
-        for i in 0..gear.size() {
-            let v = choices_at(g, p, gear, Pos(i));
-            let two_builds = v
-                .iter()
-                .filter(|c| c.0.iter().filter(|e| matches!(e, Effect::Build(_))).count() >= 2)
-                .count();
-            let mirrored = if gear == Gear::Uxmal {
-                tzolkin::spaces::uxmal::mirror_choices(g, p, tzolkin::spaces::MAX_DEPTH).len()
-            } else {
-                0
-            };
-            census.push((gear, i, v.len(), two_builds, mirrored));
-        }
     }
 }
 
@@ -115,19 +64,43 @@ fn pct<T: Copy>(v: &[T], q: f64) -> T {
     v[((v.len() as f64 - 1.0) * q) as usize]
 }
 
+fn quantiles(label: &str, a: &[usize], b: &[usize]) {
+    println!("\n{label}");
+    println!("  {:<8} {:>13} {:>13} {:>9}", "", "before", "after", "ratio");
+    for q in [0.5, 0.75, 0.9, 0.99, 0.999, 1.0] {
+        let (x, y) = (pct(a, q), pct(b, q));
+        println!(
+            "  p{:<7} {:>13} {:>13} {:>8.2}x",
+            format!("{:.1}", q * 100.0),
+            x,
+            y,
+            x as f64 / y.max(1) as f64
+        );
+    }
+    let (sa, sb) = (a.iter().sum::<usize>(), b.iter().sum::<usize>());
+    println!(
+        "  {:<8} {:>13.0} {:>13.0} {:>8.2}x",
+        "mean",
+        sa as f64 / a.len() as f64,
+        sb as f64 / b.len() as f64,
+        sa as f64 / sb.max(1) as f64
+    );
+    println!("  {:<8} {:>13} {:>13} {:>8.2}x", "total", sa, sb, sa as f64 / sb.max(1) as f64);
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let games: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(8);
     let spec = args.next().unwrap_or_else(|| "heuristic:32".into());
-    let cap_ms: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1500);
+    let cap_ms: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(20000);
     let cap = Duration::from_millis(cap_ms);
 
     let agent = parse_agent(&spec, false).expect("agent");
-    let mut turns: Vec<Turn> = Vec::new();
-    let mut pruned: Vec<Turn> = Vec::new();
-    let mut census: Vec<(Gear, u8, usize, usize, usize)> = Vec::new();
-
     let wall = Instant::now();
+
+    // ---- phase 1: reach the positions -----------------------------------
+    set_prune(false);
+    let mut positions: Vec<(GameState, PlayerId)> = Vec::new();
     for seed in 0..games {
         let mut g = Game::new(seed);
         let mut rng = StdRng::seed_from_u64(seed ^ 0x5eed_1234);
@@ -137,16 +110,7 @@ fn main() {
             g.state.current = g.state.first_player;
             for _ in 0..N_PLAYERS {
                 let p = g.state.current;
-                set_prune(false);
-                turns.push(measure(&g.state, p, cap));
-                if g.state.day >= 18 {
-                    space_census(&g.state, p, &mut census);
-                }
-                set_prune(true);
-                pruned.push(measure(&g.state, p, cap));
-                // Positions come from the *unpruned* engine, so the trajectory
-                // is the one the pre-change code would have played.
-                set_prune(false);
+                positions.push((g.state, p));
                 if let Some(o) = agent.play_turn(&g.state, p, 0.0, &mut rng) {
                     g.play(p, &o.mv);
                 }
@@ -154,230 +118,206 @@ fn main() {
             }
             g.end_round_public();
         }
-        eprintln!(
-            "seed {seed} done ({} turns, {:.1}s elapsed)",
-            turns.len(),
-            wall.elapsed().as_secs_f64()
-        );
     }
-
-    let mut counts: Vec<usize> = turns.iter().map(|t| t.place + t.retrieve).collect();
-    counts.sort_unstable();
-    let mut nanos: Vec<u128> = turns.iter().map(|t| t.nanos).collect();
-    nanos.sort_unstable();
-
-    println!("agent {spec}, {games} games, {} turns", turns.len());
-    println!(
-        "capped turns (>{cap_ms}ms): {}",
-        turns.iter().filter(|t| t.capped).count()
+    eprintln!(
+        "phase 1: {} positions from {games} games ({:.1}s)",
+        positions.len(),
+        wall.elapsed().as_secs_f64()
     );
 
-    println!("\nbranching factor (>= when capped)");
-    for q in [0.5, 0.75, 0.9, 0.99, 0.999, 1.0] {
-        println!("  p{:<6} {:>12}", format!("{:.1}", q * 100.0), pct(&counts, q));
-    }
-    println!(
-        "  mean   {:>12.0}",
-        counts.iter().sum::<usize>() as f64 / counts.len() as f64
-    );
-
-    println!("\nvisit time");
-    for q in [0.5, 0.9, 0.99, 1.0] {
-        println!(
-            "  p{:<6} {:>10.3} ms",
-            format!("{:.0}", q * 100.0),
-            pct(&nanos, q) as f64 / 1e6
-        );
-    }
-    println!(
-        "  total  {:>10.2} s",
-        nanos.iter().sum::<u128>() as f64 / 1e9
-    );
-
-    let pl: usize = turns.iter().map(|t| t.place).sum();
-    let re: usize = turns.iter().map(|t| t.retrieve).sum();
-    println!(
-        "\nmoves generated: {pl} placement, {re} retrieval ({:.1}% retrieval)",
-        re as f64 * 100.0 / (pl + re).max(1) as f64
-    );
-
-    println!("\nbranching by workers on board");
-    for n in 0..=6 {
-        let mut v: Vec<usize> = turns
-            .iter()
-            .filter(|t| t.on_board == n)
-            .map(|t| t.place + t.retrieve)
-            .collect();
-        if v.is_empty() {
-            continue;
+    // ---- phase 3 (attribution) ------------------------------------------
+    for on in [false, true] {
+    set_prune(on);
+    println!("\n########## PRUNING {} ##########", if on { "ON" } else { "OFF" });
+    let mut worker_opts: Vec<usize> = Vec::new();
+    let mut worker_states: Vec<usize> = Vec::new();
+    let mut worker_own: Vec<usize> = Vec::new();
+    let mut by_space: Vec<(Gear, u8, usize, usize, usize)> = Vec::new(); // gear,pos,n,sum len,sum distinct
+    let mut hot: Vec<(Gear, u8, usize, usize)> = Vec::new();
+    for &(ref g, p) in &positions {
+        for w in g.on_board(p) {
+            let Some((gear, pos)) = g.loc(w).on_board() else {
+                continue;
+            };
+            let cs = moves::choices_for_worker(g, p, gear, pos);
+            let mut seen = HashSet::new();
+            for c in &cs {
+                let mut probe = *g;
+                c.apply(&mut probe, p);
+                probe.retrieve_worker(w);
+                seen.insert(probe);
+            }
+            worker_opts.push(cs.len());
+            worker_states.push(seen.len());
+            worker_own.push(choices_at(g, p, gear, pos).len());
+            hot.push((gear, pos.0, cs.len(), seen.len()));
         }
-        v.sort_unstable();
-        println!(
-            "  {n} workers: n={:<6} median {:>8}  p99 {:>10}  max {:>10}",
-            v.len(),
-            pct(&v, 0.5),
-            pct(&v, 0.99),
-            v[v.len() - 1]
-        );
-    }
-
-    println!("\nby day (late game)");
-    for d in [0u8, 4, 8, 12, 16, 20, 24] {
-        let mut v: Vec<usize> = turns
-            .iter()
-            .filter(|t| t.day >= d && t.day < d + 4)
-            .map(|t| t.place + t.retrieve)
-            .collect();
-        if v.is_empty() {
-            continue;
-        }
-        v.sort_unstable();
-        let w: f64 = turns
-            .iter()
-            .filter(|t| t.day >= d && t.day < d + 4)
-            .map(|t| t.on_board as f64)
-            .sum::<f64>()
-            / v.len() as f64;
-        println!(
-            "  days {d:>2}-{:<2}: n={:<5} median {:>8}  p99 {:>10}  mean workers {w:.2}",
-            d + 3,
-            v.len(),
-            pct(&v, 0.5),
-            pct(&v, 0.99)
-        );
-    }
-
-    // The step-down multiplier: the ratio of the whole option list to the
-    // subset a worker could take without paying to walk down its gear.
-    let mut ratios: Vec<f64> = Vec::new();
-    let mut opt_hist: Vec<usize> = Vec::new();
-    for t in &turns {
-        for (i, &o) in t.worker_opts.iter().enumerate() {
-            opt_hist.push(o);
-            let own = t.own_opts[i].max(1);
-            ratios.push(o as f64 / own as f64);
-        }
-    }
-    opt_hist.sort_unstable();
-    ratios.sort_by(|a, b| a.total_cmp(b));
-    if !opt_hist.is_empty() {
-        println!("\noptions per worker on board (choices_for_worker)");
-        for q in [0.5, 0.9, 0.99, 1.0] {
-            println!(
-                "  p{:<6} {:>8}   step-down ratio p{:.0} {:.2}x",
-                format!("{:.0}", q * 100.0),
-                pct(&opt_hist, q),
-                q * 100.0,
-                pct(&ratios, q)
-            );
-        }
-        println!(
-            "  mean {:.1} options, mean step-down ratio {:.2}x",
-            opt_hist.iter().sum::<usize>() as f64 / opt_hist.len() as f64,
-            ratios.iter().sum::<f64>() / ratios.len() as f64
-        );
-    }
-
-    let mut prods: Vec<f64> = turns
-        .iter()
-        .filter(|t| t.on_board > 0)
-        .map(|t| t.product)
-        .collect();
-    prods.sort_by(|a, b| a.total_cmp(b));
-    if !prods.is_empty() {
-        println!("\nproduct of per-worker option counts (unmemoised retrieval tree width)");
-        for q in [0.5, 0.9, 0.99, 1.0] {
-            println!(
-                "  p{:<6} {:>14.0}",
-                format!("{:.0}", q * 100.0),
-                pct(&prods, q)
-            );
-        }
-    }
-
-    if !census.is_empty() {
-        println!("\nspace census (day >= 18), mean options per space");
-        let mut by: Vec<(Gear, u8, f64, f64, f64, usize)> = Vec::new();
-        for gear in Gear::ALL {
-            for i in 0..gear.size() {
-                let rows: Vec<_> = census
-                    .iter()
-                    .filter(|r| r.0 == gear && r.1 == i)
-                    .collect();
-                if rows.is_empty() {
-                    continue;
+        if g.day >= 14 {
+            for gear in Gear::ALL {
+                for i in 0..gear.size() {
+                    let v = choices_at(g, p, gear, Pos(i));
+                    let mut seen = HashSet::new();
+                    for c in &v {
+                        let mut probe = *g;
+                        c.apply(&mut probe, p);
+                        seen.insert(probe);
+                    }
+                    let row = by_space
+                        .iter_mut()
+                        .find(|r| r.0 == gear && r.1 == i);
+                    match row {
+                        Some(r) => {
+                            r.2 += 1;
+                            r.3 += v.len();
+                            r.4 += seen.len();
+                        }
+                        None => by_space.push((gear, i, 1, v.len(), seen.len())),
+                    }
                 }
-                let n = rows.len();
-                by.push((
-                    gear,
-                    i,
-                    rows.iter().map(|r| r.2 as f64).sum::<f64>() / n as f64,
-                    rows.iter().map(|r| r.3 as f64).sum::<f64>() / n as f64,
-                    rows.iter().map(|r| r.4 as f64).sum::<f64>() / n as f64,
-                    rows.iter().map(|r| r.2).max().unwrap(),
-                ));
             }
         }
-        by.sort_by(|a, b| b.2.total_cmp(&a.2));
-        println!("  {:<14} {:>3} {:>10} {:>10} {:>10} {:>8}", "gear", "pos", "mean opts", "2-build", "mirror", "max");
-        for (gear, i, mean, tb, mi, mx) in by.iter().take(20) {
-            println!(
-                "  {:<14} {:>3} {:>10.1} {:>10.1} {:>10.1} {:>8}",
-                gear.name(),
-                i,
-                mean,
-                tb,
-                mi,
-                mx
-            );
+    }
+    eprintln!("phase 3 done ({:.1}s)", wall.elapsed().as_secs_f64());
+
+    println!("=== where the options are (UNPRUNED, {} positions) ===", positions.len());
+    let mut wo = worker_opts.clone();
+    let mut ws = worker_states.clone();
+    let mut ww = worker_own.clone();
+    wo.sort_unstable();
+    ws.sort_unstable();
+    ww.sort_unstable();
+    println!("\noptions for one worker on the board");
+    println!(
+        "  {:<8} {:>12} {:>12} {:>12}",
+        "", "own space", "with step-down", "distinct states"
+    );
+    for q in [0.5, 0.9, 0.99, 1.0] {
+        println!(
+            "  p{:<7} {:>12} {:>12} {:>12}",
+            format!("{:.0}", q * 100.0),
+            pct(&ww, q),
+            pct(&wo, q),
+            pct(&ws, q)
+        );
+    }
+    println!(
+        "  {:<8} {:>12.1} {:>12.1} {:>12.1}",
+        "mean",
+        ww.iter().sum::<usize>() as f64 / ww.len() as f64,
+        wo.iter().sum::<usize>() as f64 / wo.len() as f64,
+        ws.iter().sum::<usize>() as f64 / ws.len() as f64
+    );
+
+    // Which occupied spaces carry the mass?
+    hot.sort_by_key(|r| std::cmp::Reverse(r.2));
+    let mut agg: Vec<(Gear, u8, usize, usize, usize)> = Vec::new();
+    for (gear, pos, len, st) in &hot {
+        match agg.iter_mut().find(|r| r.0 == *gear && r.1 == *pos) {
+            Some(r) => {
+                r.2 += 1;
+                r.3 += len;
+                r.4 += st;
+            }
+            None => agg.push((*gear, *pos, 1, *len, *st)),
         }
     }
-
-    // The worst turn, spelled out.
-    if let Some(worst) = turns.iter().max_by_key(|t| t.place + t.retrieve) {
+    agg.sort_by_key(|r| std::cmp::Reverse(r.3));
+    println!("\nwhere workers actually sit: total options contributed");
+    println!(
+        "  {:<14} {:>3} {:>8} {:>12} {:>10} {:>12}",
+        "gear", "pos", "workers", "sum options", "mean", "sum distinct"
+    );
+    for (gear, pos, n, len, st) in agg.iter().take(14) {
         println!(
-            "\nworst turn: day {} corn {} workers {} -> {} moves ({} place, {} retrieve){}",
-            worst.day,
-            worst.corn,
-            worst.on_board,
-            worst.place + worst.retrieve,
-            worst.place,
-            worst.retrieve,
-            if worst.capped { " [CAPPED]" } else { "" }
-        );
-        println!("  per-worker options: {:?}", worst.worker_opts);
-        println!("  own-space only:     {:?}", worst.own_opts);
-    }
-
-    // ---- A/B --------------------------------------------------------
-    println!("\n================ pruned vs unpruned, same positions ================");
-    let mut a: Vec<usize> = turns.iter().map(|t| t.place + t.retrieve).collect();
-    let mut b: Vec<usize> = pruned.iter().map(|t| t.place + t.retrieve).collect();
-    a.sort_unstable();
-    b.sort_unstable();
-    println!("{:<10} {:>14} {:>14} {:>9}", "quantile", "before", "after", "ratio");
-    for q in [0.5, 0.75, 0.9, 0.99, 0.999, 1.0] {
-        let (x, y) = (pct(&a, q), pct(&b, q));
-        println!(
-            "  p{:<7} {:>14} {:>14} {:>8.2}x",
-            format!("{:.1}", q * 100.0),
-            x,
-            y,
-            x as f64 / y.max(1) as f64
+            "  {:<14} {:>3} {:>8} {:>12} {:>10.1} {:>12}",
+            gear.name(),
+            pos,
+            n,
+            len,
+            *len as f64 / *n as f64,
+            st
         );
     }
-    let (sa, sb) = (a.iter().sum::<usize>(), b.iter().sum::<usize>());
-    println!("  {:<8} {:>14} {:>14} {:>8.2}x", "total", sa, sb, sa as f64 / sb.max(1) as f64);
 
-    let mut ta: Vec<u128> = turns.iter().map(|t| t.nanos).collect();
-    let mut tb: Vec<u128> = pruned.iter().map(|t| t.nanos).collect();
-    ta.sort_unstable();
-    tb.sort_unstable();
-    println!("\nvisit time (ms)");
+    by_space.sort_by(|a, b| (b.3 as f64 / b.2 as f64).total_cmp(&(a.3 as f64 / a.2 as f64)));
+    println!("\nspace census (day >= 14): mean options and mean distinct states");
+    println!("  {:<14} {:>3} {:>12} {:>14} {:>8}", "gear", "pos", "mean opts", "mean distinct", "dup x");
+    for (gear, pos, n, len, st) in by_space.iter().take(16) {
+        println!(
+            "  {:<14} {:>3} {:>12.1} {:>14.1} {:>8.2}",
+            gear.name(),
+            pos,
+            *len as f64 / *n as f64,
+            *st as f64 / *n as f64,
+            *len as f64 / (*st).max(1) as f64
+        );
+    }
+    }
+    set_prune(false);
+
+    // ---- phase 2: A/B on identical positions ----------------------------
+    let mut a: Vec<usize> = Vec::new();
+    let mut b: Vec<usize> = Vec::new();
+    let mut ta: Vec<u128> = Vec::new();
+    let mut tb: Vec<u128> = Vec::new();
+    let mut capped_a = 0;
+    let mut capped_b = 0;
+    let mut worst = (0usize, 0usize, 0u8, 0usize);
+    let mut place_a = 0usize;
+    let mut retr_a = 0usize;
+    for (i, &(ref g, p)) in positions.iter().enumerate() {
+        set_prune(false);
+        let x = size_of_move_space(g, p, cap);
+        set_prune(true);
+        let y = size_of_move_space(g, p, cap);
+        if x.capped {
+            capped_a += 1;
+        }
+        if y.capped {
+            capped_b += 1;
+        }
+        place_a += x.place;
+        retr_a += x.retrieve;
+        // Only pairs where neither side hit the cap are comparable.
+        if !x.capped && !y.capped {
+            a.push(x.place + x.retrieve);
+            b.push(y.place + y.retrieve);
+            ta.push(x.nanos);
+            tb.push(y.nanos);
+            if x.place + x.retrieve > worst.0 {
+                worst = (x.place + x.retrieve, y.place + y.retrieve, g.day, g.on_board(p).count());
+            }
+        }
+        if i % 100 == 0 {
+            eprintln!("phase 2: {i}/{} ({:.1}s)", positions.len(), wall.elapsed().as_secs_f64());
+        }
+    }
+    set_prune(true);
+
+    println!(
+        "\n=== pruned vs unpruned on identical positions ({} of {} comparable, cap {cap_ms}ms) ===",
+        a.len(),
+        positions.len()
+    );
+    println!(
+        "unpruned mix: {place_a} placement, {retr_a} retrieval ({:.1}% retrieval)",
+        retr_a as f64 * 100.0 / (place_a + retr_a).max(1) as f64
+    );
+    println!("capped turns: before {capped_a}, after {capped_b}");
+    quantiles("branching factor", &a, &b);
+
+    let tam: Vec<usize> = ta.iter().map(|&v| v as usize).collect();
+    let tbm: Vec<usize> = tb.iter().map(|&v| v as usize).collect();
+    let mut tas = tam.clone();
+    let mut tbs = tbm.clone();
+    tas.sort_unstable();
+    tbs.sort_unstable();
+    println!("\nlegal_moves() time (ms)");
+    println!("  {:<8} {:>13} {:>13} {:>9}", "", "before", "after", "ratio");
     for q in [0.5, 0.9, 0.99, 1.0] {
-        let (x, y) = (pct(&ta, q) as f64 / 1e6, pct(&tb, q) as f64 / 1e6);
+        let (x, y) = (pct(&tas, q) as f64 / 1e6, pct(&tbs, q) as f64 / 1e6);
         println!(
-            "  p{:<7} {:>14.3} {:>14.3} {:>8.2}x",
+            "  p{:<7} {:>13.3} {:>13.3} {:>8.2}x",
             format!("{:.0}", q * 100.0),
             x,
             y,
@@ -385,41 +325,43 @@ fn main() {
         );
     }
     let (na, nb) = (
-        ta.iter().sum::<u128>() as f64 / 1e9,
-        tb.iter().sum::<u128>() as f64 / 1e9,
+        tas.iter().sum::<usize>() as f64 / 1e9,
+        tbs.iter().sum::<usize>() as f64 / 1e9,
     );
-    println!("  {:<8} {:>14.2} {:>14.2} {:>8.2}x", "total s", na, nb, na / nb.max(1e-9));
+    println!("  {:<8} {:>13.2} {:>13.2} {:>8.2}x", "total s", na, nb, na / nb.max(1e-9));
     println!(
-        "  capped turns: before {}, after {}",
-        turns.iter().filter(|t| t.capped).count(),
-        pruned.iter().filter(|t| t.capped).count()
+        "\nworst comparable position: day {} with {} workers on board: {} -> {} ({:.2}x)",
+        worst.2,
+        worst.3,
+        worst.0,
+        worst.1,
+        worst.0 as f64 / worst.1.max(1) as f64
     );
 
-    let mut oa: Vec<usize> = turns.iter().flat_map(|t| t.worker_opts.clone()).collect();
-    let mut ob: Vec<usize> = pruned.iter().flat_map(|t| t.worker_opts.clone()).collect();
-    oa.sort_unstable();
-    ob.sort_unstable();
-    if !oa.is_empty() {
-        println!("\noptions per worker (choices_for_worker)");
-        for q in [0.5, 0.9, 0.99, 1.0] {
-            let (x, y) = (pct(&oa, q), pct(&ob, q));
-            println!(
-                "  p{:<7} {:>14} {:>14} {:>8.2}x",
-                format!("{:.0}", q * 100.0),
-                x,
-                y,
-                x as f64 / y.max(1) as f64
-            );
+    // per-worker options, pruned
+    set_prune(true);
+    let mut wo2: Vec<usize> = Vec::new();
+    for &(ref g, p) in &positions {
+        for w in g.on_board(p) {
+            if let Some((gear, pos)) = g.loc(w).on_board() {
+                wo2.push(moves::choices_for_worker(g, p, gear, pos).len());
+            }
         }
-        println!(
-            "  {:<8} {:>14.1} {:>14.1} {:>8.2}x",
-            "mean",
-            oa.iter().sum::<usize>() as f64 / oa.len() as f64,
-            ob.iter().sum::<usize>() as f64 / ob.len() as f64,
-            (oa.iter().sum::<usize>() as f64) / (ob.iter().sum::<usize>() as f64).max(1.0)
-        );
     }
+    wo2.sort_unstable();
+    set_prune(false);
+    let mut wo1: Vec<usize> = Vec::new();
+    for &(ref g, p) in &positions {
+        for w in g.on_board(p) {
+            if let Some((gear, pos)) = g.loc(w).on_board() {
+                wo1.push(moves::choices_for_worker(g, p, gear, pos).len());
+            }
+        }
+    }
+    wo1.sort_unstable();
+    set_prune(true);
+    quantiles("options per worker (choices_for_worker)", &wo1, &wo2);
 
+    let _ = Effect::UnlockWorker;
     println!("\nwall {:.1}s", wall.elapsed().as_secs_f64());
-    let _ = MoveKind::Place(Default::default());
 }
