@@ -131,6 +131,7 @@ use crate::effect::Effect;
 use crate::eval;
 use crate::ids::*;
 use crate::moves::Placement;
+use crate::options::EffectPrice;
 use crate::phase::{Evaluation, Evaluator, Phase, Step};
 use crate::state::{GameState, LAST_DAY, POINT_DAYS, RESOURCE_DAYS};
 
@@ -905,7 +906,7 @@ impl crate::record::Agent for PlanAgent {
 /// A mask rather than one line, because a Chichen action genuinely is both a
 /// skull spent and a temple step, and forcing a choice between them would be a
 /// worse reading than reporting both.
-fn lines_advanced(step: &Step) -> u8 {
+fn lines_advanced(step: &Step, target: Option<Temple>) -> u8 {
     let Step::Take(choice) = step else {
         return 0;
     };
@@ -922,7 +923,13 @@ fn lines_advanced(step: &Step) -> u8 {
             // `Line::Construction` reads. Blocks are not among them.
             Effect::Build(_) | Effect::TakeMonument(_) => Line::Construction,
             Effect::AdvanceResearch(Science::Architecture) => Line::Construction,
-            Effect::TempleStep(_, n) if n > 0 => Line::Temples,
+            // `target` is the whole content of `temple_target`: with a temple
+            // named, a step on either of the other two is a *different* plan
+            // rather than the same one, and crediting it would be the mistake
+            // `Line::Temples`'s fold over the three tracks was hiding.
+            Effect::TempleStep(t, n) if n > 0 && target.map_or(true, |x| x == t) => {
+                Line::Temples
+            }
             _ => continue,
         };
         mask |= 1 << (l as u8);
@@ -970,6 +977,13 @@ pub struct BiasWeights {
     /// This is also where most of the saving is, because the opening is where
     /// the tree is widest.
     pub min_lead: f32,
+    /// Credit a `TempleStep` to [`Line::Temples`] only when it is on the
+    /// temple [`temple_target`] names.
+    ///
+    /// Off is the honest null: `Line::Temples` folds `max` over the three
+    /// tracks, so without this the prior promotes any climb at all — including
+    /// the two that pay 2 where the third pays 6.
+    pub name_temple: bool,
     /// **The control, not a mode to ship.** Raise every line-advancing edge by
     /// the leader's multiplier and demote nothing, so the bias no longer knows
     /// or cares which line is ahead.
@@ -988,6 +1002,7 @@ impl BiasWeights {
         k: 0.0,
         place: false,
         min_lead: 0.02,
+        name_temple: false,
         blind: false,
     };
 }
@@ -1074,8 +1089,16 @@ impl crate::mcts::PriorBias for PlanBias {
         let s = self.w.k * lead * (left / LAST_DAY as f32).min(1.0);
         let up = (s * LEAD_SLOPE).exp();
         let down = (s * FOLLOW_SLOPE).exp();
+        // Once per node, like the three `line_progress` calls above: naming the
+        // temple is an argmax over three closed-form shares, not a per-edge
+        // cost.
+        let target = if self.w.name_temple {
+            temple_target(state, mover)
+        } else {
+            None
+        };
         for (step, o) in steps.iter().zip(out.iter_mut()) {
-            let mut mask = lines_advanced(step);
+            let mut mask = lines_advanced(step, target);
             if self.w.place {
                 mask |= lines_placed(step);
             }
@@ -1096,9 +1119,10 @@ impl crate::mcts::PriorBias for PlanBias {
 
     fn name(&self) -> String {
         format!(
-            "plan-bias:k={}{}{}",
+            "plan-bias:k={}{}{}{}",
             self.w.k,
             if self.w.place { ":place" } else { "" },
+            if self.w.name_temple { ":named" } else { "" },
             if self.w.blind { ":blind" } else { "" }
         )
     }
@@ -1158,6 +1182,261 @@ impl crate::mcts::PriorBias for OnePlyBias {
 
     fn name(&self) -> String {
         format!("one-ply-bias:t={}", self.temp)
+    }
+}
+
+// =======================================================================
+// The plan as a price
+// =======================================================================
+
+/// Which temple this player is actually climbing, or `None` when nothing
+/// separates them.
+///
+/// [`Line::Temples`] deliberately folds `max` over the three tracks, which is
+/// the right statistic for *how far along* the line is and throws away the one
+/// fact a prior needs: **which** track. The prizes invert between the ages —
+/// brown pays 6 then 2, yellow 2 then 6 (`data/temples.rs`) — so "climb a
+/// temple" is not one plan but three, and two of them are wrong on any given
+/// day.
+///
+/// Ties abstain rather than picking the first. On day 0 every player stands on
+/// `STARTING_STEP` of all three, every share is 0, and an argmax there is a
+/// coin flip dressed up as a plan.
+pub fn temple_target(g: &GameState, p: PlayerId) -> Option<Temple> {
+    let age = next_scoring_age(g)?;
+    let mut best = Temple::Brown;
+    let mut best_v = f32::NEG_INFINITY;
+    let mut tied = false;
+    for &t in Temple::ALL.iter() {
+        let v = temple_share(g, p, t, age);
+        if v > best_v + 1e-6 {
+            best_v = v;
+            best = t;
+            tied = false;
+        } else if (v - best_v).abs() <= 1e-6 {
+            tied = true;
+        }
+    }
+    if best_v <= 0.0 || tied {
+        None
+    } else {
+        Some(best)
+    }
+}
+
+/// What one step on `t` is worth to the plan at `age`, in points of eventual
+/// prize.
+///
+/// # Why this is not what the gradient measures
+///
+/// `eval::temple_outlook` prices a step by what it changes **today**:
+/// `temple_points` is the majority prize, so a step that does not overtake
+/// anybody moves it by exactly zero. A player three steps below the top of
+/// yellow on day 16 is on the only climb that pays at day 27, and the gradient
+/// reads that climb as worthless until the step that actually passes someone.
+/// That is not a bug in `eval` — a one-step difference is what a gradient *is*
+/// — but it is the one place a plan has strictly more to say.
+///
+/// [`temple_share`] is linear in the step, so its derivative is a constant per
+/// temple per age: prize over climbable steps. Brown pays 1.20 points a step in
+/// age 1 and 0.40 in age 2; yellow 0.29 then 0.86. No state is touched.
+pub fn plan_temple_step(t: Temple, age: u8) -> f32 {
+    let d = &crate::data::temples::TEMPLES[t.idx()];
+    let top = (d.steps - 1) as f32;
+    let base = crate::data::temples::STARTING_STEP as f32;
+    let prize = if age == 1 { d.age1_prize } else { d.age2_prize } as f32;
+    prize / (top - base)
+}
+
+/// Where the 21 numbers in an [`EffectPrice`] come from.
+///
+/// The three arms differ **only in the three temple entries**. That is the
+/// whole experiment: 18 of the 21 prices are held at the gradient's own values,
+/// so the difference between arms is exactly the claim being tested and not a
+/// second, differently-tuned price table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PriceSource {
+    /// `eval::heuristic`'s local gradient and nothing else: the baseline the
+    /// generation agent measured at 16 ns an edge and 0.057 points of regret.
+    Gradient,
+    /// The gradient plus [`plan_temple_step`] on **all three** temples. Knows
+    /// the age inversion; does not know which temple is this player's.
+    ///
+    /// The control that isolates the naming: without it, an arm that beat
+    /// [`PriceSource::Gradient`] could be winning on the prize schedule alone,
+    /// which `temple_outlook` half-knows already.
+    PlanFlat,
+    /// The gradient plus [`plan_temple_step`] on the [`temple_target`] only.
+    /// `PlanNamed - PlanFlat` is exactly "naming the temple".
+    PlanNamed,
+}
+
+/// A prior over a `Take` node's edges built on [`EffectPrice`], with the temple
+/// axis optionally supplied by the plan instead of by the gradient.
+///
+/// # Why a price and not an evaluation
+///
+/// `effect.rs` resolves every value at generation time, so a `Choice` is
+/// already a summary of what it does and can be priced by a dot product with no
+/// state copy. That is the difference between 16 ns an edge and the 123 ns an
+/// `apply_step` plus `eval::heuristic` costs — and at a node 2,293 edges wide it
+/// is the difference between a prior and a second search.
+///
+/// # Where the cost actually is, measured
+///
+/// The dot product is free and the **gradient is not**, and through this seam
+/// that is fatal. Over 2,608 `Take` nodes (mean width 18.6):
+///
+/// ```text
+///   PricedBias::bias (gradient)          4.72 us/node   253.4 ns/edge
+///     of which: the 17 gradient probes   4.43 us/node   237.8 ns/edge
+///     of which: EffectPrice::choice      0.35 us/node    18.5 ns/edge
+///   OnePlyBias::bias (what it replaces)  4.96 us/node   266.2 ns/edge
+///   PlanBias::bias (the cheap prior)     0.35 us/node    19.0 ns/edge
+/// ```
+///
+/// `EffectPrice::choice` really is ~16 ns an edge as `options.rs` claims. But
+/// 94% of the cost here is *filling* the table, and `PriorBias::bias` is handed
+/// a **node**, not a turn — so unlike `movestats`'s `Gradient`, which pays the
+/// probe once and reuses it at every `Take` node of the turn, there is nowhere
+/// to amortise it. That drags a 19 ns/edge interface up to 253, which is the
+/// 266 of the one-ply probe it was supposed to undercut.
+///
+/// The conclusion is not that the price is wrong; it is that the *seam* is. See
+/// [`PlanBias`], which reaches 19 ns/edge by reading the effect vocabulary
+/// directly and never building a gradient at all.
+///
+/// `min_edges` is the partial mitigation: a three-edge node is resolved by
+/// three simulations whatever its prior says, and the median searched width
+/// is 3.
+pub struct PricedBias {
+    pub source: PriceSource,
+    /// Softmax temperature, in points — `eval::heuristic`'s own scale.
+    pub temp: f32,
+    /// Points per step of climb credited to the plan's temple. Zero reduces
+    /// every arm to [`PriceSource::Gradient`], which is the identity test.
+    pub w: f32,
+    /// Do not spend 17 `heuristic` probes on a node narrower than this.
+    pub min_edges: usize,
+}
+
+impl PricedBias {
+    pub fn new(source: PriceSource, w: f32) -> PricedBias {
+        PricedBias {
+            source,
+            temp: 4.0,
+            w,
+            min_edges: 8,
+        }
+    }
+
+    /// `EffectPrice` filled from `eval::heuristic`'s local gradient: probe `+1`
+    /// of each axis against the position and take the difference.
+    ///
+    /// The five card- and space-naming effects are constants rather than
+    /// probes, scaled by the probed price of one point so both halves of the
+    /// sum are in the same units. `movestats` measured probing them per card at
+    /// 0.005 points of regret in the first 32 edges for 26% more per edge.
+    pub fn gradient(g: &GameState, p: PlayerId) -> EffectPrice {
+        let base = eval::heuristic(g, p);
+        let pr = |e: Effect| {
+            let mut probe = *g;
+            crate::effect::Choice::one(e).apply(&mut probe, p);
+            eval::heuristic(&probe, p) - base
+        };
+        let points = pr(Effect::Points(1));
+        EffectPrice {
+            corn: pr(Effect::Corn(1)),
+            res: std::array::from_fn(|i| pr(Effect::Res(Resource::ALL[i], 1))),
+            points,
+            temple: std::array::from_fn(|i| pr(Effect::TempleStep(Temple::ALL[i], 1))),
+            science: std::array::from_fn(|i| pr(Effect::AdvanceResearch(Science::ALL[i]))),
+            unlock_worker: pr(Effect::UnlockWorker),
+            free_worker: pr(Effect::FreeWorker(1)),
+            worker_discount: pr(Effect::WorkerDiscount(1)),
+            // In points, times the probed price of a point. A building is ~3
+            // points on the pad, a monument ~6, a Chichen head 4-13.
+            palenque_tile: 1.5 * points,
+            burn_wood: 1.0 * points,
+            fill_chichen: 6.0 * points,
+            build: 3.0 * points,
+            monument: 6.0 * points,
+        }
+    }
+
+    /// The gradient, with the temple axis adjusted by the plan.
+    pub fn price(&self, g: &GameState, p: PlayerId) -> EffectPrice {
+        let mut e = PricedBias::gradient(g, p);
+        if self.w == 0.0 || self.source == PriceSource::Gradient {
+            return e;
+        }
+        let Some(age) = next_scoring_age(g) else {
+            // Past the last payout a step buys nothing the plan can spend, and
+            // the gradient's resource-day reading is the only true one left.
+            return e;
+        };
+        let target = temple_target(g, p);
+        for (i, &t) in Temple::ALL.iter().enumerate() {
+            let credit = match self.source {
+                PriceSource::Gradient => continue,
+                PriceSource::PlanFlat => true,
+                PriceSource::PlanNamed => target == Some(t),
+            };
+            if credit {
+                e.temple[i] += self.w * plan_temple_step(t, age);
+            }
+        }
+        e
+    }
+}
+
+impl crate::mcts::PriorBias for PricedBias {
+    fn bias(
+        &self,
+        state: &GameState,
+        _phase: Phase,
+        mover: PlayerId,
+        steps: &[Step],
+        out: &mut [f32],
+    ) {
+        if steps.len() < self.min_edges {
+            return;
+        }
+        // `Choice` is the only thing `EffectPrice` can read, and a node's edges
+        // are homogeneous by phase: a `Take` node is all `Take`, a `Placing`
+        // node is `Place`s plus a commit edge. So this either prices every edge
+        // or abstains, and never mixes a priced weight with an unpriced 1.0.
+        if !steps.iter().all(|s| matches!(s, Step::Take(_))) {
+            return;
+        }
+        let price = self.price(state, mover);
+        let mut best = f32::NEG_INFINITY;
+        for (step, o) in steps.iter().zip(out.iter_mut()) {
+            let Step::Take(c) = step else { unreachable!() };
+            let v = price.choice(c);
+            best = best.max(v);
+            *o = v;
+        }
+        // Shifted by the max before exponentiating, as `mcts::one_ply` is: a
+        // priced choice runs to tens of points and `exp` of that is not a
+        // number.
+        let t = self.temp.max(1e-3);
+        for o in out.iter_mut() {
+            *o = ((*o - best) / t).exp();
+        }
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "priced:{}:w={}:t={}",
+            match self.source {
+                PriceSource::Gradient => "grad",
+                PriceSource::PlanFlat => "flat",
+                PriceSource::PlanNamed => "named",
+            },
+            self.w,
+            self.temp
+        )
     }
 }
 
@@ -1317,6 +1596,281 @@ mod tests {
         );
         assert!(b1 > y1, "brown pays 6 and yellow 2 at the day-14 payout");
         assert!(y2 > b2, "and the other way round at day 27");
+    }
+
+    /// Real `Take` nodes from real games, for the prior tests.
+    ///
+    /// Walks the sub-decision chain rather than only the turn roots: a `Take`
+    /// node is three levels into a turn and never appears at the top of one.
+    fn take_nodes(seeds: std::ops::Range<u64>) -> Vec<(GameState, Phase, PlayerId, Vec<Step>)> {
+        let mut out = Vec::new();
+        for seed in seeds {
+            let mut game = Game::new(seed);
+            for _ in 0..14 {
+                if game.state.over {
+                    break;
+                }
+                let turn = game.state.current;
+                let mut probe = game.state;
+                let mut at = (Phase::Beg, turn, 0u8);
+                for _ in 0..24 {
+                    let (phase, t, done) = at;
+                    let steps = crate::tree::legal_steps(&probe, phase, t, done);
+                    if steps.is_empty() {
+                        break;
+                    }
+                    if steps.len() > 1 {
+                        out.push((probe, phase, phase.mover(t), steps.clone()));
+                    }
+                    let step = steps[steps.len() / 2].clone();
+                    let tr = crate::tree::apply_step(&mut probe, phase, t, done, &step);
+                    match tr.next() {
+                        None => break,
+                        Some(next) => {
+                            if tr.committed() {
+                                break;
+                            }
+                            at = next;
+                        }
+                    }
+                }
+                game.play_round();
+            }
+        }
+        out
+    }
+
+    /// A prior may bias and must never exclude. PUCT reaches a low-prior edge
+    /// given enough simulations only while the prior is strictly positive, and
+    /// a zero would turn "the plan disagrees" into "the move does not exist".
+    #[test]
+    fn the_bias_never_excludes_an_edge() {
+        use crate::mcts::PriorBias;
+        let b = PlanBias::new(32.0);
+        let mut out = Vec::new();
+        for (g, phase, mover, steps) in take_nodes(0..6) {
+            out.clear();
+            out.resize(steps.len(), 1.0);
+            b.bias(&g, phase, mover, &steps, &mut out);
+            for (w, step) in out.iter().zip(&steps) {
+                assert!(
+                    *w > 0.0 && w.is_finite(),
+                    "day {} {phase:?} {step:?}: weight {w}",
+                    g.day
+                );
+            }
+        }
+    }
+
+    /// `k = 0` must leave every weight at one, so "the plan is off" and "there
+    /// is no plan" are the same search and the null duel measures exactly zero.
+    #[test]
+    fn zero_strength_is_the_identity() {
+        use crate::mcts::PriorBias;
+        let b = PlanBias::new(0.0);
+        let mut out = Vec::new();
+        for (g, phase, mover, steps) in take_nodes(10..13) {
+            out.clear();
+            out.resize(steps.len(), 1.0);
+            b.bias(&g, phase, mover, &steps, &mut out);
+            assert!(out.iter().all(|&w| w == 1.0), "day {}: {out:?}", g.day);
+        }
+    }
+
+    /// An edge the classifier calls Construction or Temples must really raise
+    /// that line once applied, or the prior is steering the search somewhere
+    /// the value function will refuse to pay for.
+    ///
+    /// **Skulls is exempt, and the exemption is the finding.** `FillChichen` is
+    /// where the skull line *pays*, and it lowers `line_progress(Skulls)`
+    /// because that statistic counts skulls in hand — fuel, not payoff. The
+    /// prior deliberately promotes cashing anyway: a plan that hoards the
+    /// resource it is committed to and never spends it is not a plan.
+    #[test]
+    fn construction_and_temple_edges_raise_the_line_they_name() {
+        for (g, phase, mover, steps) in take_nodes(20..26) {
+            for step in &steps {
+                let mask = lines_advanced(step, None);
+                for l in [Line::Construction, Line::Temples] {
+                    if mask & (1 << (l as u8)) == 0 {
+                        continue;
+                    }
+                    let before = line_progress(&g, mover, l);
+                    let mut after = g;
+                    let _ = crate::tree::apply_step(&mut after, phase, mover, 0, step);
+                    let now = line_progress(&after, mover, l);
+                    assert!(
+                        now >= before - 1e-6,
+                        "day {} {l:?}: {step:?} was classified as advancing it and moved it {before} -> {now}",
+                        g.day
+                    );
+                }
+            }
+        }
+    }
+
+    /// The blind control must touch exactly the edges the plan does. If it
+    /// touched a different set, the difference between the two arms would be
+    /// the edge set as much as the direction, and the arm would answer nothing.
+    #[test]
+    fn the_blind_control_moves_the_same_edges() {
+        use crate::mcts::PriorBias;
+        let plan = PlanBias {
+            w: BiasWeights { k: 8.0, ..BiasWeights::OFF },
+        };
+        let blind = PlanBias {
+            w: BiasWeights { k: 8.0, blind: true, ..BiasWeights::OFF },
+        };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut touched = 0usize;
+        for (g, phase, mover, steps) in take_nodes(30..46) {
+            a.clear();
+            a.resize(steps.len(), 1.0);
+            b.clear();
+            b.resize(steps.len(), 1.0);
+            plan.bias(&g, phase, mover, &steps, &mut a);
+            blind.bias(&g, phase, mover, &steps, &mut b);
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(
+                    *x == 1.0,
+                    *y == 1.0,
+                    "day {}: the two arms disagree about which edges to touch",
+                    g.day
+                );
+                if *x != 1.0 {
+                    touched += 1;
+                }
+            }
+        }
+        assert!(touched > 100, "only {touched} edges touched: the walk found nothing to test");
+    }
+
+
+    /// The plan's per-step temple price must carry the age inversion the
+    /// prizes actually have, or naming the temple names the wrong one. Brown is
+    /// the age-1 plan and yellow the age-2 plan; green is flat by construction.
+    #[test]
+    fn the_plan_step_price_inverts_with_the_age() {
+        let (b1, y1) = (plan_temple_step(Temple::Brown, 1), plan_temple_step(Temple::Yellow, 1));
+        let (b2, y2) = (plan_temple_step(Temple::Brown, 2), plan_temple_step(Temple::Yellow, 2));
+        assert!(b1 > y1, "brown pays 6 to yellow's 2 at day 14: {b1} vs {y1}");
+        assert!(y2 > b2, "and 2 to yellow's 6 at day 27: {b2} vs {y2}");
+        assert_eq!(
+            plan_temple_step(Temple::Green, 1),
+            plan_temple_step(Temple::Green, 2),
+            "green pays 4 in both ages, so it must not move with the age"
+        );
+    }
+
+    /// `temple_target` must abstain where there is nothing to name and commit
+    /// where there is. A fresh game has every player on `STARTING_STEP` of all
+    /// three tracks, which is the tie the argmax would otherwise resolve by
+    /// enum order.
+    #[test]
+    fn the_temple_target_abstains_on_a_tie() {
+        let mut g = Game::new(11).state;
+        g.day = 4;
+        let p = PlayerId(0);
+        // Levelled by hand rather than taken fresh: the starting-tile draft
+        // deals temple steps, so a real day-0 position usually *has* already
+        // named a temple. That is the mechanism working, not a case to exclude
+        // -- the tie is what has to abstain.
+        for t in Temple::ALL {
+            g.temples[t.idx()][p.idx()] = crate::data::temples::STARTING_STEP;
+        }
+        assert_eq!(temple_target(&g, p), None, "level tracks name no plan");
+        // Two steps up yellow and nothing else: the plan is yellow, in both
+        // ages, because it is the only track this player has climbed at all.
+        g.temples[Temple::Yellow.idx()][p.idx()] = 3;
+        assert_eq!(temple_target(&g, p), Some(Temple::Yellow));
+    }
+
+    /// Naming the temple may only ever *narrow* the set of edges credited to
+    /// `Line::Temples` — never credit one the unnamed classifier refused. A
+    /// prior that named a temple and then promoted a different one would be
+    /// worse than no naming at all.
+    #[test]
+    fn naming_the_temple_only_narrows() {
+        let mut seen = 0usize;
+        let mut narrowed = 0usize;
+        for (g, _phase, mover, steps) in take_nodes(50..70) {
+            let target = temple_target(&g, mover);
+            for step in &steps {
+                let wide = lines_advanced(step, None);
+                let narrow = lines_advanced(step, target);
+                assert_eq!(
+                    wide & narrow,
+                    narrow,
+                    "naming credited a line the unnamed classifier did not"
+                );
+                let bit = 1 << (Line::Temples as u8);
+                if wide & bit != 0 {
+                    seen += 1;
+                    if narrow & bit == 0 {
+                        narrowed += 1;
+                    }
+                }
+            }
+        }
+        assert!(seen > 50, "only {seen} temple edges: the walk found nothing to test");
+        assert!(
+            narrowed > 0,
+            "{seen} temple edges and naming dropped none of them, so the axis is inert"
+        );
+    }
+
+    /// The priced bias is a softmax, so every weight is strictly positive: a
+    /// low prior costs simulations, never correctness. This is the same
+    /// soundness property `the_bias_never_excludes_an_edge` asserts for
+    /// `PlanBias`, and it has to hold separately because the two compute their
+    /// weights by completely different routes.
+    #[test]
+    fn the_priced_bias_never_excludes_an_edge() {
+        use crate::mcts::PriorBias;
+        let b = PricedBias {
+            min_edges: 2,
+            ..PricedBias::new(PriceSource::PlanNamed, 4.0)
+        };
+        let mut out = Vec::new();
+        let mut touched = 0usize;
+        for (g, phase, mover, steps) in take_nodes(70..86) {
+            out.clear();
+            out.resize(steps.len(), 1.0);
+            b.bias(&g, phase, mover, &steps, &mut out);
+            for w in &out {
+                assert!(
+                    w.is_finite() && *w > 0.0,
+                    "day {}: a priced edge got weight {w}",
+                    g.day
+                );
+                if *w != 1.0 {
+                    touched += 1;
+                }
+            }
+        }
+        assert!(touched > 100, "only {touched} edges priced: the walk found nothing to test");
+    }
+
+    /// With `w = 0` all three arms must be the identical price table, or the
+    /// sweep's low end is not a control. This is the `PricedBias` counterpart
+    /// of `zero_strength_is_the_identity`.
+    #[test]
+    fn zero_weight_leaves_the_gradient_alone() {
+        let mut g = Game::new(13).state;
+        g.day = 16;
+        let p = PlayerId(0);
+        g.temples[Temple::Yellow.idx()][p.idx()] = 4;
+        let grad = PricedBias::gradient(&g, p);
+        for src in [PriceSource::Gradient, PriceSource::PlanFlat, PriceSource::PlanNamed] {
+            assert_eq!(PricedBias::new(src, 0.0).price(&g, p), grad, "{src:?}");
+        }
+        // And with weight on, only the temple axis may move: 18 of the 21
+        // prices are the gradient's, which is what makes the arms comparable.
+        let named = PricedBias::new(PriceSource::PlanNamed, 4.0).price(&g, p);
+        assert_eq!(named.corn, grad.corn);
+        assert_eq!(named.res, grad.res);
+        assert_eq!(named.science, grad.science);
+        assert_ne!(named.temple, grad.temple, "the target temple must be repriced");
     }
 
     /// Reachability is arithmetic, not search: a worker one space below a

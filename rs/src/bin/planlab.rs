@@ -54,7 +54,7 @@ use tzolkin::mcts::{Mcts, MctsConfig, PriorBias, Priors};
 use tzolkin::phase::{Evaluator, HeuristicEvaluator, Phase, Step};
 use tzolkin::plan::{
     self, BiasWeights, DraftMode, OnePlyBias, PlanAgent, PlanBias, PlanEvaluator, PlanWeights,
-    Schedule,
+    temple_target, PriceSource, PricedBias, Schedule,
 };
 use tzolkin::record::{
     self, flags, interrupt, play_game, Agent, Candidates, GameConfig, GreedyAgent, Summary,
@@ -947,6 +947,144 @@ fn priors_probe(args: &Args) {
     println!("  first simulation goes elsewhere with the bias on : {changed} / {}", changed + agreed);
     println!("  and lands on a top-weighted edge                 : {leaderward}");
 
+    // ---- what naming the temple actually changes ---------------------------
+    //
+    // The claim under test is that `Line::Temples` folding `max` over three
+    // tracks throws away the one fact a prior needs. If naming the temple never
+    // moved the top-weighted edge, the axis would be inert whatever a duel said.
+    let named_bias = PlanBias {
+        w: BiasWeights { name_temple: true, ..plan_bias.w },
+    };
+    let (mut nodes_with_target, mut nodes_named, mut top_moved) = (0usize, 0usize, 0usize);
+    let (mut flat_top, mut named_top) = (0usize, 0usize);
+    let mut other = Vec::new();
+    for (g, phase, mover, steps) in &nodes {
+        if temple_target(g, *mover).is_some() {
+            nodes_with_target += 1;
+        }
+        scratch.clear();
+        scratch.resize(steps.len(), 1.0f32);
+        plan_bias.bias(g, *phase, *mover, steps, &mut scratch);
+        other.clear();
+        other.resize(steps.len(), 1.0f32);
+        named_bias.bias(g, *phase, *mover, steps, &mut other);
+        if scratch != other {
+            nodes_named += 1;
+        }
+        let arg = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+        };
+        if steps.len() > 1 && arg(&scratch) != arg(&other) {
+            top_moved += 1;
+        }
+    }
+    println!("\n=== what naming the temple changes ({} nodes) ===", nodes.len());
+    println!("  nodes where `temple_target` names one : {nodes_with_target} ({:.1}%)",
+        100.0 * nodes_with_target as f64 / nodes.len() as f64);
+    println!("  nodes where the weights differ        : {nodes_named} ({:.1}%)",
+        100.0 * nodes_named as f64 / nodes.len() as f64);
+    println!("  nodes where the top-weighted edge moves: {top_moved} ({:.1}%)",
+        100.0 * top_moved as f64 / nodes.len() as f64);
+
+    // Same question for the priced arms, on the wide nodes where truncation
+    // makes the ordering load-bearing.
+    let pflat = PricedBias { min_edges: 0, ..PricedBias::new(PriceSource::PlanFlat, args.priced_w) };
+    let pnamed = PricedBias { min_edges: 0, ..PricedBias::new(PriceSource::PlanNamed, args.priced_w) };
+    let pgrad = PricedBias { min_edges: 0, ..PricedBias::new(PriceSource::Gradient, 0.0) };
+    for (label, a, b) in [
+        ("named vs gradient", &pgrad, &pnamed),
+        ("named vs flat    ", &pflat, &pnamed),
+    ] {
+        let (mut n, mut moved) = (0usize, 0usize);
+        for (g, phase, mover, steps) in &wide {
+            scratch.clear();
+            scratch.resize(steps.len(), 1.0f32);
+            a.bias(g, *phase, *mover, steps, &mut scratch);
+            other.clear();
+            other.resize(steps.len(), 1.0f32);
+            b.bias(g, *phase, *mover, steps, &mut other);
+            let arg = |v: &[f32]| {
+                v.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|(i, _)| i)
+            };
+            n += 1;
+            if arg(&scratch) != arg(&other) {
+                moved += 1;
+            }
+        }
+        println!("  PricedBias {label}: top edge moves at {moved} / {n} wide Take nodes");
+    }
+    let _ = (&mut flat_top, &mut named_top);
+
+    // ---- does `EdgeOrder::Gradient` outrank the plan? -----------------------
+    //
+    // `Mcts::node_for` calls `select_edges` **before** `priors_for`, so at a
+    // node past `widen_cap` the search has already priced every edge with
+    // `mcts::Gradient` and deleted the tail by the time a `PriorBias` is
+    // consulted. A plan can re-rank the survivors; it cannot rescue an edge the
+    // gradient dropped. That matters most for exactly the claim this file is
+    // testing: a temple step that overtakes nobody moves `temple_points` by
+    // zero, so the gradient is at its least informative on the climb a plan is
+    // most committed to.
+    let cap = MctsConfig::default().widen_cap.max(MctsConfig::default().max_edges);
+    let (mut past_cap, mut plan_top_dropped, mut temple_dropped, mut temple_kept) =
+        (0usize, 0usize, 0usize, 0usize);
+    for (g, phase, mover, steps) in &nodes {
+        if steps.len() <= cap {
+            continue;
+        }
+        past_cap += 1;
+        let grad = tzolkin::mcts::Gradient::new(g, *mover);
+        let mut order: Vec<usize> = (0..steps.len()).collect();
+        order.sort_unstable_by(|&a, &b| {
+            grad.step(&steps[b]).total_cmp(&grad.step(&steps[a])).then(a.cmp(&b))
+        });
+        let kept: std::collections::HashSet<usize> = order[..cap].iter().copied().collect();
+        scratch.clear();
+        scratch.resize(steps.len(), 1.0f32);
+        named_bias.bias(g, *phase, *mover, steps, &mut scratch);
+        // Not "the argmax survived": `PlanBias` hands every promoted edge the
+        // same multiplier, so an argmax over it is a tie broken by position and
+        // says nothing. The question that has an answer is whether the cut
+        // leaves the plan *anything* to promote.
+        let up = scratch.iter().copied().fold(0.0f32, f32::max);
+        if up > 1.0 {
+            let promoted: Vec<usize> =
+                (0..steps.len()).filter(|&i| scratch[i] >= up).collect();
+            if !promoted.is_empty() && !promoted.iter().any(|i| kept.contains(i)) {
+                plan_top_dropped += 1;
+            }
+        }
+        // And specifically: does the survivor set still contain a step on the
+        // temple the plan named?
+        if let Some(t) = temple_target(g, *mover) {
+            let on_target = |i: &usize| match &steps[*i] {
+                Step::Take(c) => c.0.iter().any(|e| {
+                    matches!(e, tzolkin::Effect::TempleStep(x, n) if *x == t && *n > 0)
+                }),
+                _ => false,
+            };
+            let any = (0..steps.len()).any(|i| on_target(&i));
+            if any {
+                if kept.iter().any(on_target) {
+                    temple_kept += 1;
+                } else {
+                    temple_dropped += 1;
+                }
+            }
+        }
+    }
+    println!("\n=== `EdgeOrder::Gradient` vs the plan (cap {cap}) ===");
+    println!("  nodes past the cap                          : {past_cap}");
+    if past_cap > 0 {
+        println!("  every edge the plan promotes is deleted first     : {plan_top_dropped} ({:.1}%)",
+            100.0 * plan_top_dropped as f64 / past_cap as f64);
+        println!("  a step on the named temple existed and survived   : {temple_kept}");
+        println!("  a step on the named temple existed and was deleted: {temple_dropped}");
+    }
+
     // ---- cost --------------------------------------------------------------
     let one_ply = OnePlyBias {
         ev: args.evaluator()(),
@@ -980,6 +1118,93 @@ fn priors_probe(args: &Args) {
         std::hint::black_box(&buf);
     });
     bench("OnePlyBias::bias (the baseline)", &mut |(g, p, m, st)| {
+        buf.clear();
+        buf.resize(st.len(), 1.0);
+        one_ply.bias(g, *p, *m, st, &mut buf);
+        std::hint::black_box(&buf);
+    });
+    // Both `PricedBias` arms, because the interesting split is that the plan's
+    // temple term is free and the *gradient underneath it* is not.
+    let grad_bias = PricedBias { min_edges: 0, ..PricedBias::new(PriceSource::Gradient, 0.0) };
+    bench("PricedBias::bias (gradient)", &mut |(g, p, m, st)| {
+        buf.clear();
+        buf.resize(st.len(), 1.0);
+        grad_bias.bias(g, *p, *m, st, &mut buf);
+        std::hint::black_box(&buf);
+    });
+    bench("PricedBias::bias (plan-named temple)", &mut |(g, p, m, st)| {
+        buf.clear();
+        buf.resize(st.len(), 1.0);
+        pnamed.bias(g, *p, *m, st, &mut buf);
+        std::hint::black_box(&buf);
+    });
+    bench("plan::temple_target (the naming)", &mut |(g, _p, m, _st)| {
+        std::hint::black_box(tzolkin::plan::temple_target(g, *m));
+    });
+
+    // Every arm again over `Take` nodes only. `PricedBias` abstains on every
+    // other phase -- `EffectPrice` reads a `Choice` and nothing else has one --
+    // so averaging it over a walk that is 71% `Mode` and `PickWorker` nodes
+    // divides its cost by the nodes it declined to look at. This is the table
+    // to quote.
+    let take_only: Vec<_> = nodes
+        .iter()
+        .filter(|(_, p, _, _)| matches!(p, Phase::Take { .. }))
+        .cloned()
+        .collect();
+    let bench2 = |name: &str, f: &mut dyn FnMut(&(GameState, Phase, PlayerId, Vec<Step>))| {
+        let t0 = std::time::Instant::now();
+        let (mut reps, mut edges) = (0usize, 0usize);
+        while t0.elapsed().as_secs_f64() < 1.5 {
+            for n in &take_only {
+                f(n);
+                edges += n.3.len();
+            }
+            reps += 1;
+        }
+        println!(
+            "  {name:<34} {:>8.2} us/node  {:>8.1} ns/edge",
+            t0.elapsed().as_secs_f64() * 1e6 / (reps * take_only.len()) as f64,
+            t0.elapsed().as_secs_f64() * 1e9 / edges as f64
+        );
+    };
+    println!("\n=== cost on `Take` nodes only ({} of {}) ===", take_only.len(), nodes.len());
+    bench2("PlanBias::bias", &mut |(g, p, m, st)| {
+        buf.clear();
+        buf.resize(st.len(), 1.0);
+        plan_bias.bias(g, *p, *m, st, &mut buf);
+        std::hint::black_box(&buf);
+    });
+    bench2("PlanBias::bias (+named temple)", &mut |(g, p, m, st)| {
+        buf.clear();
+        buf.resize(st.len(), 1.0);
+        named_bias.bias(g, *p, *m, st, &mut buf);
+        std::hint::black_box(&buf);
+    });
+    bench2("PricedBias::bias (gradient)", &mut |(g, p, m, st)| {
+        buf.clear();
+        buf.resize(st.len(), 1.0);
+        grad_bias.bias(g, *p, *m, st, &mut buf);
+        std::hint::black_box(&buf);
+    });
+    bench2("PricedBias::bias (plan-named)", &mut |(g, p, m, st)| {
+        buf.clear();
+        buf.resize(st.len(), 1.0);
+        pnamed.bias(g, *p, *m, st, &mut buf);
+        std::hint::black_box(&buf);
+    });
+    bench2("  of which: the 17 gradient probes", &mut |(g, _p, m, _st)| {
+        std::hint::black_box(tzolkin::plan::PricedBias::gradient(g, *m));
+    });
+    bench2("  of which: EffectPrice::choice", &mut |(_g, _p, _m, st)| {
+        let price = tzolkin::options::EffectPrice::default();
+        for step in st {
+            if let Step::Take(c) = step {
+                std::hint::black_box(price.choice(c));
+            }
+        }
+    });
+    bench2("OnePlyBias::bias (the baseline)", &mut |(g, p, m, st)| {
         buf.clear();
         buf.resize(st.len(), 1.0);
         one_ply.bias(g, *p, *m, st, &mut buf);
@@ -1034,6 +1259,12 @@ struct Args {
     /// absent `Option` is the only way to be sure of that.
     bias: f32,
     bias_place: bool,
+    /// Credit a temple step only on the temple `plan::temple_target` names.
+    bias_named: bool,
+    /// `PricedBias` source: "grad", "flat" or "named". Empty leaves it off.
+    priced: String,
+    /// Points per step of climb the plan adds to its temple in `PricedBias`.
+    priced_w: f32,
     /// Run the plan-blind control: same edges, same strength, no leader test.
     bias_blind: bool,
     /// Use `OnePlyBias` at this temperature instead of `PlanBias`. Negative
@@ -1072,6 +1303,14 @@ impl Args {
     /// scratch buffer and the multiply entirely when the `Option` is empty, so
     /// this is the only construction that is *provably* the unbiased search.
     fn bias(&self) -> Option<std::sync::Arc<dyn PriorBias>> {
+        if !self.priced.is_empty() {
+            let source = match self.priced.as_str() {
+                "grad" => PriceSource::Gradient,
+                "flat" => PriceSource::PlanFlat,
+                _ => PriceSource::PlanNamed,
+            };
+            return Some(std::sync::Arc::new(PricedBias::new(source, self.priced_w)));
+        }
         if self.bias_1ply >= 0.0 {
             return Some(std::sync::Arc::new(OnePlyBias {
                 ev: self.evaluator()(),
@@ -1085,6 +1324,7 @@ impl Args {
             w: BiasWeights {
                 k: self.bias,
                 place: self.bias_place,
+                name_temple: self.bias_named,
                 blind: self.bias_blind,
                 ..BiasWeights::OFF
             },
@@ -1297,6 +1537,9 @@ fn parse() -> Args {
         sims,
         bias,
         bias_place,
+        bias_named: argv.iter().any(|a| a == "--bias-named"),
+        priced: get("--priced").unwrap_or_default(),
+        priced_w: get("--priced-w").and_then(|v| v.parse().ok()).unwrap_or(4.0),
         bias_blind,
         bias_1ply,
         cand_ev,
@@ -1317,6 +1560,7 @@ fn main() {
         "--sched", "--shrink", "--flat", "--engine", "--board", "--only", "--drop", "--focus", "--reach", "--draft", "--k", "--blocks",
         "--games", "--seed", "--out", "--resume", "--help",
         "--sims", "--bias", "--bias-place", "--bias-blind", "--bias-1ply", "--cand-ev", "--priors",
+        "--bias-named", "--priced", "--priced-w",
     ]);
     match args.cmd.as_str() {
         "compare" => {
