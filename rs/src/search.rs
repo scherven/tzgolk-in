@@ -124,6 +124,13 @@ pub struct Config {
     /// against each other in one arena process. Delete with the `nocache` spec
     /// flag once the measurement is banked.
     pub cache: bool,
+    /// AB-HARNESS (temporary): index `widths` by the *mover's own* turn number
+    /// rather than by ply. Under `Greedy` the three opponent plies are width 1
+    /// whatever `widths` says, so ply indexing spends entries 1..3 on nobody
+    /// and hands the root player's second turn `widths[4]`.
+    pub own_width: bool,
+    /// AB-HARNESS (temporary): keep the shortlist cache across turns of a game.
+    pub keep_tt: bool,
 }
 
 impl Default for Config {
@@ -146,6 +153,8 @@ impl Default for Config {
             root_budget: Some(crate::eval::FULL_BUDGET),
             keep: 10,
             cache: true,
+            own_width: false,
+            keep_tt: false,
         }
     }
 }
@@ -205,6 +214,9 @@ pub struct Stats {
     pub partial: bool,
     /// Legal moves at the root. Always the whole set.
     pub root_moves: usize,
+    /// How long the exhaustive first ply took. The rest of `elapsed` is
+    /// deepening, so the two together say which half a slow turn was spent in.
+    pub root_elapsed: Duration,
     pub elapsed: Duration,
 }
 
@@ -295,7 +307,9 @@ impl Search {
         self.deadline = started + self.cfg.budget;
         self.root = p;
         self.stats = Stats::default();
-        self.tt.clear();
+        if !self.cfg.keep_tt {
+            self.tt.clear();
+        }
 
         let g = &{
             let mut probe = *g;
@@ -309,6 +323,7 @@ impl Search {
             eval::margin(s, p)
         });
         self.stats.root_moves = roots.total;
+        self.stats.root_elapsed = started.elapsed();
         if roots.moves.is_empty() {
             roots.note = "no legal move".into();
             return roots;
@@ -436,7 +451,16 @@ impl Search {
         // evaluation prefers. The min over a single child is that child, so the
         // rest of this function needs no special case.
         let width = if maximizing || self.cfg.opponents == Opponents::Paranoid {
-            self.cfg.width_at(ply)
+            // Under `Greedy` a ply index counts three opponent plies that are
+            // width 1 no matter what `widths` holds, so `widths[1..3]` is spent
+            // on nobody and the root player's second turn gets `widths[4]`.
+            // Counting the mover's own turns instead makes the taper mean what
+            // it reads like.
+            if self.cfg.own_width && self.cfg.opponents == Opponents::Greedy {
+                self.cfg.width_at(ply / N_PLAYERS)
+            } else {
+                self.cfg.width_at(ply)
+            }
         } else {
             1
         };

@@ -74,6 +74,20 @@ const ACTION_VALUE: f32 = 2.4;
 /// Rounds a worker typically spends riding a gear between actions.
 const ROUNDS_PER_ACTION: f32 = 2.6;
 
+/// What one round of one worker's throughput costs, in points: the price of
+/// leaving a worker standing on a gear for one more rotation instead of taking
+/// the action under it.
+///
+/// This is what stops a worker being valued at whatever the top of its gear
+/// pays. The old code discounted a later space by a flat 0.85 *regardless of
+/// distance*, so a worker on Chichen space 1 was priced at the 13-point space
+/// nine rotations away, and every worker on a gear scored the same. Charging
+/// per space ridden is worth **+2.02 centred points** (95% CI +1.21..+2.83,
+/// 500 rotation blocks / 2000 games, `heuristic:32` both sides).
+///
+/// Sweeping it is what set the value; see the note in `board_position`.
+const TEMPO_PER_ROUND: f32 = 0.52;
+
 // ---- the evaluator -----------------------------------------------------
 
 /// The estimate, term by term. Every field is in points and they sum to
@@ -382,13 +396,28 @@ fn research_step_value(s: Science, level: u8) -> f32 {
     }
 }
 
-/// What this player's workers are standing on.
+/// What this player's workers are standing on, **over and above** the generic
+/// action `engine_value` has already paid them for.
 ///
 /// A worker's value is the action it will eventually take, not its distance
 /// along a gear. A worker one space from a double build is worth far more than
 /// one three spaces along Palenque, and the old `pos * 0.2` could not say so.
+///
+/// It is a *differential* rather than an outright price because `engine_value`
+/// already pays every unlocked worker `ACTION_VALUE` per `ROUNDS_PER_ACTION`
+/// rounds, whether it is in hand or on a gear. Paying the space value on top of
+/// that counted a placed worker's next action twice, so placing always beat
+/// holding by construction. The calibration study measured the damage: fitting
+/// the realised final score on the components, centred across the four seats of
+/// one position, gave this term a coefficient of **-0.44** — and negative in
+/// every one of the nine day buckets, so it was steering the search the wrong
+/// way for the whole game rather than only at one end of it.
+/// (`tests/rules.rs::evaluator_calibration`.)
 fn board_position(g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
     let mut v = 0.0;
+    if rounds_left <= 0.0 {
+        return 0.0;
+    }
 
     for w in g.on_board(p) {
         let Some((gear, pos)) = g.loc(w).on_board() else {
@@ -399,27 +428,28 @@ fn board_position(g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
         let reach = last.min(pos.0.saturating_add(rounds_left as u8));
 
         // It can act now, or wait for something better up the gear. Waiting
-        // costs tempo and risks the gear turning past the calendar's end.
-        let now = space_value(g, p, gear, pos.0);
-        let mut best_later: f32 = 0.0;
+        // costs a round of this worker's own throughput per space ridden --
+        // which is the only thing that stops every worker on a gear being
+        // valued at whatever the top of that gear pays. The old flat 0.85
+        // multiplier did not depend on the distance, so a worker on Chichen
+        // space 1 was priced at the 13-point space nine rotations away.
+        let mut worth = space_value(g, p, gear, pos.0);
         for j in (pos.0 + 1)..=reach {
-            best_later = best_later.max(space_value(g, p, gear, j) * 0.85);
+            let waited = (j - pos.0) as f32 * TEMPO_PER_ROUND;
+            worth = worth.max(space_value(g, p, gear, j) - waited);
         }
-        let mut worth = now.max(best_later);
 
         // A worker on the top space is picked up by the next rotation whether
         // its owner wants it or not: take it this turn or lose the action.
         if pos.0 == last {
             worth *= 0.5;
         }
-        // And nothing is worth anything once the calendar is done.
-        if rounds_left <= 0.0 {
-            worth = 0.0;
-        }
         v += worth;
     }
 
     // The first player space: the corn pot, the marker, and the extra day.
+    // Differential for the same reason -- that worker is spending its action
+    // here rather than on a gear.
     if let Some(w) = g.first_player_space {
         if w.owner() == p {
             v += g.accumulated_corn as f32 / CORN_PER_POINT + 1.2;

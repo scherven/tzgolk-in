@@ -2650,6 +2650,17 @@ fn parse_minimax(rest: Option<&str>) -> Result<crate::search::Config, String> {
             match f {
                 "nocache" => cfg.cache = false,
                 "cache" => cfg.cache = true,
+                "ownwidth" => cfg.own_width = true,
+                "keeptt" => cfg.keep_tt = true,
+                f if f.starts_with("w=") => {
+                    cfg.widths = f[2..]
+                        .split('.')
+                        .map(|x| x.parse::<usize>().unwrap_or(1).max(1))
+                        .collect();
+                    if cfg.widths.is_empty() {
+                        return Err("minimax w= needs at least one width".into());
+                    }
+                }
                 other => return Err(format!("minimax flag {other:?} unknown")),
             }
         }

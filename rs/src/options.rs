@@ -476,32 +476,40 @@ pub fn dedup(mut v: Vec<Choice>) -> Vec<Choice> {
 /// space is required to offer it (`doing_nothing_is_always_an_option`) --
 /// without the exemption a space whose action is pure corn, like Palenque 1,
 /// would lose it to its own payout.
-pub fn dominated_dedup(v: Vec<Choice>) -> Vec<Choice> {
+pub fn dominated_dedup(mut v: Vec<Choice>) -> Vec<Choice> {
     // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
     if !pruning_on() {
         return dedup(v);
     }
-    // `(is skip, non-corn effects, -net corn, choice)`: sorting on that puts
-    // every rival spelling of one outcome in a run, cheapest first, and parks
-    // the empty choice in a bucket of its own.
-    let mut keyed: Vec<(bool, Effects, i32, Choice)> = v
-        .into_iter()
-        .map(|c| {
-            let key: Effects = c
-                .0
+    // Order by "what it does, ignoring the price", then by price. That puts
+    // every rival spelling of one outcome in a run with the cheapest first, so
+    // the survivors are the heads of the runs. The key is compared as an
+    // iterator rather than materialised, because this runs at every node of the
+    // retrieval walk and a per-choice allocation there is not free.
+    let same_action = |a: &Choice, b: &Choice| {
+        a.is_skip() == b.is_skip()
+            && a.0
                 .iter()
-                .copied()
                 .filter(|e| !matches!(e, Effect::Corn(_)))
-                .collect();
-            let cost = -c.net_corn();
-            (c.is_skip(), key, cost, c)
-        })
-        .collect();
-    keyed.sort_unstable();
-    keyed.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-    let mut out: Vec<Choice> = keyed.into_iter().map(|(_, _, _, c)| c).collect();
-    out.sort();
-    out
+                .cmp(b.0.iter().filter(|e| !matches!(e, Effect::Corn(_))))
+                .is_eq()
+    };
+    v.sort_unstable_by(|a, b| {
+        a.is_skip()
+            .cmp(&b.is_skip())
+            .then_with(|| {
+                a.0.iter()
+                    .filter(|e| !matches!(e, Effect::Corn(_)))
+                    .cmp(b.0.iter().filter(|e| !matches!(e, Effect::Corn(_))))
+            })
+            .then_with(|| b.net_corn().cmp(&a.net_corn()))
+            .then_with(|| a.cmp(b))
+    });
+    v.dedup_by(|a, b| same_action(a, b));
+    // Back into `Choice` order, which is what every other generator returns and
+    // what makes the traversal order of `legal_moves` stable.
+    v.sort_unstable();
+    v
 }
 
 /// Monument definitions are static; this is here so callers don't reach past

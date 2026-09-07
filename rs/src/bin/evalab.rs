@@ -599,8 +599,15 @@ fn play_block(seed: u64, cand: &dyn Agent, base: &dyn Agent) -> Vec<Out> {
         let seats: [bool; N_PLAYERS] = std::array::from_fn(|i| i == c);
         let agents: [&dyn Agent; N_PLAYERS] =
             std::array::from_fn(|s| if seats[s] { cand } else { base });
+        // Common random numbers: every seating of a block plays from the *same*
+        // play RNG, not `bin/arena`'s per-seating offset. Both agents here are
+        // deterministic at temperature 0, so under the null (identical
+        // evaluators) the four games of a block are the same game and the block
+        // mean is exactly zero — all remaining variance comes from the change
+        // under test. `bin/arena` offsets instead because it wants four
+        // different games from one deal; this wants a matched pair.
         let mut rng =
-            <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed.wrapping_mul(0x9E37_79B9) ^ c as u64);
+            <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed.wrapping_mul(0x9E37_79B9));
         let r = play_game(seed, &agents, &cfg, &mut rng);
         let sc: [f64; N_PLAYERS] = std::array::from_fn(|s| r.scores[s] as f64);
         let table = sc.iter().sum::<f64>() / N_PLAYERS as f64;
@@ -623,6 +630,7 @@ fn mean(v: &[Out], f: impl Fn(&Out) -> f64) -> f64 {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--eqcheck") { eqcheck(); return; }
     let argv: Vec<String> = std::env::args().collect();
     let get = |n: &str| argv.iter().position(|a| a == n).and_then(|i| argv.get(i + 1)).cloned();
     let games: usize = get("--games").and_then(|v| v.parse().ok()).unwrap_or(400);
@@ -759,4 +767,25 @@ fn main() {
 /// per-block JSONL flush to make a kill lossless.
 fn ctrlc_lite(_f: impl Fn() + Send + 'static) -> Result<(), ()> {
     Ok(())
+}
+
+// --- scratch equality check ---
+fn eqcheck() {
+    use tzolkin::game::Game;
+    let mut worst = 0.0f32;
+    let mut n = 0;
+    for seed in 0..200u64 {
+        let mut g = Game::new(seed);
+        for _ in 0..(seed % 20) {
+            if g.state.over { break; }
+            g.play_round();
+        }
+        for p in PlayerId::ALL {
+            let a = tzolkin::eval::heuristic(&g.state, p);
+            let b = frozen::heuristic(&g.state, p);
+            if (a - b).abs() > worst { worst = (a-b).abs(); }
+            n += 1;
+        }
+    }
+    println!("eqcheck: {n} states, max |live - frozen| = {worst:e}");
 }

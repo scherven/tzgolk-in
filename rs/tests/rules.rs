@@ -1312,6 +1312,7 @@ fn evaluator_calibration() {
     /// finally scored.
     struct Row {
         day: u8,
+        state: GameState,
         est: [f32; N_PLAYERS],
         parts: [Components; N_PLAYERS],
         margin: [f32; N_PLAYERS],
@@ -1334,6 +1335,7 @@ fn evaluator_calibration() {
                 .filter(|n| n.flags & flags::TURN_ROOT != 0 && !n.state.over)
                 .map(|n| Row {
                     day: n.state.day,
+                    state: n.state,
                     est: std::array::from_fn(|i| heuristic(&n.state, PlayerId(i as u8))),
                     parts: std::array::from_fn(|i| components(&n.state, PlayerId(i as u8))),
                     margin: std::array::from_fn(|i| margin(&n.state, PlayerId(i as u8))),
@@ -1552,6 +1554,96 @@ fn evaluator_calibration() {
         println!();
     }
 
+    // ---- 2c. what one unit of each raw holding is worth -----------------
+    //
+    // The component fit above cannot separate `held` from `liquidation`: both
+    // are near-linear in the same block count, so only their sum is
+    // identified. This fit sidesteps that by regressing on the *holdings*
+    // themselves — one column per resource — again centred across the four
+    // seats of a position. The coefficient is then what one more stone, one
+    // more skull or one more worker is worth in realised final points, which
+    // is exactly the number `src/eval.rs`'s constants are guesses at.
+    const RAW: [&str; 18] = [
+        "points", "corn", "wood", "stone", "gold", "skull", "corn_tile", "wood_tile",
+        "workers", "on_board", "free_wkr", "discount", "temple_pts", "temple_stp",
+        "research", "buildings", "monuments", "fp_tile",
+    ];
+    let raw_of = |g: &GameState, p: PlayerId| -> [f64; 18] {
+        let pl = &g.players[p.idx()];
+        let temple_pts: i32 = Temple::ALL
+            .iter()
+            .map(|&t| {
+                let step = g.temple_pos(p, t) as usize;
+                tzolkin::data::temples::TEMPLES[t.idx()].points[step] as i32
+            })
+            .sum();
+        let temple_stp: u32 = Temple::ALL.iter().map(|&t| g.temple_pos(p, t) as u32).sum();
+        [
+            pl.points as f64,
+            pl.corn as f64,
+            pl.get(Resource::Wood) as f64,
+            pl.get(Resource::Stone) as f64,
+            pl.get(Resource::Gold) as f64,
+            pl.get(Resource::Skull) as f64,
+            pl.corn_tiles as f64,
+            pl.wood_tiles as f64,
+            g.n_unlocked(p) as f64,
+            g.on_board(p).count() as f64,
+            pl.free_workers as f64,
+            pl.worker_discount as f64,
+            temple_pts as f64,
+            temple_stp as f64,
+            g.research[p.idx()].iter().map(|&l| l as f64).sum(),
+            pl.n_buildings() as f64,
+            pl.n_monuments() as f64,
+            pl.may_skip_day as u8 as f64,
+        ]
+    };
+    let fe_raw = |sel: &dyn Fn(&Row) -> bool| -> (Vec<Vec<f64>>, Vec<f64>) {
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for r in rows.iter().filter(|r| sel(r)) {
+            let t: Vec<[f64; 18]> = (0..N_PLAYERS)
+                .map(|i| raw_of(&r.state, PlayerId(i as u8)))
+                .collect();
+            let tbar: [f64; 18] = std::array::from_fn(|k| {
+                (0..N_PLAYERS).map(|i| t[i][k]).sum::<f64>() / N_PLAYERS as f64
+            });
+            let ybar = r.outcome.iter().sum::<f32>() as f64 / N_PLAYERS as f64;
+            for i in 0..N_PLAYERS {
+                let mut row = vec![1.0];
+                row.extend((0..18).map(|k| t[i][k] - tbar[k]));
+                x.push(row);
+                y.push(r.outcome[i] as f64 - ybar);
+            }
+        }
+        (x, y)
+    };
+    println!(
+        "\n-- marginal value of one unit, in realised final points --\n\
+         (centred across the four seats of a position; `now` is what \n\
+          src/eval.rs currently pays for the same unit)\n{:>12}  {:>8}  {:>8}  {:>8}",
+        "holding", "sd", "day 0-8", "day 18-26"
+    );
+    let (xa, ya) = fe_raw(&|r| r.day <= 8);
+    let (xb, yb) = fe_raw(&|r| r.day >= 18);
+    let (xall, yall) = fe_raw(&|_| true);
+    let (ca, cb, call) = (
+        ridge(&xa, &ya, 1e-2),
+        ridge(&xb, &yb, 1e-2),
+        ridge(&xall, &yall, 1e-2),
+    );
+    for (k, name) in RAW.iter().enumerate() {
+        let col: Vec<f64> = xall.iter().map(|r| r[k + 1]).collect();
+        println!(
+            "{:>12}  {:>8.2}  {:>8.2}  {:>8.2}   (all {:>5.2})",
+            name,
+            sd(&col),
+            ca[k + 1],
+            cb[k + 1],
+            call[k + 1],
+        );
+    }
+
     // ---- 3. ordering ---------------------------------------------------
     //
     // For a search, ranking beats calibration: what matters is whether the
@@ -1633,4 +1725,114 @@ fn evaluator_calibration() {
         print!("{}-{}:{:.3}({:.1}/{:.1})  ", b * 3, b * 3 + 2, corr(&e, &a), sd(&e), sd(&a));
     }
     println!("\n");
+}
+
+// ---- dominated options -------------------------------------------------
+//
+// These pin the pruning in `options::dominated_dedup`, `affordable_costs` and
+// `moves::choices_for_worker`: they assert that a *redundant* option is gone,
+// never that a distinct one is, so a rule change that widens the move space
+// still passes and only a rule change that narrows it can trip them.
+
+/// A worker on a free-choice space never pays to walk down its own gear.
+///
+/// Yaxchilan's top spaces repeat the whole gear for nothing, so nothing there
+/// can cost corn -- and before the step-down prune, a worker on space 6 offered
+/// Yaxchilan 1's single wood for five corn.
+#[test]
+fn free_choice_space_never_buys_what_it_already_has() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.players[p.idx()].corn = 30;
+
+    for pos in [6u8, 7] {
+        for c in tzolkin::moves::choices_for_worker(&g.state, p, Gear::Yaxchilan, Pos(pos)) {
+            assert!(
+                c.net_corn() >= 0,
+                "Yaxchilan:{pos} charged {} corn for an action it gives away: {c}",
+                -c.net_corn()
+            );
+        }
+    }
+}
+
+/// Uxmal's mirror sells any lower action for one corn, so stepping down to that
+/// same action for two or more is the same play at a worse price.
+#[test]
+fn the_mirror_undercuts_stepping_down() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.players[p.idx()].corn = 20;
+
+    // Uxmal 3 unlocks a worker; from space 5 the mirror reaches it for one corn
+    // and the two-space walk down reaches it for two.
+    let unlocks: Vec<Choice> = tzolkin::moves::choices_for_worker(&g.state, p, Gear::Uxmal, Pos(5))
+        .into_iter()
+        .filter(|c| c.0.contains(&Effect::UnlockWorker))
+        .collect();
+    assert!(!unlocks.is_empty(), "the mirror should reach Uxmal 3");
+    for c in &unlocks {
+        assert_eq!(
+            c.net_corn(),
+            -1,
+            "unlocking is available for one corn; this pays more: {c}"
+        );
+    }
+}
+
+/// The architecture discount is not an offer a player may decline: refusing it
+/// hands a block back to the bank and changes nothing else.
+#[test]
+fn a_builder_never_pays_the_listed_price() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.research[p.idx()][Science::Architecture.idx()] = 3; // builder
+    g.state.players[p.idx()].res = [8, 8, 8, 0];
+
+    let mut checked = 0;
+    for c in tzolkin::options::building_choices(&g.state, p, None, true, 0) {
+        // `payment_effects` writes the cost immediately before the card.
+        let cut = c.0.iter().position(|e| matches!(e, Effect::Build(_))).unwrap();
+        let Effect::Build(id) = c.0[cut] else { unreachable!() };
+        let listed: i32 = Resource::BLOCKS
+            .iter()
+            .map(|&r| tzolkin::data::buildings::def(id).cost[r.idx()] as i32)
+            .sum();
+        if listed == 0 {
+            continue;
+        }
+        let paid: i32 = c.0[..cut]
+            .iter()
+            .map(|e| match e {
+                Effect::Res(_, n) if *n < 0 => -(*n as i32),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(paid, listed - 1, "full price paid with a discount going spare: {c}");
+        checked += 1;
+    }
+    assert!(checked > 0, "no buildable card to check");
+}
+
+/// Two advances are one decision however they are spelled: which track goes
+/// first, and which block pays for which half, are not choices a player makes.
+#[test]
+fn two_advances_are_offered_once_per_outcome() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.players[p.idx()].res = [2, 2, 2, 0];
+    g.state.research[p.idx()] = [0, 1, 3, 0];
+
+    for free in [false, true] {
+        let mut seen = std::collections::HashSet::new();
+        for c in tzolkin::options::research_choices(&g.state, p, 2, free) {
+            let mut probe = g.state;
+            c.apply(&mut probe, p);
+            assert!(
+                seen.insert(probe),
+                "two spellings of one pair of advances (free={free}): {c}"
+            );
+        }
+        assert!(!seen.is_empty());
+    }
 }

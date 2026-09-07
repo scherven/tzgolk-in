@@ -12,7 +12,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tzolkin::effect::Effect;
 use tzolkin::game::Game;
 use tzolkin::ids::*;
@@ -33,7 +33,7 @@ struct Sized_ {
     capped: bool,
 }
 
-fn size_of_move_space(g: &GameState, p: PlayerId, cap: Duration) -> Sized_ {
+fn size_of_move_space(g: &GameState, p: PlayerId, cap: usize) -> Sized_ {
     let mut place = 0usize;
     let mut retrieve = 0usize;
     let mut capped = false;
@@ -42,11 +42,11 @@ fn size_of_move_space(g: &GameState, p: PlayerId, cap: Duration) -> Sized_ {
         place += 1;
         ControlFlow::Continue(())
     });
-    let mut n = 0u64;
+    // Capped by move count, not by wall clock: the cut has to fall in the same
+    // place in both runs however loaded the machine is.
     let _ = moves::visit_moves_of(g, p, Kinds::Retrievals, |_| {
         retrieve += 1;
-        n += 1;
-        if n % 2048 == 0 && t.elapsed() > cap {
+        if retrieve >= cap {
             capped = true;
             return ControlFlow::Break(());
         }
@@ -92,8 +92,8 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let games: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(8);
     let spec = args.next().unwrap_or_else(|| "heuristic:32".into());
-    let cap_ms: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(20000);
-    let cap = Duration::from_millis(cap_ms);
+    let cap: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    let cap_ms = cap;
 
     let agent = parse_agent(&spec, false).expect("agent");
     let wall = Instant::now();
@@ -295,7 +295,7 @@ fn main() {
     set_prune(true);
 
     println!(
-        "\n=== pruned vs unpruned on identical positions ({} of {} comparable, cap {cap_ms}ms) ===",
+        "\n=== pruned vs unpruned on identical positions ({} of {} comparable, cap {cap_ms} moves) ===",
         a.len(),
         positions.len()
     );
