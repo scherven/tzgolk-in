@@ -101,6 +101,23 @@ route, which is the kind of agreement worth more than either number alone.
 * `docs/TRAINING.md:552-554` describes truncation behaviour that is now wrong
   twice over.
 
+## Runs cut for the deadline
+
+The `status.sh` ETA column exists to be acted on. Killed at 02:20, with their
+partial JSONL left in place so `--resume` can finish them if the picture
+changes:
+
+| run | state when cut | why |
+| --- | --- | --- |
+| `mcts:32768:cp=0.01` | 2/600 blocks after 12 min | ETA 3,533 min against 930 remaining |
+| `mcts:65536:cp=0.02` | 0/600 after 2.5 min | a single block had not completed |
+| `mcts:2720` vs `2048` | 5/3,500 after 1.4 min | 3,500 blocks is a 979-min target |
+
+Load was 74 on 14 cores, so these were not merely doomed, they were taking
+cores from runs that can finish. **The very high sims arms are the ones to cut
+first**: cost scales with the budget while the measured return on it is small
+even now that the axis is live, so they are the worst ratio on the machine.
+
 ## Coupling worth knowing
 
 `src/mcts.rs:1573` calls `eval::heuristic` **directly** to order edges, so the
