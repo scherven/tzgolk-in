@@ -1613,3 +1613,25 @@ machine with ~2 GB free.
 against the 366 that `mc/cost.sh` measures in user CPU for the same spec. Quote
 the ratio from this table, never the milliseconds; user CPU is in the 06:23
 entry.)
+
+### 2026-09-08 07:12 — the `pmin` increment is drifting down as blocks accumulate; watch it
+
+`v8-8192pmin2 - v8-8192cp002`, paired on seed, as the block count grows:
+
+| paired blk | centred | 95% CI | p |
+|---|---|---|---|
+| 28 | +2.92 | +1.06..+4.77 | 0.0013 |
+| 46 | +3.06 | +1.43..+4.68 | 0.00016 |
+| 53 | +2.99 | +1.51..+4.48 | 5.7e-05 |
+| **66** | **+2.33** | **+1.01..+3.66** | **4.9e-04** |
+
+Every reading is inside the previous interval, so nothing is contradicted — but
+the point estimate has fallen by a fifth and the direction of travel is down.
+On the v6 platform the same contrast settled at +4.73 over 50 blocks. **Quote
+the v8 increment as "about two to three points, still tightening"**, and take
+the final value from the highest block count on file rather than from this
+entry.
+
+Unchanged and not drifting: `v8-champ-vs-greedy - v8-oldchamp-vs-greedy` =
+**+10.40 (CI +9.29..+11.51, 110 paired blocks, p = 9e-77)**, and the champion
+takes **72.3%** of its games against three stateless greedy agents.
