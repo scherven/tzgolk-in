@@ -2518,3 +2518,114 @@ fn evaluator_starvation_ignores_income_it_has_not_earned() {
         "corn already in hand covers the bill"
     );
 }
+
+/// The board table is scaled per *gear*, because it prices what a space hands
+/// over and never what it charges.
+///
+/// `evalab --promise`'s `dead` column measures the consequence: the fraction of
+/// standing workers for which the evaluator, offered the action under them,
+/// declines it. Palenque and Yaxchilan, which only gather, read 0.00 and 0.01;
+/// Chichen reads 0.5 to 0.7, because the skull it spends is held at
+/// `3.0 + SKULL_PREMIUM` = 5.2 while the bottom of the gear pays 4 printed
+/// points. So Chichen was over-paid and Palenque under-paid, and
+/// `eval::GEAR_SCALE` is 0.7 and 1.5 there. `docs/FINDINGS-eval.md` F26d, F27.
+///
+/// Both pins put one worker on the **top** space of a gear, where
+/// `board_position` takes no maximum over a ride and every worker is halved by
+/// the same top-of-gear discount, so the only thing between two of them is the
+/// gear scale.
+#[test]
+fn evaluator_scales_the_board_table_by_gear() {
+    use tzolkin::eval::components;
+
+    let p = PlayerId(0);
+    let top_of = |gear: Gear| {
+        let mut g = fresh();
+        // A skull, so Chichen is not gated down to its no-skull floor.
+        g.state.players[p.idx()].res[Resource::Skull.idx()] = 1;
+        let w = GameState::worker_ids(p).next().unwrap();
+        g.state.place_worker(w, gear, Pos(gear.size() - 1));
+        let with = components(&g.state, p).board;
+        let mut bare = fresh();
+        bare.state.players[p.idx()].res[Resource::Skull.idx()] = 1;
+        // The same position without the worker, so what is left is the worker.
+        with - components(&bare.state, p).board
+    };
+
+    let (palenque, yaxchilan) = (top_of(Gear::Palenque), top_of(Gear::Yaxchilan));
+    let (chichen, tikal) = (top_of(Gear::Chichen), top_of(Gear::Tikal));
+    for (name, v) in [
+        ("palenque", palenque),
+        ("yaxchilan", yaxchilan),
+        ("chichen", chichen),
+        ("tikal", tikal),
+    ] {
+        assert!(v > 0.0, "{name} credits its worker nothing: the fixture is wrong");
+    }
+
+    // The raw table pays Palenque's top 2.6 and Yaxchilan's 3.4, so unscaled
+    // this ordering runs the other way. Nothing but `GEAR_SCALE` can flip it.
+    assert!(
+        palenque > yaxchilan,
+        "the corn gear must outprice the resource gear at the top after the \
+         re-price: palenque {palenque}, yaxchilan {yaxchilan}"
+    );
+
+    // The raw table pays Chichen's top 10.5 against Tikal's 5.2, a ratio of
+    // 2.02; at 0.7 it is 1.41. The bracket excludes both the unscaled value and
+    // any scale below about 0.6.
+    let ratio = chichen / tikal;
+    assert!(
+        (1.2..1.7).contains(&ratio),
+        "chichen/tikal at the top should be about 1.41 after the re-price and \
+         2.02 before it, got {ratio}"
+    );
+}
+
+/// A corn space is not worth the same to everyone.
+///
+/// `GEAR_SCALE` says the corn gear is worth half again what the hand table
+/// pays; `HUNGRY_CORN` says that to a player who cannot pay the next food bill
+/// out of the corn in hand it is worth a quarter more again. Once
+/// `CORN_INCOME_PER_ROUND` went to zero, corn's worth to such a player is the
+/// three points a head `starvation_risk` is charging them, and a flat
+/// multiplier cannot say so. `docs/FINDINGS-eval.md` F27b, F29, F29a.
+#[test]
+fn evaluator_pays_more_for_corn_when_the_food_day_is_unpaid() {
+    use tzolkin::eval::components;
+
+    let p = PlayerId(0);
+    // What one worker on the top of a gear is worth, differenced against the
+    // same position with no worker on the board.
+    let worker_worth = |corn: u8, gear: Gear| {
+        let mut g = fresh();
+        g.state.players[p.idx()].corn = corn;
+        let w = GameState::worker_ids(p).next().unwrap();
+        g.state.place_worker(w, gear, Pos(gear.size() - 1));
+        let with = components(&g.state, p).board;
+        let mut bare = fresh();
+        bare.state.players[p.idx()].corn = corn;
+        with - components(&bare.state, p).board
+    };
+
+    // Solve for the feeding bill rather than assuming it: the smallest holding
+    // that stops `starvation_risk` firing is what the workers eat.
+    let starve = |corn: u8| {
+        let mut g = fresh();
+        g.state.players[p.idx()].corn = corn;
+        components(&g.state, p).starvation
+    };
+    let bill = (0u8..40).find(|&c| starve(c) == 0.0).expect("nobody ever eats here");
+    assert!(bill > 0, "the fixture has no feeding bill, so the test proves nothing");
+
+    let ratio = worker_worth(bill - 1, Gear::Palenque) / worker_worth(bill, Gear::Palenque);
+    assert!(
+        ratio > 1.05,
+        "a worker on the corn gear must be worth more to a player one corn short \
+         of the food bill than to one who can pay it: ratio {ratio}"
+    );
+
+    // Only the corn gear may move with the corn in hand.
+    let (h, f) = (worker_worth(bill - 1, Gear::Yaxchilan), worker_worth(bill, Gear::Yaxchilan));
+    assert!((h - f).abs() < 1e-4, "the resource gear moved too: {h} against {f}");
+}

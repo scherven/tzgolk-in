@@ -111,17 +111,26 @@ const ACTION_VALUE: f32 = 0.2;
 /// over its whole gear as if no other worker of its own and no opponent were
 /// competing for those spaces.
 ///
-/// Halving the term is the largest single effect measured on this file:
+/// Halving the term was the largest single effect ever measured on this file:
 /// **+10.48 greedy:64 [+9.07, +11.89] and +9.04 mcts:256 [+7.86, +10.23]** at
-/// 150 blocks. The optimum is a plateau, not a digit — 0.35, 0.40 and 0.50 are
-/// mutually indistinguishable on both agents while 0.25 and 0.70 are clearly
-/// worse — so read this as "about a half". `docs/FINDINGS-eval.md` F5a, F7.
+/// 150 blocks, on a plateau over 0.35..0.50 with 0.25 and 0.70 clearly worse.
+///
+/// **That plateau moved when [`GEAR_SCALE`] landed**, and the direction is up
+/// rather than down: on the new table 0.40 is −0.99 [−1.33, −0.65], 0.55 is
+/// +0.56 [+0.29, +0.82], 0.65 is +1.36 [+0.88, +1.85] and 0.70 is +1.41
+/// [+1.02, +1.83], all `mcts:256` against the 0.5 it replaces. This is not
+/// level compensation — `GEAR_SCALE`'s n-weighted mean is 0.98, and a 2% cut in
+/// the table is not answered by a 30% rise in its scale. What changed is the
+/// *shape*: Chichen's entries came down 30% and Palenque's went up 50%, and a
+/// term whose value is a max over a gear responds to the mix, not the mean.
+/// 0.65 rather than 0.70 because they are indistinguishable and 0.65 is the
+/// interior one. `docs/FINDINGS-eval.md` F5a, F7, F29c.
 ///
 /// Do **not** also subtract the placed worker from `engine_value`'s action
 /// count. That corrects the same double count a second time and measures
 /// −12.09 / −9.95 with a 0.028 win rate, the worst configuration in the log
 /// after ungating the space table entirely (F5b).
-const BOARD_SCALE: f32 = 0.5;
+const BOARD_SCALE: f32 = 0.65;
 
 /// [`temple_outlook`] is *under*-priced, which is the one thing nobody
 /// expected: scaling it alone is monotone improving from 0.5 to 1.4 on both
@@ -570,6 +579,9 @@ fn board_position(g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
     if rounds_left <= 0.0 {
         return 0.0;
     }
+    // Once per position rather than once per space considered: the loop below
+    // runs up to the width of a gear for every placed worker.
+    let hungry = hungry(g, p);
 
     for w in g.on_board(p) {
         let Some((gear, pos)) = g.loc(w).on_board() else {
@@ -585,10 +597,10 @@ fn board_position(g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
         // valued at whatever the top of that gear pays. The old flat 0.85
         // multiplier did not depend on the distance, so a worker on Chichen
         // space 1 was priced at the 13-point space nine rotations away.
-        let mut worth = space_value(g, p, gear, pos.0);
+        let mut worth = space_value_scaled(g, p, gear, pos.0, hungry);
         for j in (pos.0 + 1)..=reach {
             let waited = (j - pos.0) as f32 * TEMPO_PER_ROUND;
-            worth = worth.max(space_value(g, p, gear, j) - waited);
+            worth = worth.max(space_value_scaled(g, p, gear, j, hungry) - waited);
         }
 
         // A worker on the top space is picked up by the next rotation whether
@@ -616,12 +628,101 @@ fn board_position(g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
     v
 }
 
+/// Per-gear correction on the hand table, indexed by `Gear::ALL`:
+/// Palenque, Yaxchilan, Tikal, Uxmal, Chichen.
+///
+/// The hand numbers are right *within* a gear and were wrong *between* gears,
+/// and the reason is structural: [`space_value`] prices what a space hands over
+/// and never what it charges. `evalab --promise`'s `dead` column measures the
+/// consequence — the fraction of standing workers for which the evaluator,
+/// offered the action, declines it and skips. Palenque and Yaxchilan, whose
+/// actions are pure gathering, read **0.00 and 0.01**. Chichen reads **0.5 to
+/// 0.7**, because a skull is held at `3.0 + SKULL_PREMIUM` = 5.2 through
+/// `liquidation` and `held_premium` while the bottom of the gear pays 4 printed
+/// points, so the evaluator will not cash a skull there and the table prices
+/// those spaces as if it would. Tikal 1 reads **0.99**: a research advance
+/// costs 1/2/3 blocks (`options::recurse`) and at `RESEARCH_SCALE = 0.05` is
+/// worth a tenth of one.
+///
+/// **Only two of the five move.** The sizes are the arena's, not the
+/// diagnostic's — `--promise` reads Uxmal as *under*-priced and shrinking it a
+/// quarter measures **+1.80 on `greedy:64` and −0.46 on `mcts:256`**, the
+/// largest greedy/MCTS sign split in `docs/FINDINGS-eval.md`. What survives the
+/// search is Chichen, the gear whose payout is points a deeper search cannot
+/// improve on: **+0.38 [+0.13, +0.64] mcts:256 at 400 blocks**, +0.36 greedy.
+/// Palenque rides along at +0.11 [−0.09, +0.30] alone and +0.17 [−0.03, +0.38]
+/// paired on top of Chichen; the pair is **+0.56 [+0.29, +0.83] mcts:256 and
+/// +1.04 [+0.79, +1.30] greedy:64**. Palenque's own interval covers zero — it
+/// is here on the strength of the pair and of a sharp greedy optimum (1.25 is
+/// +0.23, 1.5 is +0.64, 2.0 is −0.59, 2.5 is −12.8), so drop it first if this
+/// ever has to shrink. Yaxchilan loses in *both* directions and Tikal's greedy
+/// gain did not get an MCTS tier.
+/// `docs/FINDINGS-eval.md` F26b-F26e, F27.
+const GEAR_SCALE: [f32; 5] = [1.5, 1.0, 1.0, 1.0, 0.7];
+
+/// Extra multiplier on the Palenque table for a player who cannot pay the next
+/// food bill out of the corn already in hand.
+///
+/// [`GEAR_SCALE`] says the corn gear is worth half again what the table pays.
+/// This says it is not worth the same to everyone. Once
+/// [`CORN_INCOME_PER_ROUND`] went to zero, corn's worth to a player who is
+/// short is the three points a head [`starvation_risk`] is charging them, and
+/// to a player who is not it is a quarter point plus [`CORN_PREMIUM`]; a flat
+/// multiplier cannot say that and a gate can. The test is the one
+/// `starvation_risk` fires on, without its arithmetic.
+///
+/// **The three agents rank this knob three different ways**, which is why it is
+/// 0.25 and not larger. `greedy:64` at 800 blocks reads +0.19 / +1.73 / +1.06 /
+/// +1.31 / **−1.90** / **−16.01** at 0.10 / 0.20 / 0.25 / 0.33 / 0.50 / 1.00 —
+/// jagged, because a gate's effect is discontinuous in how often it flips a
+/// max-over-the-gear comparison, and off a cliff by 0.5. `mcts:256` is monotone
+/// *increasing* over the same range (+0.06 / +0.33 / +1.02 / +1.06), and
+/// `mcts:1024:cp=0.05`, the deep search, reads **+1.62 [+0.66, +2.59] at 0.20**
+/// where `mcts:256` reads +0.06. 0.25 is the largest value that is positive on
+/// every agent measured; past 0.33 the one-ply agent that every screening
+/// measurement in this file uses loses two points, and an evaluator nobody can
+/// screen against is not worth the extra tenth.
+///
+/// An earlier attempt landed 1.0 and was retracted within two minutes: `pneed`
+/// was swept against a base whose Palenque scale was 1.0, and carrying the same
+/// constant onto [`GEAR_SCALE`]'s 1.5 made the total 3.0 — the configuration
+/// that reads −16 on greedy. Two MCTS runs on disjoint seeds had both endorsed
+/// it. `docs/FINDINGS-eval.md` F29a. Worth **+1.15 [+0.75, +1.55] * on `mcts:256`** at 298 blocks against the evaluator `GEAR_SCALE` landed, and **+1.29 [+0.59, +1.99] *** on a disjoint seed set — the larger of the two effects this run found, and the only one whose greedy reading (+1.48) and search reading agree in size rather than only in sign.
+/// `docs/FINDINGS-eval.md` F27b, F28c, F28f.
+const HUNGRY_CORN: f32 = 0.25;
+
 /// Point-equivalent of the action at one board space.
 ///
 /// Hand-priced against the space generators in `src/spaces`. Gated where the
 /// action needs something the player may not have: Chichen without a skull is
-/// worth nothing, and neither is a build with no blocks.
+/// worth nothing, and neither is a build with no blocks. [`GEAR_SCALE`] then
+/// corrects the level of the gear as a whole.
 fn space_value(g: &GameState, p: PlayerId, gear: Gear, pos: u8) -> f32 {
+    space_value_scaled(g, p, gear, pos, hungry(g, p))
+}
+
+/// [`space_value`] with the hungry test already answered, so `board_position`
+/// can hoist it out of its loop over the reachable gear.
+fn space_value_scaled(g: &GameState, p: PlayerId, gear: Gear, pos: u8, hungry: bool) -> f32 {
+    let mut scale = GEAR_SCALE[gear as usize];
+    if hungry && gear == Gear::Palenque {
+        scale *= 1.0 + HUNGRY_CORN;
+    }
+    scale * space_value_raw(g, p, gear, pos)
+}
+
+/// Whether `p` cannot pay the next food bill out of the corn in hand. The same
+/// test [`starvation_risk`] fires on, without its arithmetic.
+fn hungry(g: &GameState, p: PlayerId) -> bool {
+    let pl = &g.players[p.idx()];
+    let mouths = g.n_unlocked(p);
+    let free = (pl.free_workers as usize).min(mouths);
+    let each = 2u8.saturating_sub(pl.worker_discount);
+    (mouths - free) as f32 * each as f32 > pl.corn as f32
+}
+
+/// [`space_value`] before [`GEAR_SCALE`]: the hand table as it was written.
+fn space_value_raw(g: &GameState, p: PlayerId, gear: Gear, pos: u8) -> f32 {
     let pl = &g.players[p.idx()];
     match gear {
         // Corn and wood. The jungle spaces climb 5/7/9 corn or 2/3/4 wood.

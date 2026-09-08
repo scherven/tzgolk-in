@@ -36,7 +36,7 @@ use rayon::prelude::*;
 use tzolkin::ids::*;
 use tzolkin::phase::{Evaluation, Evaluator, Phase};
 use tzolkin::record::{
-    play_game, Agent, Candidates, GameConfig, GreedyAgent, SearchAgent, Summary,
+    play_game, Agent, Candidates, GameConfig, GreedyAgent, Summary,
 };
 use tzolkin::state::GameState;
 
@@ -242,6 +242,79 @@ pub mod v {
         /// Never swept; it becomes worth more once `starvation_risk` stops
         /// assuming income (F23).
         pub food_saving: f32,
+        /// Per-space multipliers on the *gated* hand table, for the five spaces
+        /// `--promise` says disagree most with the rest of the evaluator.
+        /// Multiplying rather than replacing keeps every affordability gate,
+        /// which F2 showed is most of what the table is worth.
+        pub tik1: f32,
+        pub tik3: f32,
+        pub tik5: f32,
+        pub uxm3: f32,
+        pub chi: f32,
+        /// Whole-gear multipliers on the *gated* hand table. `--promise` reads
+        /// the table's error as one common factor plus outliers, but the common
+        /// factor is not common: n-weighted `want/table` is 4.18 on Palenque,
+        /// 3.27 Yaxchilan, 3.08 Uxmal, 2.03 Tikal, 1.52 Chichen against an
+        /// all-board 2.33 (F26). `space_scale` cannot express that tilt and
+        /// `Space::Calib` moves every space at once; these move one gear.
+        pub g_pal: f32,
+        pub g_yax: f32,
+        pub g_tik: f32,
+        pub g_uxm: f32,
+        /// Weight on the food day *after* the next one in `starvation_risk`.
+        ///
+        /// The committed term looks at one food day and stops, so a player who
+        /// can feed six workers this time and has nothing coming scores zero
+        /// risk. That was defensible while the search saw one turn; a search
+        /// that descends six turns already sees the next food day itself, and
+        /// what it cannot see is the one after. Zero reproduces the committed
+        /// term exactly.
+        pub starve_next2: f32,
+        /// Extra multiplier on the Palenque table for a player who cannot pay
+        /// the *next* food bill out of the corn in hand.
+        ///
+        /// `pal` is a flat re-price of the corn gear and it peaks at 1.5 (F26c),
+        /// but a corn space is not worth the same to everyone: after
+        /// `CORN_INCOME_PER_ROUND = 0.0`, corn's value to a player who is short
+        /// is the 3 points a head that `starvation_risk` is charging them, and
+        /// to a player who is not it is 1/4 a point. A flat multiplier cannot
+        /// say that; this is the gate-shaped version of the same correction.
+        pub pal_need: f32,
+        /// Three constants inside `board_position` that have never been swept:
+        /// the flat part of the first-player space, the unused first-player
+        /// tile's free calendar day, and the discount on a worker sitting on
+        /// the top space of a gear (it is picked up next rotation whether its
+        /// owner wants it or not, so half its space is what it is worth).
+        /// Points subtracted from every entry of a gear whose action *charges*
+        /// the player for its payout, floored at the ungated 0.1.
+        ///
+        /// F26d: `space_value` prices what a space hands over and never what it
+        /// takes, so the gears that charge — Chichen a skull, Tikal blocks for
+        /// research and building, Uxmal corn — are over-paid relative to
+        /// Palenque and Yaxchilan, which charge nothing. A *shift* is the right
+        /// shape for that and a scale is not: the cost is the same at the
+        /// bottom of a gear as at the top, so it is the low spaces that are
+        /// mispriced most, and those are exactly where `dead` is highest.
+        pub chi_sub: f32,
+        pub tik_sub: f32,
+        pub uxm_sub: f32,
+        pub fp_bonus: f32,
+        pub skip_day: f32,
+        pub top_worker: f32,
+        /// The cap on `actions_each` in `engine_value`. At 2.6 rounds an action
+        /// and a 27-day calendar the cap binds for the first eleven days, so
+        /// this — not `ROUNDS_PER_ACTION`, which is collinear with
+        /// `ACTION_VALUE` — is the knob that prices a worker's early-game
+        /// throughput.
+        pub action_cap: f32,
+        /// The `lvl == 2` "one short of the top" bonus in `engine_value`.
+        /// Never swept; it survived `RESEARCH_SCALE` untouched because it is
+        /// outside the scaled sum.
+        pub near_top: f32,
+        /// The rounds over which `held_premium`'s spendability fades in:
+        /// `(rounds_left / spend_fade).min(1.0)`. Never swept, and it gates
+        /// every holding premium at once.
+        pub spend_fade: f32,
         pub held_scale: f32,
         pub monument_scale: f32,
         pub starve_scale: f32,
@@ -260,12 +333,19 @@ pub mod v {
     ///
     /// `action_value`, `board_scale` and `temple_scale` were moved here from
     /// (1.2, 1.0, 1.0) when `docs/FINDINGS-eval.md` F11 landed the re-pricing,
-    /// and `research_scale` (0.5), `corn_income` (1.9) and `ceiling` (false)
-    /// when F24 landed the second one, so
-    /// `--ab 'board=0.5,av=0.2,temple=1.4,rs=0.05,ci=0.0,ceiling'` is now the
-    /// null and must measure 0 against this. The pre-F24 evaluator is
-    /// `--base 'rs=0.5,ci=1.9,noceiling'`.
+    /// `research_scale` (0.5), `corn_income` (1.9) and `ceiling` (false) when
+    /// F24 landed the second one, `g_pal` (1.0) and `chi` (1.0) when F28 landed
+    /// `GEAR_SCALE`, and `pal_need` (0.0) and `board_scale` (0.5) when F29
+    /// landed `HUNGRY_CORN` and re-fitted `BOARD_SCALE` on the new table. So
+    /// the null is now `--ab 'board=0.65,av=0.2,temple=1.4,rs=0.05,ci=0.0,
+    /// ceiling,pal=1.5,chi=0.7,pneed=0.25'` and must measure 0 against this.
+    /// The pre-F24 evaluator is `--base 'rs=0.5,ci=1.9,noceiling'`, the pre-F28
+    /// one is `--base 'pal=1,chi=1,pneed=0,board=0.5'`, and the pre-F29 one is
+    /// `--base 'pneed=0,board=0.5'`.
     pub const HEAD: V = V {
+        g_pal: 1.5,
+        chi: 0.7,
+        pal_need: 0.25,
         action_value: 0.2,
         tempo: 0.52,
         building_value: 0.45,
@@ -279,7 +359,7 @@ pub mod v {
         contend_monument: false,
         charge_placed: false,
         hand_lag: 1.0,
-        board_scale: 0.5,
+        board_scale: 0.65,
         engine_scale: 1.0,
         temple_scale: 1.4,
         t_near: 0.85,
@@ -303,6 +383,23 @@ pub mod v {
         urgency: 0.25,
         urgency_floor: 0.3,
         food_saving: 1.0,
+        tik1: 1.0,
+        tik3: 1.0,
+        tik5: 1.0,
+        uxm3: 1.0,
+        g_yax: 1.0,
+        g_tik: 1.0,
+        g_uxm: 1.0,
+        starve_next2: 0.0,
+        chi_sub: 0.0,
+        tik_sub: 0.0,
+        uxm_sub: 0.0,
+        fp_bonus: 1.2,
+        skip_day: 0.6,
+        top_worker: 0.5,
+        action_cap: 6.0,
+        near_top: 0.4,
+        spend_fade: 6.0,
         held_scale: 1.0,
         monument_scale: 1.0,
         starve_scale: 1.0,
@@ -394,7 +491,7 @@ pub mod v {
 
     fn held_premium(vr: &V, g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
         let pl = &g.players[p.idx()];
-        let spendable = (rounds_left / 6.0).min(1.0);
+        let spendable = (rounds_left / vr.spend_fade).min(1.0);
         if spendable <= 0.0 {
             return 0.0;
         }
@@ -554,7 +651,7 @@ pub mod v {
         let pl = &g.players[p.idx()];
         let mut v = 0.0;
 
-        let actions_each = (rounds_left / ROUNDS_PER_ACTION).min(6.0);
+        let actions_each = (rounds_left / ROUNDS_PER_ACTION).min(vr.action_cap);
         let workers = g.n_unlocked(p) as f32;
         let mut acts = workers * actions_each;
         if vr.charge_placed {
@@ -582,7 +679,7 @@ pub mod v {
                 v += research_step_value(s, l) * uses * vr.research_scale;
             }
             if lvl == 2 && horizon > 0.15 {
-                v += 0.4;
+                v += vr.near_top;
             }
         }
 
@@ -725,11 +822,11 @@ pub mod v {
 
         if let Some(w) = g.first_player_space {
             if w.owner() == p {
-                v += g.accumulated_corn as f32 / CORN_PER_POINT + 1.2;
+                v += g.accumulated_corn as f32 / CORN_PER_POINT + vr.fp_bonus;
             }
         }
         if g.players[p.idx()].may_skip_day && rounds_left > 2.0 {
-            v += 0.6;
+            v += vr.skip_day;
         }
         v
     }
@@ -765,7 +862,7 @@ pub mod v {
             worth = worth.max(sv(j) - waited);
         }
         if pos == last {
-            worth *= 0.5;
+            worth *= vr.top_worker;
         }
         worth
     }
@@ -849,7 +946,20 @@ pub mod v {
                     * vr.space_scale
             }
             (Space::Table, _) | (_, Pricer::None) => {
-                let base = table_space_value(vr, g, p, gear, pos);
+                let mut base =
+                    table_space_value(vr, g, p, gear, pos) * space_mul_g(vr, g, p, gear, pos);
+                // The action's price to the player, for the gears that have one.
+                let sub = match gear {
+                    Gear::Chichen => vr.chi_sub,
+                    // Tikal 6/7 are the "any of the above" spaces and 0 is the
+                    // entry space; only the five that really charge are moved.
+                    Gear::Tikal if (1..=5).contains(&pos) => vr.tik_sub,
+                    Gear::Uxmal if pos == 1 || pos == 4 => vr.uxm_sub,
+                    _ => 0.0,
+                };
+                if sub > 0.0 && base > 0.1 {
+                    base = (base - sub).max(0.1);
+                }
                 if vr.gates {
                     base.min(gate_ceiling(g, p, gear, pos))
                 } else {
@@ -972,6 +1082,38 @@ pub mod v {
                 [0.0, 3.0, 3.8, 4.6, 5.4, 6.2, 6.8, 8.0, 9.0, 10.5, 10.5][(pos as usize).min(10)]
             }
         }
+    }
+
+    /// The targeted per-space multipliers, 1.0 unless a variant sets one.
+    fn space_mul_g(vr: &V, g: &GameState, p: PlayerId, gear: Gear, pos: u8) -> f32 {
+        let mut m = space_mul(vr, gear, pos);
+        if vr.pal_need > 0.0 && gear == Gear::Palenque {
+            // Short of the next food bill on the corn in hand. The same test
+            // `starvation_risk` fires on, without its arithmetic.
+            let pl = &g.players[p.idx()];
+            if owed_at(g, p).is_some_and(|owed| owed > pl.corn as f32) {
+                m *= 1.0 + vr.pal_need;
+            }
+        }
+        m
+    }
+
+    fn space_mul(vr: &V, gear: Gear, pos: u8) -> f32 {
+        let per_gear = match gear {
+            Gear::Palenque => vr.g_pal,
+            Gear::Yaxchilan => vr.g_yax,
+            Gear::Tikal => vr.g_tik,
+            Gear::Uxmal => vr.g_uxm,
+            Gear::Chichen => vr.chi,
+        };
+        per_gear
+            * match (gear, pos) {
+                (Gear::Tikal, 1) => vr.tik1,
+                (Gear::Tikal, 3) => vr.tik3,
+                (Gear::Tikal, 5) => vr.tik5,
+                (Gear::Uxmal, 3) => vr.uxm3,
+                _ => 1.0,
+            }
     }
 
     pub fn table_space_value(vr: &V, g: &GameState, p: PlayerId, gear: Gear, pos: u8) -> f32 {
@@ -1133,26 +1275,52 @@ pub mod v {
     }
 
     fn starvation_risk(vr: &V, g: &GameState, p: PlayerId) -> f32 {
-        let Some(next) = RESOURCE_DAYS
+        let mut days = RESOURCE_DAYS
             .iter()
             .chain(POINT_DAYS.iter())
             .copied()
             .filter(|&d| d > g.day)
-            .min()
-        else {
+            .collect::<Vec<_>>();
+        days.sort_unstable();
+        let Some(&next) = days.first() else {
             return 0.0;
         };
+        let mut v = one_food_day(vr, g, p, next, 0.0);
+        // The day after the next one, at `starve_next2`. A player who can pay
+        // this bill and has nothing coming scores zero under the committed
+        // term; the corn it will have spent on the first day is charged before
+        // the second is priced.
+        if vr.starve_next2 > 0.0 {
+            if let Some(&after) = days.get(1) {
+                let owed_now = owed_at(g, p).unwrap_or(0.0);
+                v += vr.starve_next2 * one_food_day(vr, g, p, after, owed_now);
+            }
+        }
+        v
+    }
 
+    /// The feeding bill, or `None` when the player owes nothing on any day.
+    fn owed_at(g: &GameState, p: PlayerId) -> Option<f32> {
         let pl = &g.players[p.idx()];
         let mouths = g.n_unlocked(p);
         let free = (pl.free_workers as usize).min(mouths);
         let each = 2u8.saturating_sub(pl.worker_discount);
         if each == 0 {
-            return 0.0;
+            return None;
         }
-        let owed = (mouths - free) as f32 * each as f32;
-        let rounds = (next - g.day) as f32;
-        let expected = pl.corn as f32 + rounds * vr.corn_income;
+        Some((mouths - free) as f32 * each as f32)
+    }
+
+    /// Points expected to be lost on the food day at `day`, with `spent` corn
+    /// already committed to earlier days.
+    fn one_food_day(vr: &V, g: &GameState, p: PlayerId, day: u8, spent: f32) -> f32 {
+        let pl = &g.players[p.idx()];
+        let each = 2u8.saturating_sub(pl.worker_discount);
+        let Some(owed) = owed_at(g, p) else {
+            return 0.0;
+        };
+        let rounds = (day - g.day) as f32;
+        let expected = (pl.corn as f32 - spent).max(0.0) + rounds * vr.corn_income;
         let short = owed - expected;
         if short <= 0.0 {
             return 0.0;
@@ -1274,6 +1442,26 @@ fn variant(name: &str) -> Option<v::V> {
                             "urg" => out.urgency = f,
                             "ufl" => out.urgency_floor = f,
                             "fs" => out.food_saving = f,
+                            "tik1" => out.tik1 = f,
+                            "tik3" => out.tik3 = f,
+                            "tik5" => out.tik5 = f,
+                            "uxm3" => out.uxm3 = f,
+                            "chi" => out.chi = f,
+                            "pal" => out.g_pal = f,
+                            "yax" => out.g_yax = f,
+                            "tik" => out.g_tik = f,
+                            "uxm" => out.g_uxm = f,
+                            "sn2" => out.starve_next2 = f,
+                            "pneed" => out.pal_need = f,
+                            "chisub" => out.chi_sub = f,
+                            "tiksub" => out.tik_sub = f,
+                            "uxmsub" => out.uxm_sub = f,
+                            "fp" => out.fp_bonus = f,
+                            "skipd" => out.skip_day = f,
+                            "topw" => out.top_worker = f,
+                            "acap" => out.action_cap = f,
+                            "ntop" => out.near_top = f,
+                            "spend" => out.spend_fade = f,
                             "calib" => {
                                 out.space = Space::Calib;
                                 out.calib_alpha = f;
@@ -1690,13 +1878,13 @@ fn cmd_promise(pos: &[(GameState, PlayerId)], take: usize) {
     use tzolkin::phase::{ModeChoice, Step};
     let vr = v::HEAD;
 
-    // (gear, pos) -> (n, sum promise, sum delivery, sum sv_now)
-    type Cell = (usize, f64, f64, f64);
-    let rows: Vec<(usize, u8, f64, f64, f64)> = pos
+    // (gear, pos) -> (n, sum promise, sum delivery, sum sv_now, n dead)
+    type Cell = (usize, f64, f64, f64, usize);
+    let rows: Vec<(usize, u8, f64, f64, f64, bool)> = pos
         .par_iter()
         .take(take)
         .flat_map_iter(|(g0, p)| {
-            let mut out: Vec<(usize, u8, f64, f64, f64)> = Vec::new();
+            let mut out: Vec<(usize, u8, f64, f64, f64, bool)> = Vec::new();
             let mut g = *g0;
             // Beg is a real decision; take the "don't beg" edge so the position
             // is the one the turn started from.
@@ -1736,6 +1924,13 @@ fn cmd_promise(pos: &[(GameState, PlayerId)], take: usize) {
                     promise as f64,
                     (best - before) as f64 + promise as f64,
                     sv_now as f64,
+                    // "Dead": once the worker's board credit is added back,
+                    // taking this action leaves the estimate where it was — the
+                    // space hands over something the evaluator does not price.
+                    // A mean delivery near zero can mean every instance is
+                    // small or that the positive and negative ones cancel;
+                    // only this column separates them.
+                    ((best - before) + promise).abs() < 0.05,
                 ));
             }
             out.into_iter()
@@ -1744,12 +1939,13 @@ fn cmd_promise(pos: &[(GameState, PlayerId)], take: usize) {
 
     let mut cells: std::collections::BTreeMap<(usize, u8), Cell> = Default::default();
     let (mut np, mut sp, mut sd) = (0usize, 0.0f64, 0.0f64);
-    for (gi, pp, pr, de, sv) in &rows {
+    for (gi, pp, pr, de, sv, dead) in &rows {
         let c = cells.entry((*gi, *pp)).or_default();
         c.0 += 1;
         c.1 += pr;
         c.2 += de;
         c.3 += sv;
+        c.4 += *dead as usize;
         np += 1;
         sp += pr;
         sd += de;
@@ -1769,8 +1965,8 @@ fn cmd_promise(pos: &[(GameState, PlayerId)], take: usize) {
         sd / sp
     );
     println!(
-        "{:>10} {:>4} {:>7} {:>9} {:>9} {:>8} {:>8}",
-        "gear", "pos", "n", "promise", "deliver", "table", "want"
+        "{:>10} {:>4} {:>7} {:>9} {:>9} {:>8} {:>8} {:>6}",
+        "gear", "pos", "n", "promise", "deliver", "table", "want", "dead"
     );
     for ((gi, pp), c) in &cells {
         if c.0 < 10 {
@@ -1778,13 +1974,14 @@ fn cmd_promise(pos: &[(GameState, PlayerId)], take: usize) {
         }
         let n = c.0 as f64;
         println!(
-            "{:>10} {pp:>4} {:>7} {:>9.3} {:>9.3} {:>8.2} {:>8.2}",
+            "{:>10} {pp:>4} {:>7} {:>9.3} {:>9.3} {:>8.2} {:>8.2} {:>6.2}",
             format!("{:?}", Gear::ALL[*gi]),
             c.0,
             c.1 / n,
             c.2 / n,
             c.3 / n,
-            (c.2 / n) / vr.board_scale as f64
+            (c.2 / n) / vr.board_scale as f64,
+            c.4 as f64 / n
         );
     }
     println!("-- machine readable: gear pos n table want --");
@@ -2197,7 +2394,14 @@ enum Kind {
     Greedy(Candidates),
     /// `Mcts` at a fixed simulation count — the same count on both sides, so
     /// the comparison is the evaluator and not the search effort.
-    Search(u32),
+    ///
+    /// The second field is `MctsConfig::c_puct_init`, negative for "leave the
+    /// default alone". It is here because the committed default (2.0) stops the
+    /// descent after about one turn, and an evaluator measured against a search
+    /// that cannot look ahead is not necessarily the one that helps a search
+    /// that can — every term about the *future* is exactly where the two differ.
+    /// `docs/OVERNIGHT.md`, `mcts.rs::MctsConfig::c_puct_init`.
+    Search(u32, f32),
 }
 
 fn agent_for(kind: Kind, vr: v::V, name: &'static str, seed: u64) -> Box<dyn Agent> {
@@ -2207,12 +2411,20 @@ fn agent_for(kind: Kind, vr: v::V, name: &'static str, seed: u64) -> Box<dyn Age
             cands: c,
             record: false,
         }),
-        Kind::Search(sims) => Box::new(SearchAgent::new(
-            Arc::new(VEval(vr, name)) as Arc<dyn Evaluator>,
-            sims,
-            false,
-            seed,
-        )),
+        Kind::Search(sims, cp) => {
+            let mut cfg = tzolkin::mcts::MctsConfig::default();
+            if cp >= 0.0 {
+                cfg.c_puct_init = cp;
+            }
+            Box::new(tzolkin::record::SearchAgent::with_config(
+                Arc::new(VEval(vr, name)) as Arc<dyn Evaluator>,
+                sims,
+                false,
+                tzolkin::record::Exploration::Off,
+                cfg,
+                seed,
+            ))
+        }
     }
 }
 
@@ -2460,8 +2672,14 @@ fn main() {
         let kind = match spec.split_once(':') {
             Some(("greedy", "full")) => Kind::Greedy(Candidates::All),
             Some(("greedy", k)) => Kind::Greedy(Candidates::Sampled(k.parse().unwrap())),
-            Some(("mcts", n)) => Kind::Search(n.parse().unwrap()),
-            _ => panic!("--agent is greedy:full, greedy:K or mcts:N"),
+            // `mcts:N` or `mcts:N:cp=X`. Both arms get the same `cp`, so the
+            // comparison stays the evaluator; what changes is how deep the
+            // search that is reading it looks.
+            Some(("mcts", rest)) => match rest.split_once(":cp=") {
+                Some((n, cp)) => Kind::Search(n.parse().unwrap(), cp.parse().unwrap()),
+                None => Kind::Search(rest.parse().unwrap(), -1.0),
+            },
+            _ => panic!("--agent is greedy:full, greedy:K, mcts:N or mcts:N:cp=X"),
         };
         let games: u64 = get("--games").and_then(|v| v.parse().ok()).unwrap_or(400);
         let blocks = games.div_ceil(N_PLAYERS as u64);

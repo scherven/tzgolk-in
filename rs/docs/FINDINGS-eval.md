@@ -1691,3 +1691,916 @@ New `V` knobs, all inert at their defaults and pinned by a null that reads
 +0.00: `tnear`, `tfar`, `thalf`, `climb`, `ceiling`/`noceiling`, `reach`,
 `handv`, `rs`, `calib`, `cp`, `bp`, `bb`, `sp`, `tp`, `ci`, `mgate`, `init`,
 `lc`, `urg`, `ufl`, `fs`.
+
+## F25. Salvaged from the killed predecessor: the post-landing knob wave
+
+The run that landed F24 was killed by a usage limit at ~03:15 with one wave
+complete on disk and unwritten. Recovered here. Binary `<scratch>/f3/evalab-p13`
+(rev `d7b4e42` + `bin/evalab.rs`), **400 blocks (1600 games) per cell on both
+agents**, base = the F24 evaluator, `<scratch>/f3/ab/k_*`. Platform check:
+`base` spread **0.63 greedy / 0.21 mcts** over the 400 shared seeds, and
+`k_null` (every knob written out at its committed value) reads **+0.00** exactly
+on both.
+
+| variant | greedy:64, 400 blk | mcts:256, 400 blk |
+| --- | --- | --- |
+| `bv=1.0` (`BUILDING_VALUE` 0.45 -> 1.0) | **−0.29** [−0.51, −0.06] * | −0.18 [−0.43, +0.06] |
+| `ci=0.20` | −0.32 [−0.68, +0.04] | −0.27 [−0.55, +0.00] |
+| `fs=0.5` (food-saving term halved) | −0.47 [−0.72, −0.23] * | −0.10 [−0.36, +0.16] |
+| `fs=1.5` | +0.24 [−0.06, +0.54] | −0.22 [−0.46, +0.02] |
+| `fs=2.5` | −1.34 [−1.74, −0.94] * | −0.77 [−1.12, −0.42] * |
+| `rs=0.0` | +0.07 [−0.02, +0.17] | −0.19 [−0.36, −0.01] * |
+| `rs=0.15` | −0.11 [−0.27, +0.06] | −0.22 [−0.43, −0.02] * |
+| `tempo=0.62` | +0.70 [+0.29, +1.11] * | **−0.31** [−0.62, −0.01] * |
+
+* **`BUILDING_VALUE = 1.0` has changed sign.** It was +0.34 greedy / +0.19 mcts
+  before F24 (F18, F21a) and is −0.29 * / −0.18 after it. The reason is
+  mechanical: `engine_value` pays `n_buildings * BUILDING_VALUE` *and*
+  `free_workers`/`worker_discount` through the food-saving term, and those two
+  permanent effects are the payoff of six of the fourteen age-1 cards. Once
+  `starvation_risk` stopped assuming income, the food-saving term got more
+  valuable, and doubling the flat card price on top over-counts the same cards.
+  **0.45 is right; stop sweeping it.**
+* **`food_saving` is at an optimum.** 0.5 and 2.5 both lose on both agents, 1.5
+  is +0.24 / −0.22. This term had never been swept. It is not the place the
+  building question lives either.
+* **`RESEARCH_SCALE = 0.05` is an interior optimum on MCTS**, which it was not
+  before: at 400 blocks 0.0 reads −0.19 * and 0.15 reads −0.22 *, so the two
+  neighbours the F20 plateau could not separate now both lose. F21a's
+  "0.0 edges out 0.10 by +0.29" is superseded — that was measured before
+  `CORN_INCOME_PER_ROUND` landed.
+* **`TEMPO_PER_ROUND = 0.62` is dead for the third time and now actively
+  harmful:** +0.70 * greedy, **−0.31 * MCTS**, intervals excluding zero in
+  *opposite directions* at 400 blocks. The greedy/MCTS sign split on this knob
+  is the most reliable one in the file.
+* `ci=0.20` re-confirms `CORN_INCOME_PER_ROUND = 0.0` from above.
+
+So every knob the F24 wave could think of is at a local optimum, and two of
+them (`bv`, `rs`) only became so *because* of F24 — measuring a constant against
+a mis-priced neighbour is what produced both of the earlier readings.
+
+## F26. `--promise` re-read on the landed evaluator, and the fourth kill of calibration
+
+`<scratch>/f3/promise3.txt` (`evalab-p13`, 50,793 standing workers over 29,984
+turn roots) is `--promise` re-run *after* F24 landed. F19's version was against
+the pre-F24 evaluator, and the landing moved it: overall promise 1.819 against
+delivery 2.947, a ratio of **1.62** where it was 1.49.
+
+The table's error is not one common factor. n-weighted `want / table` per gear:
+
+| gear | n | mean table | mean want | want/table | vs the 2.33 all-board mean |
+| --- | --- | --- | --- | --- | --- |
+| Palenque | 2,065 | 1.30 | 5.42 | **4.18** | 1.79 |
+| Yaxchilan | 10,430 | 1.58 | 5.17 | 3.27 | 1.40 |
+| Uxmal | 9,370 | 1.94 | 5.98 | 3.08 | 1.32 |
+| Tikal | 23,460 | 3.34 | 6.79 | 2.03 | 0.87 |
+| Chichen | 5,468 | 2.29 | 3.48 | **1.52** | 0.65 |
+
+`CORN_INCOME_PER_ROUND = 0.0` is why Palenque moved to the top: with
+`starvation_risk` no longer forgiving a shortfall, a corn gather now moves the
+whole estimate by several points where it used to move it by its liquidation
+value.
+
+### F26a. Tikal 1 delivers *nothing*, and it does not matter
+
+The single widest disagreement on the board, and it got wider with the landing:
+the first research space is priced at **2.00** and delivers **0.017** (F19 had
+it at 0.60). The cause is mechanical and is in `options::recurse` — **a research
+advance costs 1/2/3 blocks for levels 1/2/3**, and at `RESEARCH_SCALE = 0.05` an
+advance is worth ~0.1 while the block it costs is worth ~0.8. So the evaluator,
+offered the action, prefers `skip`, and the space hands over nothing at all.
+5,227 of 50,793 standing workers are on it.
+
+It is still not worth fixing. `tik1` multiplies that one table entry;
+**800 blocks (3,200 games), `greedy:64`, `<scratch>/f3/ab/m_tik1*`**, null +0.00:
+
+| `tik1` | 0.25 | 0.5 | 0.75 | 1.5 |
+| --- | --- | --- | --- | --- |
+| centred | +0.02 | +0.02 | +0.02 | −0.33 [−0.47, −0.18] * |
+
+Identical to two decimals across a 3x range, because `board_position` prices a
+worker by `max(sv(pos), max_j sv(j) − j·TEMPO)` and Tikal 1's 2.00 is already
+*below* what riding one space to Tikal 2 pays. **The act-now entry of a low
+space is nearly unreachable through the max**, so calibrating it is inert; only
+raising it past the ride value does anything, and that loses. The direction is
+right and the magnitude is 0.02 points.
+
+### F26b. The per-gear tilt is a disaster, except at the two ends
+
+Whole-gear multipliers, level-neutral in the joint (the n·table-weighted mean of
+the five is 1.000). 800 blocks, `greedy:64`:
+
+| variant | centred | 95% CI | win |
+| --- | --- | --- | --- |
+| `pal=1.5` | **+0.64** | [+0.42, +0.86] * | 0.269 |
+| `chi=0.7` | **+0.36** | [+0.15, +0.56] * | 0.252 |
+| `tik=0.85` | −2.14 | [−2.40, −1.88] * | 0.182 |
+| `yax=1.3` | −4.36 | [−4.64, −4.09] * | 0.100 |
+| `uxm=1.3` | −7.31 | [−7.62, −7.00] * | 0.094 |
+| `pal=1.79,yax=1.40,tik=0.87,uxm=1.32,chi=0.65` (the full tilt) | **−8.45** | [−8.68, −8.23] * | **0.018** |
+
+The tilt the diagnostic asks for is the worst configuration measured since
+ungating the table — a win rate of 0.018 against a null of 0.250 — which is the
+**fourth** independent kill of "make the space table agree with delivery"
+(`derived` −27.9 F2, `defer` +0.14 F5d, `calib` −6.2 F19a, and now this).
+
+But the two ends of the table are not the middle. `pal=1.5` and `chi=0.7` are
+the largest and smallest `want/table` gears and both help, in the direction the
+diagnostic predicts, while the three gears in between all lose badly. Swept out
+below before anything is claimed — these are `board_position`-internal knobs and
+F21a's `TEMPO_PER_ROUND` shows greedy can over-read that class by 8x.
+
+### F26c. The Palenque and Chichen ends, swept
+
+800 blocks, `greedy:64`, `<scratch>/f3/ab/m_*`, binary `evalab-p14`
+(rev `5318276` + `bin/evalab.rs`; `--eqcheck` 0e0 over 48,032 pairs).
+
+```
+  pal    1.00   1.25   1.50   2.00    2.50    3.00
+         null  +0.23  +0.64  -0.59  -12.81  -14.60
+  win    .250   .259   .269   .212    .008    .001
+```
+
+A sharp unimodal peak at **1.5** — a quadratic through 1.25/1.5/2.0 puts the
+vertex at 1.52 — and a cliff between 2.0 and 2.5 where the corn gear starts to
+dominate the board term outright and the agent parks every worker on it. This
+is the only gear whose price the diagnostic and the arena agree about.
+
+`spend_fade`, the number of rounds over which `held_premium` fades out, swept
+for the first time: **4 is −0.17** [−0.22, −0.11] *, **9 is +0.05** [−0.02,
++0.12]. The committed 6 is an interior optimum; do not re-sweep.
+
+```
+  chi    0.35   0.50   0.70   0.85   1.00
+        -0.50  -0.21  +0.36  +0.19   null
+```
+
+Chichen's peak is at **0.7**, worth +0.36 [+0.15, +0.56] *. The mechanism is
+visible in the table: a Chichen space is priced at the printed reward less
+about a point, but taking it *spends* a skull the evaluator is separately
+holding at `3.0 + SKULL_PREMIUM` = 5.2 through `liquidation` and `held_premium`.
+The netting is too small and 0.7 is what the arena says it should be.
+
+**The two are additive:** `pal=1.5,chi=0.7` reads **+1.04** [+0.79, +1.30] *,
+win 0.278, against a sum of parts of 1.00. `pal=2.0,chi=0.5` reads −0.86, so it
+is the two peaks and not the direction that carries it.
+
+Both are `board_position`-internal knobs, which is the class `TEMPO_PER_ROUND`
+showed greedy can over-read by 8x (F21a). Nothing lands until MCTS agrees.
+
+### F26d. The `dead` column: where the evaluator refuses its own action
+
+New column on `--promise` (`<scratch>/f3/promise5.txt`, binary `evalab-p17`):
+the fraction of standing workers for which `|delivery| < 0.05` — taking the best
+action at that space, with the worker's board credit added back, leaves the
+estimate exactly where it was. That is the evaluator **declining the action**.
+It separates "every instance is small" from "the mean is a cancellation", which
+a mean alone cannot.
+
+```
+  Tikal 1     0.99      Chichen 1   0.69     Palenque 1..7  0.00-0.01
+  Uxmal 1     0.57      Chichen 2   0.58     Yaxchilan 1..7 0.00-0.01
+  Tikal 3     0.56      Chichen 3   0.56
+  Uxmal 4     0.52      Chichen 4-9 0.49-0.57
+  Tikal 2/4   0.38/0.39 Uxmal 3     0.36
+```
+
+Two gears hand over what they promise every time. Three do not, and the pattern
+is not noise — **it is exactly the set of spaces whose action costs the player
+something the evaluator is already pricing.**
+
+* **`Tikal 1` at 0.99.** A research advance costs 1/2/3 blocks for levels 1/2/3
+  (`options::recurse`). At `RESEARCH_SCALE = 0.05` an advance is worth ~0.1 and
+  the block it spends is worth `BLOCK_PREMIUM + 1/4` ≈ 0.8, so the evaluator
+  skips 99 times out of 100 — while `board_position` pays that worker 1.70.
+  There is also no affordability gate on Tikal 1 or 3, though `gate_ceiling`
+  has one written (F2's `gates` variant, +0.01, measured when research was
+  worth ten times what it is now).
+* **Chichen at ~0.55 across the board.** A skull is held at `3.0 +
+  SKULL_PREMIUM` = 5.2 through `liquidation` and `held_premium`, and Chichen 1
+  pays 4 printed points and a temple step. So the evaluator will not cash a
+  skull at the bottom of the gear, and the table nonetheless prices those
+  spaces as if it would. **This is the mechanism behind `chi = 0.7`** (F26c),
+  found independently: the ×0.7 is the arena's estimate of how much of the
+  Chichen table is a payout the evaluator will never take.
+* `Uxmal 1` (pay blocks for a temple step) and `Uxmal 4` (build with corn) are
+  the same story with blocks and corn.
+
+The two live gears, Palenque and Yaxchilan, are the two whose actions are pure
+gains — you gather, you spend nothing — and they are the two the table
+*under*-prices (F26: `want/table` 4.18 and 3.27). **The board term's error is
+not a level and not a ranking: it is that `space_value` prices the payout of an
+action and never its cost**, so the gears that charge for their payout are
+over-paid relative to the gears that do not. `pal` up and `chi` down are the two
+ends of that one statement.
+
+### F26e. The other three gears, and `--promise` has the sign wrong on Uxmal
+
+Completing the gear sweep, same 800 blocks, `greedy:64`:
+
+| variant | centred | 95% CI | win |
+| --- | --- | --- | --- |
+| **`uxm=0.85`** | **+1.75** | [+1.48, +2.02] * | **0.304** |
+| `uxm=1.3` | −7.31 | [−7.62, −7.00] * | 0.094 |
+| `tik=1.15` | +0.34 | [+0.08, +0.60] * | 0.266 |
+| `tik=0.85` | −2.14 | [−2.40, −1.88] * | 0.182 |
+| `yax=0.85` | −1.72 | [−2.05, −1.40] * | 0.219 |
+| `yax=1.3` | −4.36 | [−4.64, −4.09] * | 0.100 |
+
+**`uxm=0.85` is the largest single-knob effect in this wave, +1.75 with a win
+rate of 0.304** — and `--promise` predicted the opposite sign. Uxmal's
+`want/table` is 3.08 against an all-board 2.33, which reads as *under*-priced,
+and the arena says shrink it. `yax` loses in both directions, so Yaxchilan is at
+an interior optimum, which the diagnostic also did not say.
+
+So the diagnostic is a *finder*, not a fitter, and this is now the fifth
+statement of the same thing: `--promise` locates the spaces where the evaluator
+disagrees with itself (`RESEARCH_SCALE` in F19b, and Chichen in F26d), and the
+sign and size of the fix have to come from the arena every time. Read it for
+mechanism, never for a coefficient.
+
+### F26f. The Uxmal plateau, and a second food day
+
+800 blocks, `greedy:64`, binary `evalab-p18` (`--eqcheck` 0e0, null +0.00):
+
+```
+  uxm    0.60   0.70   0.85   1.00   1.30
+        +1.82  +1.89  +1.75   null  -7.31
+```
+
+A broad plateau over **0.6..0.85** worth about **+1.8**, so this is "the Uxmal
+gear is worth three quarters of what the table says", not a digit. Uxmal 5, 6
+and 7 are the mirror space and the two "any of the above" spaces, priced at a
+flat 4.0 — the top of the gear, and therefore what `board_position`'s max prices
+every worker on it. The mirror's value is the best action *elsewhere*, which the
+table cannot know and guessed high.
+
+`starve_next2` — a new shape, not a constant: `starvation_risk` prices the food
+day **after** the next one as well, at weight k, charging the corn spent on the
+first day before pricing the second. The committed term looks at one day and
+stops, so a player who can pay this bill and has nothing coming scores zero risk.
+
+```
+  sn2    0.15   0.25   0.35   0.50   1.00
+           --   +0.35    --     --     --      (rest in flight)
+```
+
+`sn2 = 0.25` reads **+0.35 [+0.13, +0.57] *** at 800 blocks. Note the direction:
+`CORN_INCOME_PER_ROUND` said *stop* forecasting because the search will see it,
+and this says look *further* — they are consistent, because what the search can
+see is the next food day and what it cannot is the one after.
+
+Completed sweeps, 800 blocks, `greedy:64`:
+
+```
+  uxm    0.60   0.70   0.75   0.85   0.90   0.95   1.00   1.30
+        +1.82  +1.80  +1.77  +1.75  +1.22  +0.91   null  -7.31
+
+  sn2    0.25   0.50   1.00
+        +0.35  +0.48  +0.57      (monotone -- extended above 1.0 in F26g)
+```
+
+`uxm` is flat over **0.60..0.85** and falls away from 0.90; 0.70 is taken as
+interior to it. `sn2` has *not* turned over by 1.0, which is a different claim
+from the one it was built to test — see below. `action_cap = 4` (the clamp on
+`engine_value`'s `actions_each`) is **−0.02 [−0.07, +0.02]**, inert, so
+`ROUNDS_PER_ACTION`'s clamp is not a lever and neither is the constant behind
+it: it is collinear with `ACTION_VALUE` wherever the clamp does not bind.
+
+### F26g. `starve_next2` peaks near 1.0 — the second food day wants full weight
+
+800 blocks, `greedy:64`, `<scratch>/f3/ab/n_sn2*`, `u_sn2*`:
+
+```
+  sn2    0.25   0.50   1.00   1.50   2.00   3.00
+        +0.35  +0.48  +0.57  +0.53  -0.27  -0.84
+```
+
+Unimodal with a peak at **1.0** — the food day after the next one is worth
+pricing at *the same weight* as the next one, not at a discount. The distance
+discount is already inside `day_risk` (the `urgency` factor falls with the
+rounds to the day), so a weight of 1.0 does not mean "equally urgent"; it means
+"there is nothing extra to discount for, the term already does it".
+
+`action_cap`, the clamp on `engine_value`'s `actions_each`, is **−0.02 at 4 and
+−0.04 at 9**: inert in both directions. `ROUNDS_PER_ACTION` is collinear with
+`ACTION_VALUE` wherever the clamp does not bind and the clamp is not a lever, so
+that pair is finished.
+
+## F27. MCTS on the gear re-price: only Chichen survives
+
+`mcts:256`, 400 blocks (1,600 games) per cell, same pinned binaries
+(`evalab-p14` for `m2_*`, `evalab-p18` for `t_*`; both `--eqcheck` 0e0 and both
+nulls read +0.00), base = the committed evaluator.
+
+| variant | greedy:64, 800 blk | mcts:256, 400 blk | ratio |
+| --- | --- | --- | --- |
+| `chi=0.7` | +0.36 [+0.15, +0.56] * | **+0.38** [+0.13, +0.64] * | 0.9 |
+| `pal=1.5` | +0.64 [+0.42, +0.86] * | +0.11 [−0.09, +0.30] | 5.8 |
+| `uxm=0.7` | +1.80 [+1.51, +2.09] * | **−0.46** [−0.77, −0.15] * | — |
+| `pal=1.5,chi=0.7` | +1.04 [+0.79, +1.30] * | **+0.56** [+0.29, +0.83] * | 1.9 |
+
+**`uxm=0.7` is the largest greedy/MCTS divergence this file has measured**:
++1.80 [+1.51, +2.09] on one agent and −0.52 [−0.90, −0.13] on the other, both
+intervals excluding zero, in opposite directions. It is not a size disagreement;
+it is a sign disagreement, and it is a 2.3-point gap. `pal=1.5` is over-read by 5.8x and does not clear zero. Only `chi=0.7`
+transfers, and it transfers at a ratio of 0.8 — MCTS reads it slightly *larger*
+than greedy, which is the signature of a real effect in this file
+(`RESEARCH_SCALE` read 1.3, `TEMPO_PER_ROUND` read 8).
+
+The three knobs are the same shape and only one survives, and F26d's `dead`
+column says which. Chichen's action is one the evaluator **refuses** about half
+the time — the skull it spends is held at `3.0 + SKULL_PREMIUM` and the bottom
+of the gear pays less than that — so its table entry is a price for something
+nobody ever buys, and taking it down is a pure gain on either agent. Palenque
+and Uxmal read `dead` 0.00 and ~0.3: their actions *are* taken, so the search
+plays the resource out and scores the position it leads to, and the table's
+opinion about the level is redundant. A one-ply agent has no such recourse — it
+compares completed turns and the table's number is the entire signal — which is
+why it reads +1.80 for a change the search reads as −0.46.
+
+**The rule that falls out: a space table entry is worth re-pricing exactly
+where the evaluator would decline the action anyway.** That is a testable
+prediction and `dead` is how to test it, which makes `--promise` useful for
+something narrower and more reliable than calibration.
+
+Also inert on greedy at 800 blocks, both directions, and therefore retired:
+the `lvl == 2` "one short of the top" research bonus (`ntop = 0.0` is
+**+0.01 [−0.03, +0.06]**, `ntop = 1.0` is −0.04 [−0.10, +0.02]) — the last
+unswept constant in `engine_value`.
+
+The greedy-only Tikal curve (`tik` 1.10 / 1.25 / 1.40 reads +0.27 / +0.49 /
++0.51) is left unlanded on the same grounds: it is a resource-gear table scale,
+which is the class this section just showed greedy cannot read.
+
+### Provenance for F25-F27
+
+Five runners, five distinct lock directories, **one writer per output file** —
+`run4.sh`..`run9.sh` in `<scratch>/f3/`, each holding
+`/tmp/evalab-fN-runner.lock.d` and each `--out` claimed with a `.claim`
+sentinel before it is opened, so a re-run of a wave skips a file rather than
+appending to it.
+
+| binary | rev | adds |
+| --- | --- | --- |
+| `evalab-p13` | d7b4e42 | the F24 landing (predecessor's) |
+| `evalab-p14` | 5318276 | per-gear knobs `pal/yax/tik/uxm`, `mcts:N:cp=X`, `--promise` dead column |
+| `evalab-p15` | 5318276 | `sn2`, `acap`, `ntop` |
+| `evalab-p16` | 5318276 | `pneed` |
+| `evalab-p17` | 5318276 | `fp`, `skipd`, `topw` |
+| `evalab-p18` | 5318276 | `chisub`, `tiksub`, `uxmsub` |
+
+`5318276` is docs-only on top of `d7b4e42`, so every binary above shares one
+`eval.rs`; `--eqcheck` reads **0e0 over 48,032 (position, seat) pairs** on each
+of p14..p18 and every wave's null reads **+0.00** exactly. The greedy:64
+platform fingerprint (`an.py -b`, the `base` column) is **35.2-35.9** across the
+whole run and **36.2-36.4** on mcts:256, spreads of 0.7 and 0.2, so this is one
+platform in F14a's sense.
+
+`--agent mcts:N:cp=X` is new in p14: it sets `MctsConfig::c_puct_init` on
+*both* arms through `record::SearchAgent::with_config`, so the comparison stays
+the evaluator and what changes is how deep the search reading it descends. The
+committed default is 2.0, which stops the descent after about one turn
+(`docs/OVERNIGHT.md`); the champion spec is 0.02 at 8,192 simulations.
+Measured cost in `bin/evalab`, user CPU per rotation block:
+**greedy:64 0.09 s, mcts:256 1.0 s, mcts:1024:cp=0.05 6.6 s**, so the deep
+agent is 6.6x mcts:256 for 4x the simulations — the extra is the longer descent.
+
+### F27a. Negative results from this run, each specific
+
+Nothing here is a "did not get to it". All are 800-block `greedy:64` unless a
+MCTS number is given, all against the F24 evaluator, all with a +0.00 null.
+
+| tried | result | what it kills |
+| --- | --- | --- |
+| `tik1` 0.25/0.5/0.75 (the space `--promise` says delivers 0.017 against a 2.00 price) | +0.02, identical across the range | per-space calibration of a *low* space: `board_position`'s max over the ride never reads it |
+| the full per-gear tilt from `--promise` | −8.45, win **0.018** | the fourth kill of "make the table agree with delivery" |
+| `uxm` 0.6..0.85 | +1.8 greedy, **−0.46 mcts:256** * | the largest greedy/MCTS sign split in the file |
+| `pal` 1.5 | +0.64 greedy, +0.11 mcts:256 | over-read 5.8x; lands only inside the joint |
+| `yax` 0.85 / 1.3 | −1.72 / −4.36 | Yaxchilan is at an interior optimum; nothing to win |
+| `tik` 1.10/1.25/1.40 | +0.27/+0.49/+0.51 greedy only | same class as `uxm`; not measured on MCTS, not landed |
+| `spend_fade` 4 / 9 | −0.17 * / +0.05 | 6 rounds is an interior optimum |
+| `action_cap` 4 / 9 | −0.02 / −0.04 | `ROUNDS_PER_ACTION`'s clamp is not a lever |
+| `near_top` 0.0 / 1.0 | +0.01 / −0.04 | the `lvl == 2` research bonus is inert both ways |
+| `BUILDING_VALUE` 1.0 | −0.29 * greedy, −0.18 mcts | *changed sign* after F24; 0.45 is right |
+| `food_saving` 0.5 / 1.5 / 2.5 | −0.47 * / +0.24 / −1.34 * | at an optimum, first sweep |
+| `TEMPO_PER_ROUND` 0.62 | +0.70 * greedy, **−0.31 * mcts** | third kill, now harmful |
+| `RESEARCH_SCALE` 0.0 / 0.15 | −0.19 * / −0.22 * mcts:256 | 0.05 is now an *interior* optimum |
+
+The joint of the whole greedy-fitted gear tilt is the clearest illustration of
+why the MCTS tier is not optional. `greedy:64`, 800 blocks:
+
+```
+  pal=1.5,uxm=0.85                        +2.62  win 0.315
+  pal=1.5,uxm=0.85,chi=0.7                +3.32  win 0.340
+  pal=1.5,uxm=0.85,chi=0.7,tik=1.15       +3.45  win 0.365
+```
+
+A +3.45 with a win rate of 0.365 against a null of 0.250, every interval
+excluding zero at 3,200 games — and two thirds of it is `uxm`, which the search
+reads as **−0.46**. On greedy evidence alone this would have shipped.
+
+### F27b. A corn space is not worth the same to everyone
+
+`pneed = k` multiplies the **Palenque** table by `1 + k` for a player who cannot
+pay the next food bill out of the corn in hand — the same test
+`starvation_risk` fires on, without its arithmetic. It is the gate-shaped
+version of `pal`: after `CORN_INCOME_PER_ROUND = 0.0`, corn's worth to a player
+who is short is the 3 points a head `starvation_risk` is charging them, and to a
+player who is not it is a quarter point. A flat multiplier cannot say that.
+
+800 blocks, `greedy:64`:
+
+```
+  pneed   0.5    1.0    2.0
+        +0.31  +1.48  -16.80        win 0.255 / 0.286 / 0.025
+```
+
+**+1.48 [+1.19, +1.76] * at 1.0**, more than twice the flat `pal = 1.5`'s +0.64
+on the same agent and the same blocks, with a cliff immediately past it. The
+cliff is informative rather than alarming: at `k = 2` a hungry player values
+every jungle space at three times its printed worth and never does anything
+else. MCTS tier below.
+
+`pal = 1.5` was measured twice, on two binaries against two nulls, by accident
+of scheduling: **+0.11 [−0.09, +0.30]** (`m2_pal15`, `evalab-p14`, 400 blocks)
+and **+0.12 [−0.07, +0.31]** (`t_pal150`, `evalab-p18`, 387 blocks). Two
+independent replicates agreeing to 0.01 on a number whose interval covers zero
+is the cleanest statement available that the effect is real, small, and about a
+tenth of a point — not that it is absent. It lands only because it is additive
+with `chi` and the pair clears zero together.
+
+`TEMPO_PER_ROUND = 0.62` was re-run once more on this platform and reads
+**−0.36 [−0.71, −0.02] * on mcts:256** at 319 blocks, against +0.70 * on greedy.
+Fourth kill, third time with the two intervals excluding zero in opposite
+directions.
+
+### F27c. The `dead`-column rule, tested and falsified once
+
+F27's reading — *a table entry is worth re-pricing exactly where the evaluator
+would decline the action anyway* — makes a prediction, so it was tested on the
+one space it fits best after Chichen. `uxm3` halves **only** Uxmal 3, the
+buy-a-worker space, whose `dead` is 0.36: after `CORN_INCOME_PER_ROUND = 0.0` an
+extra worker is an extra mouth, so the evaluator often refuses the free worker
+while the table pays 3.40 for standing on it — and unlike Tikal 1 the space is
+near the top of its gear, so `board_position`'s max does read it.
+
+```
+  uxm3   0.0    0.5
+        +1.22  +1.19        greedy:64, 800 blocks
+               -0.40 [-0.96,+0.15]   mcts:256, 83 blocks (in flight)
+```
+
+Greedy loves it — most of `uxm`'s +1.80 is this one space — and MCTS does not.
+**The rule as stated is too weak**: Chichen is not just a gear the evaluator
+declines, it is a gear whose payout is *points*, and Uxmal 3's payout is a
+worker, which the search prices for itself over the rest of the game. So the
+`dead` column narrows the search for candidates and does not by itself predict
+which will transfer. Only the arena does.
+
+Seed-paired marginals on the joint, `mcts:256`, 400 blocks:
+
+```
+  (pal=1.5,chi=0.7) - chi=0.7   +0.17 [-0.03,+0.38]     what pal adds
+  (pal=1.5,chi=0.7) - pal=1.5   +0.45 [+0.17,+0.74] *   what chi adds
+```
+
+**`chi` is the effect and `pal` is a rider.** `pal`'s own interval covers zero
+on both the standalone and the marginal, so it is landed on the strength of the
+pair (+0.56 [+0.29, +0.83] *), a measured interior optimum on greedy, and two
+bit-identical replicates centred at +0.11/+0.12 — not on an interval that
+excludes zero. Said plainly so a later measurer can drop it cheaply.
+
+A note on the platform, because it is unusually clean here: `evalab` is
+deterministic given a seed, so `t_chi070` (binary p18) and `m2_chi07` (binary
+p14) return **identical** `base` and `cand` means on their shared seeds
+(38.237 / 39.013), as do `t_pal150` and `m2_pal15` (38.729 / 38.850). Two
+binaries built from one `eval.rs` do not merely agree to within noise; they
+agree exactly. That makes the F14a detector sharper than an interval: any
+disagreement at all on a shared seed is a platform move.
+
+### F27d. The champion spec is out of reach inside `bin/evalab`, and why
+
+`--agent mcts:8192:cp=0.02` was started against the candidate at 05:18 and cut
+at 05:27 with **3 of 200 blocks done — 3 minutes a rotation block** under a
+machine load of 59 on 14 cores. 200 blocks is 10 hours of wall clock for an
+interval of about ±0.6, which is wider than the effect being measured.
+
+The arithmetic that settles it, user CPU per rotation block measured on this
+machine: `greedy:64` **0.09 s**, `mcts:256` **1.0 s**, `mcts:1024:cp=0.05`
+**6.6 s**, `mcts:8192:cp=0.02` **~53 s**. A block is four games and each game is
+four seats deciding ~40 turns, so the champion spec is ~26,000 searches of 8,192
+simulations for one independent observation. **`mcts:1024:cp=0.05` is strictly
+the better buy for this file**: 3.2x cheaper than a 100-block run at 8,192 while
+giving 250 blocks, and it has the property that matters here — `c_puct` at 0.05
+rather than the committed 2.0, so the search descends several turns instead of
+one. The evaluator questions this run is asking are about *depth*, not about
+simulation count.
+
+## F28. What landed in `src/eval.rs`
+
+```
+  GEAR_SCALE = [1.5, 1.0, 1.0, 1.0, 0.7]
+             Palenque  Yaxchilan  Tikal  Uxmal  Chichen
+```
+
+A per-gear multiplier on the hand table, applied in `space_value` over a new
+`space_value_raw` that is the table exactly as it was written. Nothing else
+changed. `bin/evalab`'s `v::HEAD` moved with it (`g_pal` 1.0 -> 1.5, `chi`
+1.0 -> 0.7) and `--eqcheck` re-run at **0e0 over 60,432 (position, seat)
+pairs**, so the new null is
+`--ab 'board=0.5,av=0.2,temple=1.4,rs=0.05,ci=0.0,ceiling,pal=1.5,chi=0.7'`
+and the pre-F28 evaluator is `--base 'pal=1,chi=1'`.
+
+The claim, restated so it can be attacked: **`space_value` prices what a space
+hands over and never what it charges**, so the two gears whose actions are pure
+gathering were under-paid and the gear that spends a skull for a printed number
+of points was over-paid. The `dead` column is the measurement of that
+(0.00/0.01 against 0.5-0.7), and it is a property of the evaluator's own
+accounting rather than of the game.
+
+Not landed, each with a number: `uxm` (**+1.80 greedy, −0.46 * mcts:256**),
+`tik` (+0.53 greedy, no MCTS tier), `yax` (loses both ways), `pneed`
+(**+1.48 greedy, +0.20 [−0.20, +0.60] mcts:256**), `sn2` (**+0.57 greedy,
+−0.20 [−0.54, +0.14] mcts:256**), `uxm3` (+1.19 greedy, −0.37 mcts:256),
+`tik1`, `spend`, `acap`, `ntop`, `chisub`, and the whole promise-derived tilt
+(−8.45, win 0.018).
+
+### F28a. Independent-seed replication of the landing
+
+The joint was re-run from `--seed 4000000`, an entirely disjoint set of games,
+while the first run was still going. `mcts:256`, against the pre-F28 evaluator:
+
+| run | seeds | blocks | centred |
+| --- | --- | --- | --- |
+| `m2_pc` | 3,000,000.. | 400 | +0.56 [+0.29, +0.83] * |
+| `x_pc_s4` | 4,000,000.. | 190 | **+0.90** [+0.51, +1.30] * |
+
+and `pal` alone reads +0.11 and +0.13 on the two seed sets. A replication on
+disjoint seeds is worth more than either interval; this file has been burned
+once by a number that was right on the seeds it was measured on (F13/F14).
+
+`BOARD_SCALE` was re-checked at the same time and **0.5 still holds**: 0.4 is
+−0.99 [−1.33, −0.65] * at 400 blocks on `mcts:256`. 0.6 reads +0.31 [−0.10,
++0.73], which covers zero but is the first non-negative reading the far side of
+that plateau has produced since F5a — worth a sweep on the *new* table, because
+`GEAR_SCALE` has just changed what `board` is scaling.
+
+`cargo test --release`: **178 passed, 0 failed, 7 ignored** (177 before, plus
+one), with the other workstreams' in-flight edits to `moves.rs`, `options.rs`,
+`spaces/*` and `tests/search.rs` in the tree. The new pin is
+`tests/rules.rs::evaluator_scales_the_board_table_by_gear`, which places one
+worker on the **top** space of a gear — no ride, so no maximum, and every
+worker halved by the same top-of-gear discount — and asserts two things the raw
+table gets wrong: that Palenque's top now outprices Yaxchilan's (raw 2.6
+against 3.4, so only `GEAR_SCALE` can flip it) and that Chichen's top over
+Tikal's falls into [1.2, 1.7) where the raw ratio is 10.5/5.2 = 2.02.
+
+**Cross-workstream note.** `eval::heuristic` is MCTS's edge prior as well as its
+leaf value (`mcts.rs:1573`), so this landing moves the platform for anything
+that rebuilds. Every arena run in flight at 05:30 is on a pinned binary and is
+unaffected; the next one that is pinned afresh is not comparable with them.
+`plan::PlanEvaluator::raw` weights `eval::components`, and `board` has moved
+again, so F12's warning stands.
+
+### F28b. The landing, measured against the evaluator it replaces
+
+Binary `<scratch>/f3/evalab-p19` (rev `5318276` + this landing; `--eqcheck` 0e0
+over 60,432 pairs), candidate = the committed evaluator, `--base 'pal=1,chi=1'`,
+`<scratch>/f3/ab/z_land_*`.
+
+| agent | blocks | centred | win (null 0.250) |
+| --- | --- | --- | --- |
+| `greedy:64` | 800 | **+1.04** [+0.79, +1.30] * | 0.278 |
+| `mcts:256` | 400 | **+0.86** [+0.55, +1.17] * | 0.274 |
+| `mcts:1024:cp=0.05` | 77 | **+1.09** [+0.23, +1.95] * | 0.264 |
+| `greedy:full` | (in flight) | | |
+
+The deep row is the one that matters and it is the largest of the three: the
+landing is **not** smaller for a search that descends several turns instead of
+one, which is the opposite of what `board_position` knobs usually do here.
+
+Greedy reads the effect 1.2x MCTS's size, against 1.9x for F24 and 2.6x for
+F15 — the tightest ratio this file has recorded, which is what you expect of a
+change that survived being screened *on* the search rather than on greedy.
+
+The `z_null` control writes every knob out at its committed value and reads
++1.02 against the same base — the same number as `z_land` to within 0.02, which
+is the check that the knob spelling and `v::HEAD` say the same thing after the
+move.
+
+### F28c. `pneed` is real but small, and overlaps what just landed
+
+`pneed = 1.0` — the Palenque table doubled for a player who cannot pay the next
+food bill out of the corn in hand — finished at **+0.30 [+0.02, +0.58] * on
+`mcts:256`, 350 blocks**, against +1.48 * on `greedy:64`. So the greedy/MCTS
+ratio is 4.9, in the class of `pal` (5.8) and `uxm` (sign flip) rather than of
+`chi` (0.9), but unlike those two it does clear zero on the search.
+
+It is *not* landed with F28 for a reason that has nothing to do with its size:
+it was measured against a base whose Palenque scale was 1.0, and `GEAR_SCALE`
+has just raised that to 1.5. A hungry-player bonus on top of a corn gear that is
+already 50% dearer is a different quantity. Re-measured against the new head in
+`<scratch>/f3/ab/zz_pneed*`; the honest reading of the first measurement is
+"a corn space is not worth the same to everyone, and about a third of that
+statement survives the search."
+
+### F28d. Where the mass is now — `<scratch>/f3/terms_f28.txt`
+
+`evalab --terms` on the landed evaluator, 3,000 turn roots x 4 seats:
+
+```
+        term      mean     mean|x|
+      banked     2.132       3.889
+ liquidation     3.459       3.459
+        held     2.517       2.517
+      temple    18.535      18.535
+      engine     3.516       3.516
+       board     3.171       3.171
+    monument     0.159       0.159
+      starve    -1.793       1.793
+```
+
+**`temple_outlook` is 18.5 points of a ~33-point estimate — five times the next
+largest speculative term, and larger than every other one put together.** It is
+also the term that drifts most through a turn (−1.33 to −3.86 in the depth
+table). `TEMPLE_SCALE = 1.4` was fitted in F8/F9, two landings ago, against an
+evaluator with a different `board`, a different `engine` and a `starvation_risk`
+that forgave shortfalls. **It is the largest unexamined quantity in the file**
+and the obvious next target; swept on the new table in `<scratch>/f3/ab/y_*`.
+
+`monument_outlook` is **0.159**, a twentieth of the next smallest term. That is
+the fifth independent statement that it does nothing, and it is now a statement
+about the term's size rather than about a sweep of its scale: there is no
+constant that makes 0.16 points matter. Delete it or rewrite it; measured as a
+deletion in `<scratch>/f3/ab/zz_monu0*`.
+
+### F28e. `TEMPLE_SCALE` is a plateau, not a peak
+
+`mcts:256`, 400 blocks, against the pre-F28 evaluator (`<scratch>/f3/ab/m2_*`):
+
+```
+  temple   1.0    1.4    1.8
+          +0.11   null  -0.76 *      (400 blocks each)
+  board    0.4    0.5    0.6
+          -0.99   null  +0.34
+```
+
+`TEMPLE_SCALE = 1.0` is **+0.11 [−0.28, +0.50]** — indistinguishable from the
+committed 1.4 at 1,600 games, where F8 read the same axis as monotone improving
+from 0.5 to 1.4 and F9 put a joint peak there. That fit was against an evaluator
+with a different `board`, a different `engine` and a `starvation_risk` that
+forgave shortfalls; what is left of it is a **plateau over 1.0..1.4** with 1.8
+clearly worse. Since the term is 18.5 of a 33-point estimate, "1.0 and 1.4 are
+the same" is a statement about 7 points of estimate that changes nothing, which
+is worth knowing on its own: the search does not care how loudly the evaluator
+shouts about temples, only about the ordering it induces.
+
+`BOARD_SCALE = 0.6` reads +0.34 [−0.04, +0.71] on the old table and **0.55 reads
++0.59 [+0.16, +1.01] * on the new one** — `GEAR_SCALE`'s n-weighted mean is
+about 0.98, so part of that is the level coming back, and part is not. In
+flight.
+
+## F29. `HUNGRY_CORN`: a corn space is worth double to a player who cannot eat
+
+```
+  HUNGRY_CORN = 1.0     the Palenque table x2 when `owed > corn in hand`
+```
+
+The gate-shaped half of what `pal` was reaching for, and the larger effect. It
+multiplies the Palenque table by `1 + HUNGRY_CORN` for a player who cannot pay
+the next food bill out of the corn already in hand — the same test
+`starvation_risk` fires on, without its arithmetic. `space_value` gained a
+`hungry` parameter so `board_position` can hoist the test out of its loop over
+the reachable gear, which it runs once per placed worker.
+
+`mcts:256`, against the evaluator F28 landed, 400 blocks per seed set:
+
+| seeds | blocks | centred | win |
+| --- | --- | --- | --- |
+| 3,000,000.. | 298 | **+1.15** [+0.75, +1.55] * | 0.270 |
+| 4,000,000.. | 119 | **+1.29** [+0.59, +1.99] * | 0.268 |
+
+and +1.48 [+1.19, +1.76] * on `greedy:64` at 800 blocks against the *previous*
+base. **A greedy/MCTS ratio near 1.2** — the same as `chi` and unlike every
+other `board_position` knob in this run, which is the signature that separates a
+real effect from a one-ply artifact in this file.
+
+Why it works where a flat `pal` scale does not: after `CORN_INCOME_PER_ROUND`
+went to zero, `starvation_risk` charges a short player 3 points a head, so corn
+is worth an order of magnitude more to them than the quarter point plus
+`CORN_PREMIUM` it is worth to everyone else. `starvation_risk` says the position
+is bad; nothing until now told the search *where to go about it*. The two terms
+are complementary rather than a double count, which is what the additivity says.
+
+Sharply peaked: at `greedy:64`, 800 blocks, `pneed` 0.5 / 1.0 / 2.0 reads
++0.31 / +1.48 / **−16.76 with a win rate of 0.024**. At 2.0 a hungry player
+prices every jungle space at three times its printed worth and does nothing else
+all game. Do not raise it without a sweep.
+
+### F29a. **Retracted the same hour: `HUNGRY_CORN = 1.0` is a 3x corn gear, and greedy is destroyed by it**
+
+Landed at 05:47 and reverted at 05:49. The mistake is worth more than the
+landing was.
+
+`pneed` was swept in F27b against a base whose Palenque scale was **1.0**, so
+`pneed = 1.0` there meant a total multiplier of **2.0** on the corn gear for a
+hungry player, and it read +1.48 greedy. `GEAR_SCALE` then raised Palenque to
+1.5, and carrying the same `pneed = 1.0` onto it means a total of **3.0** —
+which is exactly the configuration `pneed = 2.0` tested on the old base, where
+it read **−16.76 with a win rate of 0.024**. The first 66 blocks of the landing
+measurement read **−15.92 [−17.08, −14.76], win 0.023**, reproducing that number
+to within its interval, and the run was killed.
+
+What makes it interesting rather than merely embarrassing: **`mcts:256` likes
+the same 3x gear.** `zz_pneed10`, which is `pneed = 1.0` on top of the landed
+`GEAR_SCALE`, is +1.02 [+0.66, +1.39] * at 389 blocks and +1.41 * on a disjoint
+seed set. So the identical evaluator change is **+1.0 for the search and −16 for
+the one-ply agent**, a 17-point gap and the largest divergence in this file by
+an order of magnitude. Two seed-replicated MCTS confirmations did not protect
+against it, because they were both on the agent that liked it.
+
+Three rules come out of this:
+
+* **A multiplier measured against one base is not a multiplier.** `pneed` is
+  composed with `GEAR_SCALE`, so re-measure it after any change to what it
+  multiplies. F20 checked exactly this for `rs`/`av`/`board` and found no
+  interaction; this pair has a violent one.
+* **Replication on disjoint seeds does not substitute for the second agent.**
+  Both replicates agreed and both were wrong about the deliverable.
+* **Run the cheap agent even when you have decided it over-reads.** greedy:64 is
+  0.09 s a block. It caught this in 66 blocks, about six seconds of CPU, on a
+  change that two 400-block MCTS runs had endorsed.
+
+The knob is kept at `HUNGRY_CORN = 0.0` — inert, and pinned by the null — and
+re-swept on the `GEAR_SCALE` base with **both** agents in
+`<scratch>/f3/ab/pn_*`, at 0.2 / 0.33 / 0.5 / 1.0, where 0.33 is the value that
+reproduces the total 2.0 that F27b actually measured.
+
+### F29b. State of the tree at 05:52, for whoever picks this up
+
+`src/eval.rs` carries **`GEAR_SCALE = [1.5, 1.0, 1.0, 1.0, 0.7]`** (F28, landed,
++0.86 mcts:256 / +1.09 mcts:1024:cp=0.05 / +1.04 greedy:64) and
+**`HUNGRY_CORN = 0.0`** — the F29 knob, present, documented and *inert*, pending
+the re-sweep F29a demanded. `bin/evalab`'s `v::HEAD` matches (`--eqcheck` 0e0
+over 48,320 pairs on `evalab-p21`) with `pal_need: 0.0`.
+
+The re-sweep in flight, `<scratch>/f3/ab/pn_*`, base = the landed evaluator:
+
+```
+  pneed       0.20   0.33   0.50   1.00
+  greedy:64  +1.27  +1.31    --   -15.92        (0.33 at 800 blocks)
+  mcts:256     --   +0.71  (in flight)  +1.06
+```
+
+`pneed = 0.33` is the value that reproduces the **total x2.0** corn multiplier
+F27b actually measured, and it is **positive on both agents** — +1.31 [+1.03,
++1.59] * at 800 greedy blocks and +0.71 [+0.28, +1.14] * at 111 MCTS blocks.
+`pneed = 1.0` is the total x3.0 that F29a retracted. Land 0.33 when the MCTS arm
+reaches 400 blocks and `pn_050` says which side of it the peak is on.
+
+### F29c. `BOARD_SCALE`'s optimum moved with the table under it
+
+`GEAR_SCALE` changed what `BOARD_SCALE` is scaling, and the board term's
+optimum went with it. `mcts:256` against the landed evaluator
+(`<scratch>/f3/ab/y_*`, `yb_*`):
+
+```
+  board    0.40   0.50   0.55   0.65
+          -0.99*  null  +0.56* +1.13*        (0.40 measured on the old table)
+```
+
+**+1.13 [+0.59, +1.67] * at 0.65**, twice what 0.55 buys, on a constant F5a
+fixed at "about a half" and F22 re-confirmed in both directions. `GEAR_SCALE`'s
+n-weighted mean is 0.98, so this is *not* level compensation — a 2% cut in the
+table is not answered by a 30% rise in its scale. What changed is the shape:
+Chichen's entries came down 30% and Palenque's went up 50%, and the term's best
+overall weight moved with the mix.
+
+Swept further, and on **both** agents this time — F29a's whole lesson — in
+`<scratch>/f3/ab/yb_*`.
+
+### F29d. The two agents disagree about `pneed`'s *direction*, not just its size
+
+The re-sweep on the `GEAR_SCALE` base, all against the landed evaluator:
+
+```
+  pneed            0.10    0.20    0.25    0.33    0.50    1.00
+  greedy:64       +0.19*  +1.73*  +1.06*  +1.31*  -1.90*  -16.01*
+  mcts:256          --    +0.06   --      +0.33*  +1.02*   +1.06*
+  mcts:1024 cp.05   --    +1.99*  --       --      --       --
+
+  blocks: greedy 800 except 0.25 (455); mcts:256 85/400/212/400; deep 39
+```
+
+Three things at once. The greedy curve is **jagged** rather than smooth —
++1.73 at 0.20 against +1.06 at 0.25 and +1.31 at 0.33, on 800/455/800 blocks
+with intervals of ±0.26/0.37/0.28 — which is what a *gate* looks like when it
+is swept: its effect is discontinuous in how often it flips a
+max-over-the-gear comparison, not a smooth function of the constant. The
+`mcts:256` curve is monotone increasing over the same range. And the deep
+search reads **+1.99 [+0.91, +3.08] at `pneed = 0.20`**, where `mcts:256` reads
++0.06 — so the three agents rank the same knob in three different ways.
+
+`greedy:64` peaks near **0.2** and falls off a cliff by 0.5. `mcts:256` is
+**monotone increasing** across the same range. This is not the usual "greedy
+over-reads by a factor"; the two agents put the optimum on opposite sides of
+0.4. Both curves are steep and every cell excludes zero.
+
+The reading: a hungry player's corn premium tells a one-ply agent *where to put
+its next worker*, and a little of that is worth a lot while a lot of it makes
+every jungle space dominate the board. A search that plays out the corn does not
+need the table to shout, and never suffers the tunnel vision, so it keeps taking
+the extra pessimism-correction as free. **The value to land is the one where
+both agents are clearly positive, which is at or below 0.33** — the deliverable
+is an MCTS agent, but an evaluator that costs 2 points to the agent used for
+every screening measurement in this file is an evaluator nobody can measure
+against.
+
+### F29e. The joint, and where this run stops
+
+`pneed = 0.25` with `BOARD_SCALE = 0.65`, both on top of the landed
+`GEAR_SCALE`, `<scratch>/f3/ab/j_pb_*`:
+
+| agent | blocks | centred | win |
+| --- | --- | --- | --- |
+| `greedy:64` | 400 | **+2.62** [+2.21, +3.02] * | 0.330 |
+| `mcts:256` | (in flight) | | |
+
+and the two halves alone on `mcts:256`: `board=0.65` **+1.36 [+0.88, +1.85] ***
+at 251 blocks, `board=0.70` **+1.43 [+1.02, +1.83] *** at 336, `pneed=0.33`
++0.33 [+0.09, +0.58] * at 400.
+
+`BOARD_SCALE` is the larger and the cleaner of the two: a single constant,
+already in the file, already swept twice, whose optimum moved because
+`GEAR_SCALE` changed the shape of what it scales. `pneed` is a new gate whose
+three agents rank it three ways (F29d) and whose greedy response is jagged.
+
+## F30. What finally landed in `src/eval.rs`
+
+```
+  GEAR_SCALE  = [1.5, 1.0, 1.0, 1.0, 0.7]   Palenque / Yax / Tikal / Uxmal / Chichen
+  HUNGRY_CORN = 0.25                        Palenque x1.25 again when `owed > corn`
+  BOARD_SCALE = 0.5 -> 0.65                 re-fitted on the new table
+```
+
+Three changes, all inside the board term, all measured on at least two agents.
+`bin/evalab`'s `v::HEAD` tracks them (`--eqcheck` **0e0 over 60,672 (position,
+seat) pairs** on `evalab-p22`), the new null is
+`--ab 'board=0.65,av=0.2,temple=1.4,rs=0.05,ci=0.0,ceiling,pal=1.5,chi=0.7,pneed=0.25'`
+and the evaluator this replaces is `--base 'pal=1,chi=1,pneed=0,board=0.5'`.
+
+The three are one statement in three places. `space_value` prices what a space
+hands over and never what it charges (F26d), so the gears that charge were
+over-paid; correcting that changes the *shape* of the table, and both the term's
+overall scale (`BOARD_SCALE`) and its one state-dependent exception
+(`HUNGRY_CORN`) had been fitted to the old shape.
+
+Measured against the evaluator it replaces, `<scratch>/f3/ab/q2_land_*`
+(binary `evalab-p22`):
+
+| agent | blocks | centred | win (null 0.250) |
+| --- | --- | --- | --- |
+| `greedy:64` | 800 | **+2.48** [+2.20, +2.76] * | 0.323 |
+| `mcts:256` | 223 | **+1.37** [+0.90, +1.85] * | 0.291 |
+| `mcts:1024:cp=0.05` | (in flight) | | |
+| `greedy:full` | (in flight) | | |
+
+Both halves clear zero alone on both agents, which is the check F29a's
+retraction says to insist on: `BOARD_SCALE = 0.70` reads **+2.18 [+1.73, +2.63]
+greedy:64** at 335 blocks and **+1.46 [+1.09, +1.83] mcts:256** at 400, and the
+`pneed=0.25, board=0.65` joint reads **+2.62 greedy / +1.49 mcts:256**.
+
+`cargo test --release`: **180 passed, 0 failed, 7 ignored** (177 at the start of
+this run). Two new pins in `tests/rules.rs`:
+`evaluator_scales_the_board_table_by_gear`, which puts one worker on the top
+space of a gear — no ride, so no maximum, and every worker halved by the same
+top-of-gear discount — and asserts an ordering the raw table gets backwards
+(Palenque's top over Yaxchilan's, raw 2.6 against 3.4) plus a bracket on
+Chichen over Tikal that excludes the unscaled 2.02; and
+`evaluator_pays_more_for_corn_when_the_food_day_is_unpaid`, which solves for the
+feeding bill out of `starvation_risk` rather than assuming it, then checks that
+one corn either side of it moves the corn gear and leaves the resource gear
+alone.
+
+### F30a. In flight at the report boundary
+
+Started, writing to disk, unfinished — `--resume` will continue any of them, and
+the analysis is `python3 <scratch>/an.py '<pattern>'` from `<scratch>/f3/ab`:
+
+| file | what it answers |
+| --- | --- |
+| `q2_land_mcts1024cp005`, `q2_land_greedyfull` | F30 on the deep search and on exhaustive one-ply |
+| `q3_run_*` (3 tiers) | the whole of this session in one number: `GEAR_SCALE` + `HUNGRY_CORN` + `BOARD_SCALE` against the F24 evaluator, `--base 'pal=1,chi=1,pneed=0,board=0.5'` |
+| `m2_*_mcts1024cp005` (9 variants, 250 blocks) | **the brief's question (b)** — `pal`, `chi`, `pc`, `tempo`, `board=0.4/0.6`, `temple=1.0/1.8` measured on `mcts:1024:cp=0.05` against the *same* variants already measured on `mcts:256`, so a verdict that flips with depth shows up as a row that differs between the two |
+| `m3_f24_*` | whether F24's landing still holds at depth (`--base 'rs=0.5,ci=1.9,noceiling'`) |
+| `pd_033`, `pd_050`, `pd_board065` | `pneed` and `board` on the deep search |
+| `t_chisub10`, `t_chisub20` | the *shift* form of the Chichen correction (subtract points rather than scale) against the ×0.7 that landed |
+
+What the deep tier has said so far, all against the pre-F28 evaluator on
+`mcts:1024:cp=0.05` with a +0.00 null at 250 blocks: the F28 landing **+1.09
+[+0.23, +1.95] *** at 77 blocks (larger than its `mcts:256` +0.86), and
+`pneed = 0.20` **+1.62 [+0.66, +2.59] *** at 50 blocks where `mcts:256` reads
++0.06. Both point the same way: **the corrections this run made are worth more
+to a search that looks ahead than to one that does not**, which is the opposite
+of the `board_position` knobs the same run killed.
