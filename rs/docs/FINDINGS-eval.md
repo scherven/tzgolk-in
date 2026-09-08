@@ -3026,3 +3026,399 @@ quote them:
 Both are running to 250 blocks in `<scratch>/f3/ab/bd_080_mcts1024cp005.jsonl`
 and `m2_temple10_mcts1024cp005.jsonl`. **Do not act on either until they get
 there**; that is the whole content of F30e.
+
+### F34a. Three cancelling pairs that re-measure the **same**, and one that does not exist
+
+`greedy:64`, **400 blocks a cell**, `--base head` on `evalab-p23`. `null` marks
+the committed value.
+
+```
+  av (ACTION_VALUE)   0.0     0.1    0.2    0.3    0.4    0.6
+                     -0.02  -0.02   null  -0.03  -0.04  -0.30*
+
+  chi (GEAR_SCALE[4]) 0.5     0.6    0.7    0.8    0.9    1.0
+                     -1.00*  -0.68*  null  -0.44* -1.18* -2.24*
+
+  sp (SKULL_PREMIUM)  1.0     1.6    2.2    2.8    3.4
+                     -0.41   -0.31   null  -1.47* -1.74*
+
+  pal (GEAR_SCALE[0]) 1.0     1.2    1.5    1.8
+                     -1.05*  -0.82*  null  -6.26*
+```
+
+* **`ACTION_VALUE` is not a constant, it is a plateau, and its width is the
+  finding.** 0.0 through 0.4 are *all* within ±0.05 of the committed 0.2, with
+  intervals of ±0.04 — ten times tighter than any other knob in this file,
+  because `engine_value`'s worker line is `workers × actions_each × av` and
+  `workers` changes only when one is bought or unlocked, so within a turn the
+  term is very nearly a constant offset that `margin` cancels. The doc comment's
+  "treat the digit as the low end of a plateau, not as resolved to 0.1" is
+  right, and the plateau reaches **all the way to zero**: `ACTION_VALUE = 0`
+  costs 0.02 ± 0.04 points on `greedy:64`. It is a deletion candidate, not a
+  tuning target. 0.6 is the first value off the plateau.
+* **`GEAR_SCALE[Chichen] = 0.7` is at the optimum**, unimodal on both sides, and
+  the next-best 0.8 costs −0.44. Re-measured against the evaluator it now ships
+  in, it does not move.
+* **`SKULL_PREMIUM = 2.2` is at the optimum too**, which was the interesting
+  one: `GEAR_SCALE`'s own doc comment says Chichen's `dead` column exists
+  *because* a skull is held at `3.0 + SKULL_PREMIUM = 5.2` while the bottom of
+  the gear pays 4 printed points, so `chi = 0.7` and `sp` are two knobs on one
+  mechanism and lowering `sp` should have made `chi` redundant. It does not:
+  `sp = 1.6` is −0.31 and `sp = 1.0` is −0.41, both flat-to-worse, and 2.8/3.4
+  fall off hard. The pair is genuinely two-dimensional, and the joint
+  (`chi=1.0, sp=1.2`, `chi=0.85, sp=1.6`) is in the N2 wave.
+* **`GEAR_SCALE[Palenque]`'s cliff is much closer than 1.5 suggests.** 1.8 is
+  **−6.26**, win rate 0.101, on top of `HUNGRY_CORN = 0.25` — because the two
+  multiply, so 1.8 × 1.25 = 2.25 is already in the region F29a's retraction
+  found at −16. The committed 1.5 sits with a −0.82 cell one step below it and
+  a −6.26 cliff one step above; `1.35` and `1.65` on the *shipped* base are
+  running under `n_pal135b`/`n_pal165b` (the `n_pal135`/`n_pal165` files in
+  `ab/` are chain16's, measured on `evalab-p16` against `board = 0.5,
+  pneed = 0`, and read +0.25 and +0.86 there — an old-base pair kept for the
+  contrast).
+
+### F34b. The landing's number against the actual F24 evaluator is larger than reported
+
+`q2_land_*` is `--base 'pneed=0,board=0.5'` — the **pre-F29** evaluator, which
+already has `GEAR_SCALE`. `q3_run_*` is `--base 'pal=1,chi=1,pneed=0,board=0.5'`
+— F24's. F30d's table puts the `q2` numbers under the `q3` heading, so the
+figure quoted for "the session against F24" is one landing short:
+
+| base | agent | blocks | centred | win |
+| --- | --- | --- | --- | --- |
+| pre-F29 (`q2_land`) | greedy:64 | 800 | +2.48 [+2.20, +2.76] * | 0.323 |
+| pre-F29 (`q2_land`) | mcts:256 | 400 | +1.50 [+1.14, +1.85] * | 0.290 |
+| pre-F29 (`q2_land`) | mcts:1024:cp=0.05 | 250 | +1.78 [+1.31, +2.24] * | 0.319 |
+| pre-F29 (`q2_land`) | greedy:full | 200 | +4.57 [+3.97, +5.16] * | 0.426 |
+| **F24 (`q3_run`)** | greedy:64 | 800 | **+3.23** [+2.92, +3.53] * | 0.340 |
+| **F24 (`q3_run`)** | mcts:256 | 400 | **+1.89** [+1.48, +2.30] * | 0.303 |
+
+So the whole of the previous run against the evaluator it started from is
+**+3.23 greedy:64 / +1.89 mcts:256**, not +2.48 / +1.50. Same landing, correctly
+attributed base.
+
+### F34c. `BOARD_SCALE`'s optimum rises with search depth — the one axis still moving
+
+Not a re-opening of F32's verdict; the same head-to-head framing F32 insists on,
+extended to the agent the deliverable actually uses. Every cell `--base head` on
+`evalab-p23`, so the field is the shipped evaluator in all of them.
+
+```
+  board            0.50     0.65    0.70    0.80    0.90    1.00
+  greedy:64       -1.45*    null     --    -0.03   -0.28   -0.96*
+  mcts:256        -0.98*    null   +0.03   -0.03   +0.29   +0.53 (105 blk)
+  mcts:1024 cp.05    --     null     --    +1.35*  (running)
+```
+
+400 blocks a cell on the two shallow agents; the deep cell is 99 blocks and
+**directional only** — F30b/F30e are three separate cases of a deep number
+falling by half between 50 and 250 blocks, so this is running to 250 and
+`board = 0.9` deep has been started beside it.
+
+The ordering is monotone **in search depth**, not in the constant: `greedy:64`
+turns over between 0.8 and 0.9, `mcts:256` is flat-to-rising all the way to 1.0,
+and the deep search reads +1.35 where `greedy:64` reads −0.03 on the same cell.
+F32's retraction of "a point and a half" is still right about what it measured —
+`greedy:64` and `mcts:256` both say `board = 0.80` buys nothing — but **both of
+those are shallow agents, and the shipped agent is `mcts:8192:cp=0.02`.**
+
+A mechanism that fits: `board_position` is a forecast of what a standing worker
+will do over the next few rotations. A one-ply agent is *also* about to score
+that same action explicitly at its own leaf, so weighting the forecast harder
+double-counts; a search that descends six turns has spent its budget elsewhere
+and uses the evaluator as the thing that tells it which gear to be on. Whatever
+the mechanism, the empirical statement is a curve whose peak moves right as the
+budget rises, and `BOARD_SCALE = 0.65` was fitted entirely on the two agents at
+the left of it.
+
+**Nothing lands on this tonight** without the 250-block deep cells.
+
+### F34d. The four inert constants: what a term's *level* is worth is not what ranks moves
+
+`greedy:64`, 400 blocks (or as marked), `--base head` on `evalab-p23`:
+
+```
+  tnear/tfar  1.00/0.65  0.70/0.45  1.00/0.55  0.85/0.40  0.85/0.70
+              -0.04      -0.11      -0.06      +0.09      -0.06
+  acap (action_cap)   3.0     4.0     6.0     8.0    9.0
+                     -0.00   -0.01    null   (run)  -0.04
+```
+
+* **`TEMPLE_NEAR`/`TEMPLE_FAR` cannot be moved.** An 18% rise in the level, an
+  18% fall, a flattened near/far ratio and a steepened one all read within ±0.11
+  of zero with intervals of ±0.3 — on the term that F28d measures at **18.5
+  points of a ~33-point estimate**, five times the next largest. The pair
+  *ought* to have been a scalp: `TEMPLE_SCALE = 1.4` multiplies `TEMPLE_NEAR =
+  0.85` to 1.19, so the confidence discount the constant is named for was
+  cancelled by a later global scale and nobody re-swept it. It re-measures
+  exactly the same, which is a real answer: the temple term's level does not
+  rank moves, because it barely changes within a turn and `margin` differences
+  it away.
+* **`action_cap` is inert too** (−0.00 at 3.0, −0.04 at 9.0, ±0.02 intervals),
+  which retires the `ROUNDS_PER_ACTION` coupling: the doc comment names `acap`
+  as the knob that actually prices early throughput, and it does not price
+  anything.
+* Together with `ACTION_VALUE`'s ±0.04 plateau (F34a), that is **three of the
+  audit's nine pairs where the answer is "the constant does not matter at all"**
+  rather than "the constant is right". The distinguishing signature is the
+  interval: knobs that move ranking read ±0.3 to ±0.4 at 400 blocks; the inert
+  ones read ±0.03. A knob whose interval collapses is telling you it is a
+  common offset, not a weight.
+
+### F34e. `monument_outlook` is **not** deleted — against the shipped evaluator the deletion is a loss
+
+The brief's case for deleting it was `+0.19 [−0.01, +0.39]` on `mcts:256` at 400
+blocks, plus five earlier statements that the term is inert and F28d's mean
+magnitude of 0.159 points. F33a already showed that +0.19 was measured on
+`evalab-p21`, against a field with `board = 0.5` and no `HUNGRY_CORN`.
+Head-to-head against the evaluator the deletion would actually replace:
+
+| variant | agent | blocks | centred | win (null 0.250) |
+| --- | --- | --- | --- | --- |
+| `monu=0` | greedy:64 | 800 | +0.10 [−0.03, +0.23] | 0.255 |
+| `monu=0` | **mcts:256** | **400** | **−0.20 [−0.39, −0.00] \*** | **0.238** |
+| `monu=0` (old base, `evalab-p21`) | mcts:256 | 400 | +0.19 [−0.01, +0.39] | 0.260 |
+
+**The sign flips with the base**, and on the search — the agent class the
+deliverable uses — the deletion is distinguishable from zero in the *wrong*
+direction. Its win rate falls from 0.250 to 0.238. So the sixth and seventh
+statements that the term "does nothing" are a statement about `greedy:64` and
+about an evaluator two landings old; on `mcts:256` against what ships, removing
+it costs a fifth of a point.
+
+`monument_outlook` **stays**. Its 0.159-point mean magnitude is not the
+argument it looked like: a term can be small in level and still be the only
+thing in the estimate that moves when a 20-point monument comes into reach,
+which is exactly the case where it decides. Both the `mgate` sweep (F18) and
+this deletion say the *scale* is not where the term is wrong; if it is ever
+rewritten it should be for shape, and the number to beat is now −0.20, not zero.
+
+### F34f. Why `action_cap` reads exactly `+0.0000`
+
+`n_acap50_greedy64` is 0.0000 in **all 328 blocks** and `n_acap80` in 325 of
+327 — not "small", identical. The mechanism is worth writing down because it
+generalises to every inert knob in F34d. `engine_value` pays
+`n_unlocked(p) × min(rounds_left / 2.6, action_cap) × ACTION_VALUE`. The cap
+binds only while `rounds_left / 2.6 > 5`, i.e. for the first eleven days —
+**which is exactly the stretch in which all four players still have three
+workers**. `margin` is `heuristic(me) − max over opponents`, so a term equal
+across seats cancels before it can rank anything; by the time worker counts
+diverge, `rounds_left` has fallen and the cap no longer binds at all.
+
+That is the shape of the whole inert class: a knob is inert when the quantity it
+scales is common to the seats being compared at the moment it is largest. It
+is not evidence the modelled effect is unreal — it is evidence the knob cannot
+express it. A different constant would have to be attached to something that
+*differs* between seats.
+
+### F34g. `TEMPO_PER_ROUND`, finished: the peak moved, and the move is `greedy:64`-only
+
+The `mcts:256` tier of F33b, 400-block target, `--base head` on `evalab-p23`:
+
+| tempo | greedy:64 (400 blk) | mcts:256 |
+| --- | --- | --- |
+| 0.44 | −1.40 [−1.75, −1.06] * | (running) |
+| 0.48 | −0.74 [−1.04, −0.44] * | — |
+| **0.52** | **null (committed)** | **null** |
+| 0.56 | +0.41 [+0.07, +0.75] * | −0.14 [−0.42, +0.14] (337) |
+| **0.60** | **+0.83 [+0.45, +1.21] \*** | **−0.55 [−0.87, −0.22] \*** (338) |
+| 0.62 | +0.70 [+0.29, +1.11] * | −0.31 [−0.62, −0.01] * (400) |
+| 0.70 | −0.92 [−1.32, −0.53] * | — |
+| 0.80 | −2.74 [−3.19, −2.29] * | — |
+
+**The stalest constant in the file is genuinely at the wrong value for
+`greedy:64` and at the right one for the search.** 0.60 is worth +0.83 to the
+one-ply agent and costs −0.55 to `mcts:256`, with both intervals excluding zero
+and each other. `TEMPO_PER_ROUND` therefore **does not move**: the deliverable
+is `mcts:8192:heuristic:cp=0.02` and the shipped 0.52 is on the flat top of the
+search's curve.
+
+This is the same shape as `chi = 0.7` in the newly-committed deep-tier table and
+as `uxm` in F26e: a constant inside `board_position` that tells a one-ply agent
+which space on a gear to aim at, and that a search which plays the ride out does
+not need. **`TEMPO_PER_ROUND` is a forecast; the search replaces forecasts with
+rollouts.** It is worth saying plainly because the doc comment's 3,000-block
+sweep is `heuristic:32` — a *greedy* agent — so the constant has only ever been
+fitted on the class of agent that is most sensitive to it.
+
+### F34h. `TEMPLE_CLIMB` wants to be larger, and it is the one term whose derivative ranks
+
+`greedy:64`, 400 blocks, `--base head`:
+
+```
+  climb   0.00    0.10    0.20
+         -0.06    null   +0.13*
+```
+
+Small, but 0.20 is `+0.13 [+0.01, +0.25] *` with a win rate of 0.262 against
+0.250 — the first cell in this audit that is *positive* and outside its
+interval. It also fits F34d's mechanism exactly. `temple_outlook`'s **level** is
+18.5 points and completely inert (every `tnear`/`tfar`/`TEMPLE_SCALE` variant
+reads zero), because the level is nearly common to the four seats; `climb` is
+the only part of that term that changes with the move being ranked, since
+stepping a temple is something a move does. So the one place the biggest term in
+the evaluator can be mispriced is its derivative, and the derivative is the part
+that has only ever been swept over 0.0..0.5 (F18, and "kept because the rule
+says so, not because it pays").
+
+0.4, 0.7 and 1.0 are queued, and an `mcts:256` tier with them.
+
+### F33c. A second measurer is on this file — co-tenancy, verified safe
+
+From ~06:50 a second eval-workstream runner is live out of
+`<scratch>/f4/nq.sh`, writing into the same `<scratch>/f3/ab/`. Checked rather
+than assumed:
+
+* **It uses `<scratch>/f3/evalab-p23`** — the binary this session pinned — so
+  both measurers are on one platform and their numbers are directly comparable.
+* **`ps -eo pid,ppid,command | ... | uniq -d` over every live `--out` argument
+  returns zero duplicates.** One writer per file holds across both runners.
+  Prefixes do overlap (`n_`, `bd_`) but no filename does; the `.claim` sentinel
+  and distinct stems are what make that true rather than lucky.
+* It is extending exactly the sweeps this file left open: `tempo = 0.56/0.60`
+  (re-sweeping `TEMPO_PER_ROUND` on the re-shaped table, which F31a's rule says
+  is the right thing to do after `GEAR_SCALE`), `tik = 0.85/1.15`,
+  `tik1 = 0.7/1.4`, and **`board = 0.9` on `mcts:1024:cp=0.05`** — which is the
+  neighbouring cell to F33b's open question.
+
+**Anything below this line in this file may be either measurer's.** Say which
+runner produced a number when it matters; the binary is the same, so the
+platform check is not the issue, but the *writer* is.
+
+One process of this session's own was lost to a `Killed: 9` at 06:47
+(`m2_temple10` at depth, 26 blocks) — memory pressure, with a dozen concurrent
+`mcts:1024` trees at 300-800 MB resident each. Resumed from its partial JSONL
+at two threads. **`mcts:1024:cp=0.05` costs memory as well as CPU**, and that is
+the second reason (after F27d's 53 s/block) not to run many of them at once.
+
+### F34i. `GEAR_SCALE[Palenque]` and `HUNGRY_CORN` are one constant, not two
+
+The iso-product line: five splits of the same Palenque weight *when hungry*
+(`pal × (1 + pneed) ≈ 1.875`, which is what ships) between the flat multiplier
+and the gate. `greedy:64`, ~210 blocks a cell so far, `--base head`:
+
+```
+  pal      1.10   1.25   1.35   1.50    1.65   1.80
+  pneed    0.70   0.50   0.39   0.25*   0.14   0.04
+  centred -0.23  -0.09  +0.02   null   +0.01  -0.17
+```
+
+Every cell is within ±0.25 of the committed split with intervals of ±0.3, on a
+line whose *endpoints* individually are catastrophic (`pal = 1.80, pneed = 0.25`
+is −6.26; `pal = 1.10` alone would be well under −1). **Only the product
+matters**, so `HUNGRY_CORN` is not buying the state-dependence its doc comment
+claims — it is buying level, and `GEAR_SCALE[Palenque]` could buy the same level
+on its own.
+
+That is the missing explanation for F29a and F30c, the two `pneed` incidents in
+the F31a table: `pneed` was never separable from `pal`, so a `pneed` swept on a
+`pal = 1.0` base and carried onto `pal = 1.5` was *guaranteed* to overshoot, and
+`pneed = 0.33` was *guaranteed* to look better on a base whose board term was
+smaller. **The rule "re-measure X against the evaluator it will ship in" has a
+sharper form for a pair like this: two constants that only ever appear as a
+product are one degree of freedom, and sweeping either alone is a
+reparameterisation, not an experiment.**
+
+Nothing to land — the shipped split is as good as any other on the line, and the
+gate is cheap. But it means `HUNGRY_CORN` should not be described as a
+state-dependent correction until something distinguishes it from `pal`, and the
+distinguishing measurement is on this line, not on either knob alone.
+
+### F34j. Lowering `SKULL_PREMIUM` does not substitute for `GEAR_SCALE[Chichen]`
+
+`chi = 1.0, sp = 1.2` — undo the Chichen gear correction and remove the holding
+premium that its doc comment blames for the `dead` column — reads **−1.38
+[−1.94, −0.82] \*** at 228 blocks, worse than either alone (`chi = 1.0` is −2.24,
+`sp = 1.2` interpolates to about −0.4). The mechanism in `GEAR_SCALE`'s doc
+comment is right about *why* Chichen's entries are wrong and wrong about which
+knob can fix it: the skull premium is load-bearing in three other places
+(`liquidation`, `held_premium`, `temple_outlook`'s resource-day haul, and
+Yaxchilan 4's `3.0 + SKULL_PREMIUM × 0.5`), so it cannot be spent on Chichen.
+
+### F34k. The screening ladder has been two shallow agents and one searching one, and only the searching one likes a bigger board term
+
+`evalab`'s `--agent mcts:N` leaves `MctsConfig::c_puct_init` at the committed
+default, and in `evalab-p23` (built from `6afe5fc`) that default is **2.0** —
+the value `docs/OVERNIGHT.md` measures as stopping the descent after about one
+turn. `Kind::Search`'s own doc comment says so. So the three-agent ladder this
+file screens on is really:
+
+| written as | what it is |
+| --- | --- |
+| `greedy:64` | one ply over 64 sampled moves |
+| `mcts:256` | 256 sims at `c_puct = 2.0` — **~1 turn of descent** |
+| `mcts:1024:cp=0.05` | 1,024 sims at `c_puct = 0.05` — the only one that searches |
+
+Two of the three cannot look further ahead than the evaluator's own forecast,
+and **every constant in `src/eval.rs` was fitted on those two**: `BOARD_SCALE`
+on `greedy:64` + `mcts:256` (F29c, F31a, F32), `TEMPO_PER_ROUND` on
+`heuristic:32`, `GEAR_SCALE` on `greedy:64` + `mcts:256`.
+
+That is the frame the board result sits in, and it makes the 2x2 the obvious
+experiment — `board = 0.8`, `--base head`, splitting simulations from `c_puct`:
+
+| | `c_puct = 2.0` (default) | `c_puct = 0.05` |
+| --- | --- | --- |
+| **256 sims** | −0.03 [−0.39, +0.33], 400 blk | (running: `bx_080_cp05`) |
+| **1,024 sims** | (running: `bx_080_1024`) | **+1.48 [+0.90, +2.07] \***, 163 blk |
+
+If the positive cell is the `c_puct` column rather than the sims row, then the
+question "is `BOARD_SCALE` right" has never actually been asked of a searching
+agent, and the answer for the shipped champion (`mcts:8192:cp=0.02`) is not the
+one in F31a/F32. If it is the sims row, it is a budget effect. Either way the
+control matters: `bd_t160` (`temple = 1.6`, which is −0.54 on `mcts:256` and
+−0.57 on `greedy:64`, and adds *more* absolute magnitude to the estimate than
+`board = 0.8` does) is running on the deep tier to test whether the deep search
+simply rewards a larger spread in `margin` — MCTS reads `eval::heuristic` as its
+prior as well as its leaf value, so a wider spread acts like a lower `c_puct`.
+`bd5_080` re-runs `board = 0.8` deep on **seed 5,000,000**, disjoint from every
+other cell here.
+
+**Nothing lands until those three finish.** F31a's own rule cuts both ways: the
+retraction of `board = 0.80` was measured on `greedy:64` and `mcts:256`, and
+neither of those is the evaluator's customer.
+
+## F34. A deeper search wants a more *concrete* evaluator — two signals, same direction
+
+Two independent deep-tier measurements have now stopped moving and they point at
+one claim. Both are `mcts:1024:cp=0.05` against the evaluator named, with the
+`mcts:256` reading of the identical variant beside it:
+
+| variant | mcts:256 (400 blk) | **mcts:1024:cp=0.05** | blocks |
+| --- | --- | --- | --- |
+| `board = 0.80` (up from the landed 0.65) | −0.03 [−0.39, +0.33] | **+1.44** [+0.87, +2.01] * | 174 |
+| `board = 0.90` (sibling runner) | +0.29 [−0.07, +0.66] | **+2.81** [+1.82, +3.80] * | 70 |
+| `temple = 1.0` (down from 1.4) | +0.11 [−0.28, +0.50] | **+2.13** [+1.24, +3.03] * | 60 |
+
+`greedy:64` says the opposite about `board` in both directions (0.80 −0.03,
+0.90 −0.28, 1.00 **−0.96 ***), so this is not a size disagreement between
+agents, it is a **different optimum for each depth**, and it is monotone in
+depth on the one axis where all three agents were measured.
+
+The reading, offered as a hypothesis with a falsifiable shape rather than a
+conclusion: `board_position` prices **what is on the board right now** — real
+workers on real gears — and `temple_outlook` prices a **projection**, where
+everyone's standings will be on a scoring day that has not happened. A search
+that descends one turn has to take both on trust. A search that descends six
+plays the ride out and finds out whether the worker really reaches the good
+space, *and* watches the temple standings actually move. So it wants the
+concrete term louder and the speculative one quieter — **not a smaller
+evaluator, a differently shaped one**.
+
+That predicts more than it has been tested on. If it is right, at depth:
+`held_premium` and `liquidation` (concrete) should hold or want raising, while
+`monument_outlook` and `starvation_risk`'s forecast should want shrinking — and
+`CORN_INCOME_PER_ROUND = 0.0`, which F23 landed for exactly this reason on a
+*shallow* search, should be even more right at depth. None of that is measured.
+
+**Block counts, honestly:** 174 / 70 / 60 against a rule (F30e) that says deep
+numbers under ~150 blocks halve. `board = 0.80` has passed that bar and has been
+flat at +1.4 to +1.6 over its last 50 blocks; the other two have not. **Nothing
+here is landed**, and `BOARD_SCALE` stays at 0.65 — the value that is best on
+two of three agents and costs nothing on the third.
+
+The one that is nearly actionable is `board = 0.80`: it reads **−0.03 on
+`greedy:64` at 400 blocks, −0.03 on `mcts:256` at 400, and +1.44 on the deep
+search at 174**. It costs nothing anywhere and gains a point and a half on the
+agent closest to the deliverable's `mcts:8192:heuristic:cp=0.02`. If it holds to
+250 blocks, land it.
