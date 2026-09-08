@@ -2227,3 +2227,294 @@ fn a_traversal_hint_reorders_the_walk_and_nothing_else() {
         "{compared} walks compared, {retrieval_heavy} of them over 200 retrievals"
     );
 }
+
+/// `options::pack` must order effects exactly as the derive does.
+///
+/// The dominance pass groups choices by a digest of their packed structural
+/// effects and re-sorts the survivors with `Choice`'s own `Ord`; if the packing
+/// disagreed with the derive anywhere, one of the two orders would be a lie and
+/// the `TREE_EDGE` index space would move under the search. The vocabulary is
+/// small enough to check every pair of a covering sample rather than argue.
+#[test]
+fn packed_order_matches_derived_ord() {
+    use tzolkin::options::pack;
+    let mut es: Vec<Effect> = Vec::new();
+    for n in [i16::MIN, -300, -7, -1, 0, 1, 7, 300, i16::MAX] {
+        es.push(Effect::Corn(n));
+    }
+    for n in [0u8, 3, 128, 255] {
+        es.push(Effect::SetCorn(n));
+    }
+    for r in Resource::ALL {
+        for n in [i8::MIN, -5, -1, 0, 1, 5, i8::MAX] {
+            es.push(Effect::Res(r, n));
+        }
+    }
+    for n in [i8::MIN, -1, 0, 1, i8::MAX] {
+        es.push(Effect::Points(n));
+        es.push(Effect::FreeWorker(n));
+        es.push(Effect::WorkerDiscount(n));
+        for t in Temple::ALL {
+            es.push(Effect::TempleStep(t, n));
+        }
+    }
+    for s in Science::ALL {
+        es.push(Effect::AdvanceResearch(s));
+    }
+    es.push(Effect::UnlockWorker);
+    for i in 0..12u8 {
+        es.push(Effect::TakePalenqueTile(Pos(i), TileKind::Corn));
+        es.push(Effect::TakePalenqueTile(Pos(i), TileKind::Wood));
+        es.push(Effect::BurnPalenqueWood(Pos(i)));
+        es.push(Effect::FillChichen(Pos(i)));
+    }
+    for i in 0..N_BUILDINGS as u8 {
+        es.push(Effect::Build(BuildingId(i)));
+    }
+    for i in 0..MONUMENTS.len() as u8 {
+        es.push(Effect::TakeMonument(MonumentId(i)));
+    }
+    for a in &es {
+        for b in &es {
+            assert_eq!(
+                pack(*a).cmp(&pack(*b)),
+                a.cmp(b),
+                "packed order disagrees for {a:?} vs {b:?} ({} vs {})",
+                pack(*a),
+                pack(*b)
+            );
+        }
+    }
+    // Injective, which is what makes the group digest sound in the first place.
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for e in &es {
+        assert!(seen.insert(pack(*e)), "packed collision on {e:?}");
+    }
+}
+
+/// The fast dominance pass must agree with the rule stated in prose.
+///
+/// `dominated_dedup` groups on a 64-bit digest for speed. This runs the literal
+/// rule -- sort on the filtered effect iterators, group by comparing them
+/// exactly, keep the Pareto front of the five wealth axes -- over lists
+/// harvested from real positions and shaped the way `choices_for_worker` shapes
+/// them, and demands the same sequence out. It is the guard that the digest is
+/// an accelerator and never the rule.
+#[test]
+fn dominated_dedup_matches_the_exact_rule() {
+    fn is_wealth(e: &Effect) -> bool {
+        matches!(e, Effect::Corn(_) | Effect::Points(_))
+            || matches!(e, Effect::Res(r, _) if *r != Resource::Skull)
+    }
+    fn wealth(c: &Choice) -> [i32; 5] {
+        let mut w = [0i32; 5];
+        for e in &c.0 {
+            match *e {
+                Effect::Corn(n) => w[0] += n as i32,
+                Effect::Res(r, n) if r != Resource::Skull => w[1 + r.idx()] += n as i32,
+                Effect::Points(n) => w[4] += n as i32,
+                _ => {}
+            }
+        }
+        w
+    }
+    fn reference(mut v: Vec<Choice>) -> Vec<Choice> {
+        let group = |a: &Choice, b: &Choice| {
+            a.is_skip() == b.is_skip()
+                && a.0
+                    .iter()
+                    .filter(|e| !is_wealth(e))
+                    .cmp(b.0.iter().filter(|e| !is_wealth(e)))
+                    .is_eq()
+        };
+        v.sort_unstable_by(|a, b| {
+            a.is_skip()
+                .cmp(&b.is_skip())
+                .then_with(|| {
+                    a.0.iter()
+                        .filter(|e| !is_wealth(e))
+                        .cmp(b.0.iter().filter(|e| !is_wealth(e)))
+                })
+                .then_with(|| {
+                    wealth(b).iter().sum::<i32>().cmp(&wealth(a).iter().sum::<i32>())
+                })
+                .then_with(|| a.cmp(b))
+        });
+        let mut front: Vec<[i32; 5]> = Vec::new();
+        let mut keep = 0usize;
+        let mut i = 0usize;
+        while i < v.len() {
+            let mut j = i + 1;
+            while j < v.len() && group(&v[i], &v[j]) {
+                j += 1;
+            }
+            front.clear();
+            for r in i..j {
+                let w = wealth(&v[r]);
+                if front.iter().any(|f| (0..5).all(|k| f[k] >= w[k])) {
+                    continue;
+                }
+                front.push(w);
+                v.swap(keep, r);
+                keep += 1;
+            }
+            i = j;
+        }
+        v.truncate(keep);
+        v.sort_unstable();
+        v
+    }
+
+    let mut lists = 0usize;
+    let mut nonempty_prunes = 0usize;
+    for seed in 0..6u64 {
+        let mut g = Game::new(seed);
+        for _ in 0..14 {
+            if g.state.over {
+                break;
+            }
+            for _ in 0..N_PLAYERS {
+                let p = g.state.current;
+                for w in g.state.on_board(p).collect::<Vec<_>>() {
+                    let Some((gear, pos)) = g.state.loc(w).on_board() else {
+                        continue;
+                    };
+                    // The shape `choices_for_worker` builds: every step-down fee
+                    // stacked into one list, which is where the dominance rule
+                    // has something to do.
+                    let corn = g.state.players[p.idx()].corn;
+                    let mut v = vec![Choice::skip()];
+                    for j in 0..=pos.0 {
+                        let fee = pos.0 - j;
+                        if fee > corn {
+                            continue;
+                        }
+                        let mut probe = g.state;
+                        probe.players[p.idx()].corn -= fee;
+                        for c in choices_at(&probe, p, gear, Pos(j)) {
+                            if fee == 0 {
+                                v.push(c);
+                            } else if !c.is_skip() {
+                                v.push(Choice::one(Effect::Corn(-(fee as i16))).chain(&c));
+                            }
+                        }
+                    }
+                    let n = v.len();
+                    let got = tzolkin::options::dominated_dedup(v.clone());
+                    let want = reference(v);
+                    assert_eq!(got, want, "dominance disagreed at {gear:?} {pos:?}");
+                    lists += 1;
+                    if got.len() < n {
+                        nonempty_prunes += 1;
+                    }
+                }
+                g.take_turn_sampled();
+                g.state.current = g.state.current.next(1);
+            }
+            g.end_round_public();
+        }
+    }
+    // Guard the guard: agreeing on lists that had nothing to prune proves
+    // nothing about the rule.
+    assert!(lists > 200, "only {lists} lists compared");
+    assert!(nonempty_prunes > 100, "only {nonempty_prunes} lists pruned");
+    println!("{lists} lists compared, {nonempty_prunes} of them pruned");
+}
+
+/// `temple_outlook`'s climb bonus stops where `GameState::temple_ceiling` does.
+///
+/// The bonus values the *next* step so the search sees climbing as progress
+/// between scoring days. It used to test only `step + 1 < steps`, so it paid
+/// for a move on to the exclusive top of a temple an opponent was already
+/// standing on — a move `temple_step` clamps away. Worth +0.08 [+0.01, +0.14]
+/// greedy:64 and +0.19 [+0.02, +0.35] mcts:256 on its own,
+/// `docs/FINDINGS-eval.md` F18/F21.
+///
+/// The arithmetic needs no evaluator constant. Yellow's step points are
+/// [-2, 0, 1, 2, 4, 6, 9, 12, 13] and its resource thresholds are 3 and 5, so
+/// the pairs (0,1), (1,2) and (6,7) cross no threshold, and with an opponent on
+/// the top step `p` never takes a majority prize. What is left in each
+/// difference is the step's own points and the climb credit — two equations for
+/// the day weight per point and the price of a point of jump, which makes the
+/// third pair a prediction rather than a fit.
+#[test]
+fn evaluator_climb_respects_the_exclusive_top() {
+    use tzolkin::data::temples::TEMPLES;
+    use tzolkin::eval::components;
+
+    let t = Temple::Yellow;
+    let pts = TEMPLES[t.idx()].points;
+    let top = (TEMPLES[t.idx()].steps - 1) as usize;
+
+    let temple_at = |step: usize| -> f32 {
+        let mut g = fresh();
+        g.state.temples[t.idx()][0] = step as u8;
+        g.state.temples[t.idx()][1] = top as u8;
+        components(&g.state, PlayerId(0)).temple
+    };
+    let (t0, t1, t2) = (temple_at(0), temple_at(1), temple_at(2));
+    let (t6, t7) = (temple_at(6), temple_at(7));
+
+    let d = |a: usize, b: usize| (pts[b] - pts[a]) as f32;
+    let jump = |k: usize| (pts[k + 1] - pts[k]) as f32;
+
+    // (1,2): equal jumps either side, so the difference is pure step points.
+    let w = (t2 - t1) / d(1, 2);
+    // (0,1): the jump falls by one, which prices the climb.
+    let c = (d(0, 1) * w - (t1 - t0)) / (jump(0) - jump(1));
+
+    // (6,7) is the prediction. At 7 `p` is on the ceiling of a blocked temple
+    // and cannot step again, so the climb credit there must be zero rather than
+    // `jump(7)`.
+    let want = d(6, 7) * w - jump(6) * c;
+    let old = d(6, 7) * w + (jump(7) - jump(6)) * c;
+    let got = t7 - t6;
+    assert!(
+        (want - old).abs() > 1e-2,
+        "the two behaviours are indistinguishable here, so the test proves nothing"
+    );
+    assert!(
+        (got - want).abs() < 1e-2,
+        "a blocked top must pay no climb: got {got}, want {want}, old behaviour {old}"
+    );
+}
+
+/// `starvation_risk` counts the corn a player holds, not corn it might earn.
+///
+/// It used to add `CORN_INCOME_PER_ROUND = 1.9` a round of assumed income
+/// before deciding whether a food day was survivable, which forgave any
+/// shortfall more than three rounds out — every shortfall at the start of a
+/// round block. Setting that to zero is the largest single effect measured on
+/// this evaluator since the term re-pricing: **+3.96 greedy:64 and +2.11
+/// mcts:256 at 800 blocks**, `docs/FINDINGS-eval.md` F23. The reason it works
+/// is that the income is exactly what the search is separately planning for, so
+/// assuming it here paid for the same corn twice.
+#[test]
+fn evaluator_starvation_ignores_income_it_has_not_earned() {
+    use tzolkin::eval::components;
+
+    let p = PlayerId(0);
+    let broke = {
+        let mut g = fresh();
+        g.state.players[p.idx()].corn = 0;
+        g
+    };
+    let fed = {
+        let mut g = fresh();
+        g.state.players[p.idx()].corn = 40;
+        g
+    };
+    // Day 0, so the next food day (`RESOURCE_DAYS[0]`) is eight rounds out --
+    // far enough that the old constant projected 15 corn of income and read no
+    // risk at all.
+    assert_eq!(broke.state.day, 0, "the distance to the food day is the point");
+    assert!(
+        components(&broke.state, p).starvation > 1.0,
+        "no corn and a bill to pay must score as risk however far off the day is"
+    );
+    assert_eq!(
+        components(&fed.state, p).starvation,
+        0.0,
+        "corn already in hand covers the bill"
+    );
+}

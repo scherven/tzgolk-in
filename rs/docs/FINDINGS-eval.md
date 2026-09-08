@@ -1064,3 +1064,630 @@ measurement platform can move without any action of your own.** `evalab`'s
 comes from whatever `eval.rs` is compiled in (F14). Before trusting two runs
 against each other, check `an.py -b` on them; if the `base` column has moved,
 they are not comparable no matter how tight their intervals are.
+
+## F17. The F3 mid-turn hump was `board_position`, and `94d85f3` already removed it
+
+**This retires the brief's F3 target.** The +2.70 mid-turn hump was measured on
+the *pre-landing* evaluator. Re-measured on the landed one it is gone, and the
+proof is a single binary running both sets of constants over one corpus in one
+process — the F14-safe way to tell a landing from a platform move. `--midturn`
+now takes `--vars 'a;b;c'` (`;` because a variant spec is itself
+comma-separated) and prints a trajectory per variant.
+
+`<scratch>/f3/mid1.txt`, `evalab --midturn --corpus 60 --take 3000`, 2745 turn
+roots, all rows from the same process. `v(k) - v(end)`, HEAD's own scale:
+
+```
+                     variant      d0      d3      d5      d7      d8    drift
+                        head  -1.953  -0.691  -1.270  -0.622  +0.006   -0.688
+ av=1.2,board=1.0,temple=1.0  -2.376  +0.203  +2.309  +1.333  +0.021   +0.773
+                   board=1.0  -2.495  -0.025  +1.620  +0.951  +0.013   +0.451
+                      av=1.2  -2.046  -0.783  -1.444  -0.725  +0.003   -0.786
+                  temple=1.0  -1.739  -0.380  -0.429  -0.191  +0.006   -0.299
+```
+
+Row 2 reproduces F3 (+2.31 at d5 against F3's +2.70, drift +0.773 against
+F3's +1.191; the corpus is the same command but the descent differs once the
+evaluator does). Row 1 is the committed file. **The peak went from +2.31 to
+−1.27 and the drift from +0.77 to −0.69.**
+
+Which constant did it: `board=1.0` alone (HEAD with only `BOARD_SCALE` put
+back) restores drift to **+0.451**, so `BOARD_SCALE 1.0 -> 0.5` is **−1.14 of
+the −1.46 swing**. `ACTION_VALUE` is inert on drift (−0.786 at 1.2 against
+−0.688 at 0.2) — `engine_value`'s worker count barely moves inside a turn.
+`TEMPLE_SCALE` contributes the other −0.39, by amplifying a term that is
+*under*-stated mid-turn.
+
+### F17a. The hump was never a hump: it is two lines crossing
+
+New in `--midturn`: the trajectory split by the `ModeChoice` the descent took.
+A turn is *either* placing or retrieving, and the two move the estimate in
+opposite directions, so averaging them produces a shape that belongs to neither.
+`<scratch>/f3/mid2.txt` and `mid1.txt`, same 2745 roots:
+
+```
+                pre-landing  (av=1.2,board=1.0,temple=1.0)        landed HEAD
+  depth      PLACE (2159)     RETRIEVE (586)            PLACE          RETRIEVE
+      0            -4.055            +3.813           -1.811            -2.479
+      3            -0.831            +4.012           -0.232            -2.379
+      4            -0.323            +2.692           -0.088            -1.381
+      5            +0.034            +2.832           (n<20)            -1.490
+      8                 -            +0.021                -            +0.006
+```
+
+* A **placing** turn under-states: the worker is in hand, `engine_value` pays it
+  `ACTION_VALUE` per `ROUNDS_PER_ACTION` and nothing else, and the moment it is
+  placed `board_position` pays it the space it is riding to. Placing was worth
+  **+4.06 points of pure estimate** before the landing and is worth +1.81 now.
+* A **retrieving** turn over-states: the workers still standing are being paid
+  their promise, and taking the action replaces that promise with what it
+  actually delivers. Before the landing the promise beat the delivery by
+  **+3.81**; now the delivery beats the promise by 2.48.
+* Place turns are **79%** of turns and are short (74% of them end at d3); retrieve
+  turns are 21% and long. So the early depths of F3's pooled table are the place
+  line and the deep ones are the retrieve line, and *"the crossover at depth 3"*
+  — which the brief read as placement finishing and retrieval beginning — is a
+  **change of sample, not a term changing sign**. Nothing crosses over; the
+  averaging does.
+
+### F17b. What is left is a cancellation, not a fix
+
+`--terms` on the landed evaluator (`<scratch>/f3/mid0.txt`), depth 5, term minus
+the same term of the completed turn:
+
+```
+   banked  liquid    held  temple  engine   board   monu  starve   total
+   -0.838  +0.107  +0.067  -3.235  -0.650  +3.130 -0.019  -0.033  -1.470
+```
+
+`board` still over-promises by **+3.13** (it was +8.56 at `BOARD_SCALE = 1.0`)
+and `temple` under-states by **−3.24**, because the temple steps the turn is
+about to take have not landed. The two nearly cancel *in the mean* and not at
+all per position: the sd of the depth-5 bias is **4.56** against a mean of
+−1.27. So the committed evaluator is not mid-turn-consistent; it is two large
+opposite errors that happen to sum to something small.
+
+### F17c. Drift is not a loss function — do not optimise it
+
+The same table, read against the strength numbers already in this file, kills
+the idea that a smaller |drift| is a better evaluator:
+
+```
+  variant          drift    strength vs committed
+  derived-static  -0.438    -26.88 greedy / -22.29 mcts   (S1)
+  derived         -0.484    -27.86 greedy                 (S1)
+  head            -0.688    (null)
+  board=1.0       +0.451    -10.48 greedy / -9.04 mcts    (F5, sign flipped)
+```
+
+The two smallest-|drift| variants in the file are the two worst players in it.
+`board=1.0` has the drift *closest to zero* of the four real evaluators and is
+10 points worse. Mid-turn consistency is a diagnostic that localises a bug once
+you already suspect one — it is what turned "the evaluator is over-priced" into
+"`board_position` is over-priced", F4 — and it is not a thing to minimise.
+
+Filename table additions: `f3/mid0.txt` landed-evaluator `--terms` + `--midturn`;
+`f3/mid1.txt` five variants' trajectories on one binary; `f3/mid2.txt` the same
+with the pre-landing evaluator first so the mode split is printed for it.
+
+## F18. Twenty-nine knobs screened on the landed evaluator — `<scratch>/f3/ab/*_greedy64.jsonl`
+
+Binary pinned at `<scratch>/f3/evalab-p2` (rev `8c2a56e` + `bin/evalab.rs`
+changes only), one runner holding `/tmp/evalab-f3-runner.lock.d`, one writer per
+file. Platform fingerprint, the `base` column of a null run: **30.8 greedy:64,
+33.4 mcts:256, 34.2 greedy:full**, and the null
+(`--ab 'board=0.5,av=0.2,temple=1.4'`, and again with every new knob written out
+at its committed value) reads **+0.00 [+0.00, +0.00]** — so the knobs added to
+`bin/evalab.rs` this run are inert at their defaults and `--eqcheck` is 0e0.
+
+**300 blocks (1200 games) each, `greedy:64`, against the committed evaluator.**
+Screening only: F13/F14's rule is that nothing lands on greedy evidence alone,
+and everything that survives here is re-run on MCTS below.
+
+| knob | value | centred | 95% CI |
+| --- | --- | --- | --- |
+| `TEMPO_PER_ROUND` | 0.35 | −2.35 | [−2.87, −1.82] * |
+| | 0.42 | −1.39 | [−1.89, −0.90] * |
+| | **0.62** | **+1.03** | **[+0.52, +1.53] *** |
+| | 0.75 | −2.85 | [−3.39, −2.32] * |
+| | 0.90 | −6.52 | [−7.14, −5.91] * |
+| `BUILDING_VALUE` | 0.0 | −0.87 | [−1.15, −0.58] * |
+| | **1.0** | **+0.34** | **[+0.02, +0.67] *** |
+| climb respects `temple_ceiling` | on | **+0.08** | **[+0.01, +0.14] *** |
+| `TEMPLE_CLIMB` | 0.0 / 0.25 / 0.50 | +0.04 / −0.16 / −0.32 | only 0.50 excludes 0 |
+| `TEMPLE_FAR` | 0.35 / 0.75 | −0.14 / +0.01 | both cover 0 |
+| `TEMPLE_NEAR` | 0.70 / 1.00 | −0.25 / −0.11 | both cover 0 |
+| distance discount `t_half` | 10 / 20 / 40 / 80 | −0.60 / +0.15 / −0.13 / −0.18 | only 10 excludes 0 |
+| `reach` cap (rounds) | 1 / 2 / 3 / 5 | −1.01 / −1.17 / −3.66 / −0.26 | worse or flat |
+| `monument` scale | 0.0 / 3.0 | +0.21 / −1.15 | 0.0 covers 0 |
+| `held` scale | 0.5 / 2.0 | +0.35 / −1.64 | 0.5 covers 0 |
+| `starvation` scale | 0.5 / 2.0 | −0.62 / −0.16 | — |
+
+What this settles:
+
+* **`TEMPO_PER_ROUND` wants to be 0.62, not 0.52.** It has not been swept since
+  `BOARD_SCALE` landed, and the two are coupled exactly as S3 predicted: the
+  old sweep found 0.52 with a board term twice this size. The curve is sharply
+  unimodal — 0.42 and 0.75 are both worse by more than a point, 0.90 by 6.5 —
+  so this is a real peak and not a plateau. It is also the knob the mid-turn
+  work points at: `tempo` is the discount on riding, i.e. the thing that
+  controls `board_position`'s promise about a worker's *future* space.
+* **`BUILDING_VALUE` is too low.** Deleting it costs −0.87, doubling it gains
+  +0.34, and both intervals exclude zero, so the residual-monument-counting
+  value of a built card is worth more than 0.45. Swept further in F19.
+* **The `climb` / `temple_ceiling` wart from F8 is real and worth +0.08**
+  [+0.01, +0.14], measurable at 300 blocks. It is tiny, but it is a free
+  correctness fix in the direction the rule already says.
+* **The temple discount's *shape* is inert.** `TEMPLE_NEAR`, `TEMPLE_FAR` and a
+  hyperbolic discount in the actual distance to the scoring day
+  (`t_half/(t_half+gap)`, which is the one thing the committed two-level rule
+  cannot express — a payout one day out and one twelve days out are both "the
+  near one") all read zero. Only the term's *scale* matters, and `TEMPLE_SCALE`
+  already carries it. **Dead end, do not re-sweep.**
+* **Capping how far a worker may be credited for riding is not the fix.**
+  `reach = 1..5` is flat-to-worse everywhere, so `board_position`'s max over the
+  whole reachable gear is not what over-prices it — the level is, and
+  `BOARD_SCALE` already has it.
+* `monument_outlook` can be deleted for +0.21 [−0.11, +0.53] and tripling it
+  costs −1.15. Third independent confirmation that the term is inert (F4, and
+  the plan workstream's −0.18). Not worth a constant; it is worth a rewrite or a
+  removal, neither of which is measurable as a scale.
+
+## F19. `--promise`: what `board_position` pays a worker against what its action delivers
+
+New diagnostic in `bin/evalab`, `<scratch>/f3/promise2.txt`. For every worker
+standing on a gear at a turn root where retrieving is legal, walk the tree to
+`Phase::Take { worker }`, take the best `Choice` by the evaluator's own
+estimate, and record
+
+```
+  promise  = BOARD_SCALE x rider_worth(worker)          what `board_position` pays it
+  delivery = h(after the Take) - h(before) + promise    what the action is worth
+```
+
+The `+ promise` is because retrieving deletes the worker's board credit, so the
+raw difference understates the action by exactly that. **53,704 standing workers
+over 29,960 turn roots.** This is the calibration F2's derived table could not
+do: `derived` priced the `Effect`s a space emits *in isolation* and lost the
+interaction the hand number was carrying (−27.9); this is the change in the
+*whole evaluator*, so every interaction is in it by construction.
+
+```
+  overall promise 1.835   delivery 2.740   ratio 1.493
+```
+
+Per space, `want = delivery / BOARD_SCALE` is the table entry that would make
+`board_position` agree with the rest of the evaluator. `r = want / table`:
+
+```
+  Palenque 1..7   r = 2.92 2.70 3.58 3.49 3.48 3.53 3.29
+  Yaxchilan 1..7  r = 3.66 3.13 3.03 2.51 3.57 3.13 3.09
+  Tikal 1..7      r = 0.30 1.93 0.94 1.33 5.19 3.14 2.87
+  Uxmal 1..7      r = 3.73 2.43 0.58 3.49 4.62 2.74 2.54
+  Chichen 1..10   r = 1.96 1.64 1.50 1.47 1.15 1.26 1.05 1.30 1.23 1.08
+```
+
+Read it as one common factor plus five outliers:
+
+* **The common factor is ~3 for everything that pays in *resources or temple
+  steps* and ~1.2 for Chichen, which pays in *points*.** Chichen's payout is
+  exact — points are points — so the ~2.5x gap between the two families is a
+  direct measurement of how much the evaluator's speculative terms
+  (`held_premium`, `temple_outlook`, `engine_value`) inflate a resource over its
+  banked-point worth. That inflation is the *level* problem `BOARD_SCALE = 0.5`
+  already prices, and the fact that consistency would want `BOARD_SCALE = 0.74`
+  (0.5 x 1.493) while strength wants 0.5 — `board=0.7` measures +5.10 against
+  +10.48 at 0.5, F5a — is F17c's point again, measured a third way.
+* **Tikal 1 (first research space): r = 0.30, the widest disagreement on the
+  board.** The table prices it at 2.00; the evaluator's own accounting for the
+  research level it hands over is 0.60. Tikal 3 (r = 0.94) and Uxmal 3, buying a
+  worker (r = 0.58), are the same story.
+* **Tikal 5 (two temple steps for a block): r = 5.19.** The table says 4.0 and
+  the evaluator says 19.4, because `temple_outlook x 1.4` counts both remaining
+  point days at full standings.
+
+### F19a. Re-ranking the table toward delivery is a monotone regression
+
+`Space::Calib` multiplies the *gated* table value by `r^alpha` and renormalises
+the level with `space_scale` so only the ranking moves. 300 blocks, greedy:64:
+
+| alpha | centred | 95% CI |
+| --- | --- | --- |
+| 0.25 | −2.91 | [−3.49, −2.33] * |
+| 0.50 | −3.97 | [−4.55, −3.38] * |
+| 0.75 | −5.76 | [−6.36, −5.16] * |
+| 1.00 | −6.23 | [−6.79, −5.67] * |
+
+Monotone, every cell distinguishable. `alpha = 1` is the *maximally mid-turn
+consistent* space table there is — by construction `board_position` then pays a
+worker exactly what the evaluator will pay it when the action lands — and it is
+**6.2 points worse**. Its mid-turn drift is the best of any real variant
+(−0.518 at `alpha = 0.5` against head's −0.688, `--midturn --vars`), which makes
+this the sharpest available statement of F17c: **self-consistency is the wrong
+objective, and it can be bought at 6 points a unit.**
+
+This is also the third independent kill of "replace the hand table with
+something derived" — `derived` (−27.9, F2), `defer` (+0.14, F5d) and now
+`calib`. The hand table's *ranking* is right and three different ways of
+deriving a better one have all failed.
+
+### F19b. What the outliers were really saying: `RESEARCH_SCALE` is too big
+
+`--promise` said the table and `engine_value` disagree about research by 3.3x.
+It does not say which is wrong. Sweeping the term that is not the table
+(`engine_value`'s `research_step_value(s,l) * uses * RESEARCH_SCALE`), 300
+blocks, greedy:64:
+
+| `RESEARCH_SCALE` | centred | 95% CI |
+| --- | --- | --- |
+| **0.25** | **+1.29** | **[+0.85, +1.73] *** |
+| 0.50 | (committed, null) | |
+| 0.75 | −3.40 | [−3.89, −2.90] * |
+| 1.00 | −8.81 | [−9.37, −8.24] * |
+| 1.50 | −15.30 | [−15.84, −14.76] * |
+
+Steeply monotone decreasing — so the table is right and **`engine_value` is
+paying too much for research**, the same over-pricing `ACTION_VALUE 1.2 -> 0.2`
+found in the worker half of the same term. Swept lower in F20.
+
+### F19c. Crediting the worker still in hand does not fix the root-side bias
+
+`hand_flat`: a flat credit per worker in hand, gated on being able to pay for
+the placement (the n-th costs `n + space_cost`, so k placements cost at least
+`k(k-1)/2`) and faded by the calendar the way `held_premium` is. Built to close
+F17a's −1.81 place-turn root gap without `hand_worker`'s max-over-the-board
+optimism, which is +3.32 greedy and −3.28 MCTS (S4).
+
+| credit | centred (greedy:64, 300 blk) |
+| --- | --- |
+| 0.3 | −0.10 [−0.62, +0.42] |
+| 0.6 | −0.80 [−1.28, −0.32] * |
+| 1.0 | −5.22 [−5.79, −4.65] * |
+| 1.5 | −14.90 [−15.43, −14.37] * |
+
+Monotone down, and it is *worse than `hand_worker` on the agent that liked
+`hand_worker`*. The difference tells you what the root bias is: `hand` credits
+the specific space a specific worker could reach, so it still ranks placements
+against each other; a flat credit only shrinks the gap between holding and
+placing, and that gap **is** the search's entire signal for where to put a
+worker. It also barely moves the thing it was built for — at 1.0 the root bias
+goes from −1.953 to −1.698, a quarter of the gap, for −5.22 points.
+
+**So the root-side under-statement is not a constant that can be added back.**
+It is the statement that a worker in hand has no *location*, and the evaluator's
+whole board term is about location. Any correction big enough to close it is big
+enough to stop distinguishing placements. Treat the −1.8 as inherent to a
+`(GameState, PlayerId) -> f32` evaluator; what makes it harmless is that it is
+nearly constant across the siblings of any one node.
+
+## F20. `RESEARCH_SCALE` down to a tenth, and the three knobs are additive
+
+Continuing F19b, 300 blocks (1200 games), `greedy:64`, against the committed
+evaluator. `<scratch>/f3/ab/rs0*_greedy64.jsonl`.
+
+| `RESEARCH_SCALE` | 0.0 | 0.10 | 0.15 | 0.25 | 0.35 | 0.50 | 0.75 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| centred | +1.60 | **+1.65** | +1.62 | +1.29 | +0.96 | null | −3.40 |
+| 95% CI | ±0.47 | ±0.46 | ±0.46 | ±0.44 | ±0.38 | — | ±0.50 |
+
+A plateau over **0.0..0.15**, indistinguishable across it, falling away by 0.35
+and off a cliff by 0.75. The committed 0.50 is well past the far edge. `0.10` is
+taken rather than `0.0` because it is interior to the plateau — F13's one
+surviving rule, that a constant should not be landed on the edge of one — and
+because deleting the term outright removes the only thing that makes the search
+value a research track at all.
+
+Reading this together with `ACTION_VALUE 1.2 -> 0.2` (F7/F10): both halves of
+`engine_value` — the per-worker throughput and the per-research-level payout —
+were priced 4-5x too high, and the *same* diagnostic found the second one.
+`engine`'s mean is 4.92 points now against the 19.49 it had at 6a99f2f.
+
+### F20a. Joint, and additive
+
+| variant | greedy:64, 300 blk | win |
+| --- | --- | --- |
+| `tempo=0.62` | +1.03 [+0.52, +1.53] * | 0.274 |
+| `rs=0.25` | +1.29 [+0.85, +1.73] * | 0.285 |
+| `bv=1.0` | +0.34 [+0.02, +0.67] * | 0.259 |
+| `ceiling` | +0.08 [+0.01, +0.14] * | 0.255 |
+| `tempo=0.62,rs=0.25` | +2.51 [+1.96, +3.05] * | 0.314 |
+| **`tempo=0.62,rs=0.25,bv=1.0,ceiling`** | **+3.05** [+2.52, +3.59] * | **0.335** |
+
+1.03 + 1.29 = 2.32 measured 2.51; adding 0.34 + 0.08 = 0.42 measured +0.54.
+**Additive to within the intervals**, which is the expected result for three
+knobs on three different terms — unlike `board`/`av`/`charge`, which are all
+knobs on one double count (F5b).
+
+Interactions checked on top of `rs=0.25`, all 300 blocks: `av` 0.1 / 0.3 / 0.5
+read +1.41 / +0.98 / −0.22 against +1.29 at 0.2, `board` 0.4 / 0.6 read
++1.09 / +1.05 against 0.5's +1.29, `temple=1.6` reads +1.36 against 1.4's +1.29,
+`engine=0.8` reads +0.84. **None of the landed constants moves**: shrinking
+research does not shift the optimum of the terms it is collinear with, which is
+the opposite of what shrinking `board` did to `av` in F7.
+
+## F21. MCTS confirmation — `tempo` is a greedy-only effect, `RESEARCH_SCALE` is not
+
+150 blocks (600 games), `mcts:256`, same pinned binary, `--base` the committed
+evaluator. Platform check first: `an.py -b` over the 150 shared seeds reads
+`base` = 33.098 / 33.166 / 33.211 across three of these runs, a spread of
+**0.11 points**, so they are one platform (F14a's detector).
+
+| variant | greedy:64, 300 blk | mcts:256, 150 blk |
+| --- | --- | --- |
+| `tempo=0.62` | +1.03 [+0.52, +1.53] * | **+0.13 [−0.46, +0.72]** |
+| `rs=0.0` | +1.60 [+1.13, +2.07] * | +1.41 [+0.80, +2.02] * |
+| `rs=0.10` | +1.65 [+1.20, +2.11] * | +1.30 [+0.70, +1.90] * |
+| `rs=0.25` | +1.29 [+0.85, +1.73] * | +0.84 [+0.36, +1.31] * |
+| `bv=1.0` | +0.34 [+0.02, +0.67] * | +0.39 [−0.11, +0.90] |
+| `ceiling` | +0.08 [+0.01, +0.14] * | +0.19 [+0.02, +0.35] * |
+| `tempo=0.62,rs=0.25,bv=1.0,ceiling` | +3.05 [+2.52, +3.59] * | +0.75 [+0.11, +1.39] * |
+| `tempo=0.62,rs=0.10,bv=1.0,ceiling` | — | +1.47 [+0.83, +2.11] * |
+
+**`TEMPO_PER_ROUND = 0.62` does not survive.** Greedy reads +1.03 with an
+interval that excludes zero at 300 blocks; MCTS reads +0.13 with an interval
+that covers it. And the four-knob variant containing it (+0.75 MCTS) is *no
+better than `rs=0.25` alone* (+0.84) on the agent that plays the game, while
+being 2.4 points better on greedy. This is the S3/F15 ratio taken to its limit:
+greedy over-reads an evaluator change, and a knob whose entire effect is inside
+`board_position`'s ride discount is exactly the kind of thing a one-ply agent —
+which only ever compares completed turns — reads differently from a search that
+looks at every node of the chain.
+
+`RESEARCH_SCALE` behaves the other way: +1.65 greedy against +1.30 MCTS, a ratio
+of 1.3 rather than 8, which is the normal relationship in this file. It is the
+one real effect in this wave.
+
+`ceiling` is the small, free correctness fix: +0.08 greedy, **+0.19 MCTS**, both
+excluding zero.
+
+### F21a. At 400 blocks: only `RESEARCH_SCALE` survives on MCTS
+
+`mcts:256`, **400 blocks (1600 games)** each, same binary, `an.py -b` spread
+0.11 across the wave.
+
+| variant | mcts:256, 400 blk | paired vs `rs=0.10` |
+| --- | --- | --- |
+| `rs=0.0` | +1.30 [+0.94, +1.65] * | **+0.29 [+0.01, +0.57] *** |
+| `rs=0.10` | +1.00 [+0.64, +1.37] * | — |
+| `rs=0.15` | +0.87 [+0.52, +1.21] * | −0.14 [−0.37, +0.10] |
+| `tempo=0.62` | **+0.02 [−0.34, +0.37]** | — |
+| `bv=1.0` | +0.19 [−0.10, +0.49] | — |
+| `ceiling` | +0.12 [+0.01, +0.22] * | — |
+| `rs=0.10,bv=1.0,ceiling` | +0.80 [+0.43, +1.17] * | −0.20 [−0.54, +0.13] |
+| `tempo=0.62,rs=0.10,bv=1.0,ceiling` | +1.20 [+0.81, +1.60] * | +0.20 [−0.24, +0.63] |
+
+* **`TEMPO_PER_ROUND = 0.62` is dead.** +0.02 at 400 blocks, an interval of
+  ±0.36 around zero. Greedy read +1.03 [+0.52, +1.53] at 300 blocks. The two
+  agents are not disagreeing about size here, they are disagreeing about
+  existence, and the greedy number is the one to throw away — `TEMPO_PER_ROUND`
+  lives only inside `board_position`'s ride discount, and a one-ply agent that
+  only ever compares completed turns weights that term differently from a search
+  that evaluates every node of the chain. **`TEMPO_PER_ROUND` stays at 0.52.**
+* **Adding `bv` and `ceiling` on top of `rs` buys nothing measurable**
+  (−0.20 [−0.54, +0.13] paired), even though `ceiling` alone is +0.12 and
+  distinguishable. At these sizes the bundle cannot be separated from its
+  largest member.
+* `RESEARCH_SCALE = 0.0` edges out 0.10 by +0.29 [+0.01, +0.57] paired — the
+  only one of these comparisons that resolves. Settled in F22.
+
+## F22. The `held_premium` price list, swept for the first time — `<scratch>/f3/ab/b5_*`
+
+Every constant inside `held_premium` and `starvation_risk` had only ever been
+moved as a group (`held=` / `starve=`, which scale the whole term). Both group
+scales read near zero — `held=0.5` is +0.35 [−0.17, +0.86] and `starve=0.5` is
+−0.62 — so the *level* of both terms is right. This sweeps the *mix*.
+
+**Base is `rs=0.05`, not the committed evaluator** (`--base 'rs=0.05'`), so
+these are marginal effects at the operating point F20/F21 arrived at, and the
+`b5_null` control reads +0.00 exactly. 300 blocks (1200 games), `greedy:64`.
+
+| constant | committed | tried | centred |
+| --- | --- | --- | --- |
+| `CORN_PREMIUM` | 0.10 | 0.0 / 0.05 / 0.20 / **0.35** | −0.82 / −0.36 / +0.70 * / **+1.28 [+0.76, +1.80] *** |
+| `BLOCK_PREMIUM` | 0.55 | **0.30** / 0.75 / 1.00 | **+0.75 [+0.33, +1.16] *** / −0.77 * / −1.74 * |
+| `CORN_INCOME_PER_ROUND` | 1.9 | **1.2** / 2.6 | **+0.79 [+0.41, +1.16] *** / −0.63 * |
+| `SKULL_PREMIUM` | 2.2 | 1.2 / 3.2 | −3.00 * / −1.65 * |
+| `BLOCK_BREADTH` | 0.50 | 0.0 / 1.0 | −0.09 / −0.33 |
+| `TILE_PREMIUM` | 0.25 | 0.0 / 0.6 | −0.00 / +0.05 |
+| monument gate (`short > k`) | 4 | 2 / 8 | +0.15 / +0.22 |
+| `corn_depth` (the S4 idea, re-run) | — | on | −0.10 [−0.31, +0.11] |
+| `ACTION_VALUE` | 0.2 | 0.3 / 0.4 | −0.37 * / −0.76 * |
+| `BOARD_SCALE` | 0.5 | 0.4 / 0.6 | −0.58 * / −0.55 * |
+| `TEMPLE_SCALE` | 1.4 | 1.6 | −0.48 * |
+
+* **Corn is under-priced and blocks are over-priced, and they move in opposite
+  directions inside one term whose total is already right.** `CORN_PREMIUM`
+  climbs monotonically from 0.0 to 0.35 and `BLOCK_PREMIUM` falls monotonically
+  from 1.0 to 0.30. That is the brief's corn hypothesis confirmed from the other
+  side: the flat premium is too *small*, not the wrong shape — because
+  `corn_depth`, which replaces the flat premium with the placement depth it
+  buys, is again **−0.10 [−0.31, +0.11]**, exactly the nothing S4 measured
+  before the re-pricing. **The number was wrong, not the functional form.**
+* `SKULL_PREMIUM = 2.2` is a genuine interior optimum: 1.2 and 3.2 are both
+  clearly worse, −3.00 and −1.65. It is the one constant in this term that was
+  already right, and it is the one used in three places.
+* **`ACTION_VALUE`, `BOARD_SCALE` and `TEMPLE_SCALE` all re-confirm at their
+  landed values** on this new base, in both directions, at 300 blocks. F11's
+  landing does not move when research comes down.
+* `BLOCK_BREADTH`, `TILE_PREMIUM` and the monument gate are inert in both
+  directions. `monument_outlook` cannot be fixed by widening or narrowing its
+  gate either — that is now four ways it has failed to matter.
+
+### F22a. The two corn constants, swept out
+
+Same base (`rs=0.05`), same 300 blocks, `greedy:64`.
+
+```
+  CORN_PREMIUM     0.0    0.05   0.10   0.20   0.35   0.50   0.70   1.00
+                 -0.82   -0.36   null  +0.70  +1.28  +1.90  +1.82  +0.61
+
+  BLOCK_PREMIUM    0.0    0.15   0.30   0.55   0.75   1.00
+                 +0.86   +0.94  +0.75   null  -0.77  -1.74
+
+  CORN_INCOME      0.0    0.4    0.8    1.2    1.5    1.9    2.6
+                 +2.15  +1.55  +1.15  +0.79  +0.22   null  -0.63
+```
+
+`CORN_PREMIUM` peaks at **0.50** (0.50 and 0.70 indistinguishable, 1.00 falls
+away), `BLOCK_PREMIUM` at **0.15** (0.0..0.30 a plateau), and
+`CORN_INCOME_PER_ROUND` is monotone to **0.0** — the more pessimistic
+`starvation_risk`'s assumed income, the better. `LIQUID_CORN` is inert: 24
+reproduces 16 to the digit and 8 is worse, so the cap rarely binds.
+
+**They are substitutes, not complements.** Every one of them pushes the agent to
+hold corn, and the joints are far short of the sum:
+
+```
+  cp=0.50                                +1.90
+  ci=0.0                                 +2.15
+  cp=0.35,bp=0.30                        +1.25   (sum of parts 2.03)
+  cp=0.50,bp=0.15,ci=1.2                 +2.30
+  cp=0.50,bp=0.15,ci=0.8                 +2.13
+  cp=0.70,bp=0.15,ci=0.8                 +1.79
+  rs=0.0 + cp=0.50,bp=0.15,ci=0.8        +2.22
+```
+
+The best joint is barely above the best single knob, so there is one underlying
+error here — *the evaluator does not hold enough corn* — and three constants
+that each partly correct it. Confirmed on MCTS in F23 before anything lands.
+
+### F22b. An initiative bonus is invisible to greedy by construction
+
+`init=k` adds `k` to the estimate of whoever `g.current` names. It is the one
+correction for F17a's root-side under-statement that cannot distort a
+within-turn ranking: every sibling at a node shares `g.current`, and only a
+commit edge changes it.
+
+`greedy:64`, 300 blocks: **−0.00, −0.02, −0.04** at k = 0.5, 1.0, 2.0, with
+intervals of ±0.03. Not "small" — *exactly* nothing, and that is the expected
+result: `Candidates::Sampled` scores completed turns of one player, all of which
+share `g.current`, so the constant cancels identically. Whether it does anything
+at all is a question only MCTS can be asked, because only a search crosses a
+commit edge. F23.
+
+## F23. MCTS says the win is `CORN_INCOME_PER_ROUND`, and half the greedy sweep is an artifact
+
+400 blocks (1600 games) per cell, **both agents on the same runs**, base = the
+committed evaluator, binary `<scratch>/f3/evalab-p8`. `<scratch>/f3/ab/f_*`.
+
+| variant | greedy:64 | mcts:256 | paired vs `rs=0.05,ci=0.0` (mcts) |
+| --- | --- | --- | --- |
+| `rs=0.05` | +1.75 [+1.34, +2.16] * | +1.11 [+0.75, +1.47] * | −1.14 [−1.69, −0.59] * |
+| `rs=0.05,ci=0.8` | +2.98 [+2.53, +3.44] * | +1.71 [+1.28, +2.14] * | −0.55 [−1.07, −0.02] * |
+| **`rs=0.05,ci=0.0`** | **+4.01** [+3.55, +4.48] * | **+2.25** [+1.80, +2.71] * | — |
+| `rs=0.05,cp=0.50` | +3.44 [+2.96, +3.91] * | +1.29 [+0.82, +1.75] * | −0.97 [−1.48, −0.46] * |
+| `rs=0.05,bp=0.15` | +2.94 [+2.44, +3.43] * | +0.60 [+0.23, +0.96] * | −1.66 [−2.18, −1.13] * |
+| `rs=0.05,cp=0.50,bp=0.15,ci=1.2` | +4.03 [+3.54, +4.51] * | +1.21 [+0.72, +1.69] * | −1.05 [−1.60, −0.50] * |
+| `rs=0.05,cp=0.50,bp=0.15,ci=0.0` | +3.58 [+3.12, +4.03] * | +1.49 [+1.01, +1.97] * | −0.76 [−1.34, −0.19] * |
+| `init=1.0` | −0.01 [−0.03, +0.00] | +0.05 [−0.31, +0.42] | — |
+| `init=2.0` | −0.03 [−0.06, +0.01] | −0.72 [−1.14, −0.30] * | — |
+
+* **`CORN_INCOME_PER_ROUND = 0.0` is the single largest effect this run
+  measured: +2.25 mcts:256, win rate 0.316.** `starvation_risk` assumed 1.9 corn
+  a round of future income and forgave a shortfall that far. Setting it to zero
+  makes the term score the position *as it stands* — the corn a player actually
+  holds against the bill they actually owe — and leaves the future income to the
+  search, which is the thing that can actually see whether the corn arrives.
+  Assuming it in the evaluator forgives a shortfall the search is separately
+  planning to fix, and pays for the same corn twice.
+* **`CORN_PREMIUM = 0.50` and `BLOCK_PREMIUM = 0.15` are largely a greedy
+  artifact.** Greedy reads +3.44 / +2.94 and MCTS +1.29 / +0.60 — a ratio of
+  2.7 and 4.9 against the ~1.3 that `rs` shows — and on top of `ci = 0` they
+  make things **worse** (paired −0.76). All three knobs push the agent to value
+  corn; once `starvation_risk` stops forgiving the shortfall, re-pricing corn in
+  `held_premium` on top of that over-corrects. **Do not land them.**
+* **An initiative bonus is dead on both agents.** +0.05 [−0.31, +0.42] at 1.0
+  and −0.72 * at 2.0. So the last available correction for F17a's root-side
+  under-statement fails too, and it fails in the most informative way: a
+  constant for whoever holds the move is *exactly* the shape of that bias, it
+  is the only correction that cannot distort a within-turn ranking, and it buys
+  nothing. **The root-side −1.95 is inherent, not a missing term** — see F19c
+  for the other half of the argument.
+
+### F23a. `starvation_risk`'s other constants are already right
+
+Everything on top of `rs=0.05, ci=0.2`, seed-paired against it, `mcts:256`,
+**400 blocks**. Platform check: `base` = 33.44 / 33.13 / 33.15 across the wave,
+spread 0.31, and the `g_null` control (every knob written out at its committed
+value on a freshly pinned binary) reads +0.00 on both agents.
+
+```
+  ci=0.0 instead of 0.2            -0.07 [-0.40,+0.25]
+  rs=0.0 instead of 0.05           -0.13 [-0.48,+0.21]
+  climb respects temple_ceiling    -0.05 [-0.38,+0.28]
+  urgency_floor 0.3 -> 0.1         -0.07 [-0.40,+0.25]
+  starvation scale x1.4            -0.24 [-0.75,+0.27]
+  starvation scale x0.7            -0.30 [-0.74,+0.13]
+  urgency 0.25 -> 0.5              -0.26 [-0.69,+0.16]
+  CORN_PREMIUM 0.10 -> 0.20        -0.29 [-0.75,+0.17]
+  RESEARCH_SCALE back to 0.5       -0.60 [-1.03,-0.16] *
+```
+
+Only the last row is distinguishable, and it is the one that undoes `rs`. So
+**the income assumption was the whole of `starvation_risk`'s error**: its
+weight, its urgency discount and its floor are all at an optimum already, and
+once the assumed income is gone, re-pricing corn in `held_premium` on top adds
+nothing. `CORN_INCOME_PER_ROUND` at 0.0 and 0.2 are indistinguishable; 0.0 is
+taken because greedy separates them (+2.15 against +1.55 at 0.4, monotone) and
+because zero is the statement the term should be making.
+
+## F24. What landed in `src/eval.rs`
+
+```
+  RESEARCH_SCALE          0.5  ->  0.05     (F19b, F20, F23)
+  CORN_INCOME_PER_ROUND   1.9  ->  0.0      (F23, F23a)
+  temple_outlook's climb loop now stops at `temple_ceiling` (F18, F21a)
+```
+
+Against the evaluator `94d85f3` landed, on the pinned binary
+`<scratch>/f3/evalab-p9`, `<scratch>/f3/ab/`:
+
+| agent | blocks | centred | win rate (null 0.250) |
+| --- | --- | --- | --- |
+| `greedy:64` | 800 | **+3.98** [+3.66, +4.30] * | 0.348 |
+| `greedy:full` | 200 | **+4.24** [+3.51, +4.97] * | 0.344 |
+| `mcts:256` | 800 | **+2.16** [+1.84, +2.48] * | 0.304 |
+| `mcts:1024` | 200 | **+1.37** [+0.73, +2.00] * | 0.284 |
+
+Greedy reads the effect ~1.9x MCTS's size, tighter than the 2.6x of F15, and
+`mcts:1024` reads less than `mcts:256` — some of this is repaired by search, so
+quote the 1024 number when the deliverable's budget is that high.
+
+Not landed, and each is a specific negative result rather than a "did not get
+to it": `TEMPO_PER_ROUND = 0.62` (+1.03 greedy, +0.02 MCTS at 400 blocks,
+F21a); `CORN_PREMIUM = 0.5` / `BLOCK_PREMIUM = 0.15` (+3.4 / +2.9 greedy, +1.29
+/ +0.60 MCTS, and *negative* on top of the corn-income fix, F23);
+`BUILDING_VALUE = 1.0` (+0.34 greedy, +0.19 MCTS, not separable); an initiative
+bonus, a flat hand-worker credit, a delivery-calibrated space table, a
+distance-aware temple discount, a `reach` cap on the ride, and every constant in
+`held_premium` other than the two above.
+
+Note for the next measurer: `bin/evalab`'s `v::HEAD` has been moved with this
+landing and `--eqcheck` re-run at 0e0 over 12,064 (position, seat) pairs, so
+**every number above this line is against the pre-F24 evaluator and numbers
+below it are against the new one**. The new null is
+`--ab 'board=0.5,av=0.2,temple=1.4,rs=0.05,ci=0.0,ceiling'` and reads +0.00; the
+pre-F24 evaluator is `--base 'rs=0.5,ci=1.9,noceiling'`, a spelling added for
+exactly this purpose. The greedy:64 platform fingerprint moved from
+`base 30.8` to `base 36.6` with the landing — both arms are the new evaluator
+now, and it scores six more points a game.
+
+`cargo test --release`: **177 passed, 0 failed, 7 ignored**, including two new
+pins in `tests/rules.rs`:
+`evaluator_climb_respects_the_exclusive_top` (constant-free: it solves for the
+day weight and the climb price from two step pairs that cross no resource
+threshold, then predicts a third) and
+`evaluator_starvation_ignores_income_it_has_not_earned`.
+
+### F24a. New diagnostics in `bin/evalab`
+
+| flag | what it answers |
+| --- | --- |
+| `--midturn --vars 'a;b;c'` | the mid-turn trajectory of *several* evaluators in one process, which is the only F14-safe way to ask whether a landing moved it |
+| `--midturn` mode split | the trajectory separately for placing and retrieving turns — F17a, and the reason F3's "hump" was an artifact of pooling them |
+| `--promise` | promise against delivery per space: `BOARD_SCALE x rider_worth` versus what taking the action moves `heuristic` by (F19) |
+
+New `V` knobs, all inert at their defaults and pinned by a null that reads
++0.00: `tnear`, `tfar`, `thalf`, `climb`, `ceiling`/`noceiling`, `reach`,
+`handv`, `rs`, `calib`, `cp`, `bp`, `bb`, `sp`, `tp`, `ci`, `mgate`, `init`,
+`lc`, `urg`, `ufl`, `fs`.

@@ -75,6 +75,11 @@ pub mod v {
     pub enum Space {
         /// The committed hand table.
         Table,
+        /// The hand table times a per-space factor measured by `--promise`:
+        /// what taking the action there actually moves `heuristic` by, divided
+        /// by what the table says it is worth. `space_scale` renormalises the
+        /// level so this is a change of *ranking* only.
+        Calib,
         /// Price the `Effect`s `spaces::choices_at` emits, and take the best
         /// choice. The whole point of the experiment.
         Derived,
@@ -106,6 +111,18 @@ pub mod v {
 
     /// `Space::DerivedStatic`: the mean of `Space::Derived` over 1500 turn
     /// roots (`--spacetab`), by gear and position.
+    /// `delivery / table` per space, from `evalab --promise --corpus 300`
+    /// (53,704 standing workers): the factor by which taking the action at that
+    /// space moves `heuristic` more than the hand table says it is worth.
+    /// Position 0 and the unused Chichen slots are 1.0 — the table is 0 there.
+    static RCAL: [[f32; 11]; 5] = [
+        [1.000, 2.923, 2.702, 3.577, 3.492, 3.483, 3.534, 3.289, 1.000, 1.000, 1.000],
+        [1.000, 3.658, 3.128, 3.033, 2.506, 3.569, 3.133, 3.085, 1.000, 1.000, 1.000],
+        [1.000, 0.302, 1.927, 0.944, 1.330, 5.189, 3.139, 2.867, 1.000, 1.000, 1.000],
+        [1.000, 3.725, 2.430, 0.584, 3.493, 4.623, 2.736, 2.544, 1.000, 1.000, 1.000],
+        [1.000, 1.956, 1.636, 1.502, 1.467, 1.148, 1.258, 1.052, 1.301, 1.233, 1.082],
+    ];
+
     const DERIVED_STATIC: [[f32; 11]; 5] = [
         // Palenque
         [0.00, 1.06, 2.75, 3.71, 4.76, 5.81, 5.81, 5.81, 0.0, 0.0, 0.0],
@@ -160,6 +177,71 @@ pub mod v {
         pub board_scale: f32,
         pub engine_scale: f32,
         pub temple_scale: f32,
+        /// The two-level confidence on a projected temple payout. `t_half > 0`
+        /// replaces both with a hyperbolic discount in the *distance* to the
+        /// day, `t_half / (t_half + (day - g.day))`, which is the thing the
+        /// committed pair cannot say: a payout one day out and one twelve days
+        /// out are both "the near one" today.
+        pub t_near: f32,
+        pub t_far: f32,
+        pub t_half: f32,
+        /// `TEMPLE_CLIMB`, and whether the climb credit respects
+        /// `GameState::temple_ceiling` — the top step of a track an opponent
+        /// already stands on cannot be climbed to, and `eval.rs` credits it.
+        pub climb: f32,
+        pub ceiling: bool,
+        /// Rounds of riding a placed worker may be credited for. `board_position`
+        /// maxes over every space the calendar still allows, which at
+        /// `rounds_left = 20` is the whole gear; this caps the look-ahead.
+        pub reach: f32,
+        /// A flat credit per worker still in hand, added *after* `board_scale`
+        /// so the number is in points. F17a: a placing turn under-states the
+        /// turn it is about to play by 1.81 points because `board_position`
+        /// pays a worker only once it is standing on a gear, and `hand_worker`
+        /// closes that gap by crediting the best space on the board — which is
+        /// +3.32 greedy and −3.28 MCTS (S4). This is the same correction
+        /// without the max: one number, gated on being able to pay for the
+        /// placement and on there being a round left to take the action in.
+        pub hand_flat: f32,
+        /// Exponent on the `--promise` ratio when `space` is `Calib`. 0 is the
+        /// hand table, 1 is the fully delivery-consistent one.
+        pub calib_alpha: f32,
+        /// `RESEARCH_SCALE`. `--promise` says the first research space delivers
+        /// 0.60 where the table prices it at 2.00 — the widest disagreement on
+        /// the board — so either the table is wrong there or `engine_value` is.
+        pub research_scale: f32,
+        /// The `held_premium` price list, and `starvation_risk`'s income
+        /// assumption. Every one of these is a hand number that has only ever
+        /// been moved as part of the whole term (`held=` scales all of them at
+        /// once and reads +0.35 / −1.64 at 0.5 / 2.0), never on its own.
+        pub corn_premium: f32,
+        pub block_premium: f32,
+        pub block_breadth: f32,
+        pub skull_premium: f32,
+        pub tile_premium: f32,
+        pub corn_income: f32,
+        /// How many blocks short a face-up monument may be and still be
+        /// credited. `monument_outlook` is inert (F4, F18) and this is the gate
+        /// most likely to be why.
+        pub monument_gate: i32,
+        /// A flat bonus for the player to move. `heuristic` cannot see the
+        /// `Phase`, but it *can* see `g.current`, so this is the one correction
+        /// for F17a's root-side under-statement that does not touch any
+        /// within-turn ranking: every sibling of a node shares it, and only a
+        /// commit edge — which hands the move on — sees it change.
+        pub initiative: f32,
+        /// The cap on how much held corn earns `corn_premium`. Only ever moved
+        /// with the premium itself, and the two trade off directly.
+        pub liquid_corn: f32,
+        /// `starvation_risk`'s discount on a shortfall that is still several
+        /// rounds out: `(1 / (1 + rounds * urgency)).max(urgency_floor)`.
+        pub urgency: f32,
+        pub urgency_floor: f32,
+        /// Scale on `engine_value`'s permanent-food-discount line, the corn a
+        /// free worker or a worker discount saves over every food day left.
+        /// Never swept; it becomes worth more once `starvation_risk` stops
+        /// assuming income (F23).
+        pub food_saving: f32,
         pub held_scale: f32,
         pub monument_scale: f32,
         pub starve_scale: f32,
@@ -178,8 +260,11 @@ pub mod v {
     ///
     /// `action_value`, `board_scale` and `temple_scale` were moved here from
     /// (1.2, 1.0, 1.0) when `docs/FINDINGS-eval.md` F11 landed the re-pricing,
-    /// so `--ab 'board=0.5,av=0.2,temple=1.4'` is now the null and must measure
-    /// 0 against this.
+    /// and `research_scale` (0.5), `corn_income` (1.9) and `ceiling` (false)
+    /// when F24 landed the second one, so
+    /// `--ab 'board=0.5,av=0.2,temple=1.4,rs=0.05,ci=0.0,ceiling'` is now the
+    /// null and must measure 0 against this. The pre-F24 evaluator is
+    /// `--base 'rs=0.5,ci=1.9,noceiling'`.
     pub const HEAD: V = V {
         action_value: 0.2,
         tempo: 0.52,
@@ -197,6 +282,27 @@ pub mod v {
         board_scale: 0.5,
         engine_scale: 1.0,
         temple_scale: 1.4,
+        t_near: 0.85,
+        t_far: 0.55,
+        t_half: 0.0,
+        climb: 0.10,
+        ceiling: true,
+        reach: 99.0,
+        hand_flat: 0.0,
+        calib_alpha: 0.0,
+        research_scale: 0.05,
+        corn_premium: 0.10,
+        block_premium: 0.55,
+        block_breadth: 0.50,
+        skull_premium: 2.2,
+        tile_premium: 0.25,
+        corn_income: 0.0,
+        monument_gate: 4,
+        initiative: 0.0,
+        liquid_corn: 16.0,
+        urgency: 0.25,
+        urgency_floor: 0.3,
+        food_saving: 1.0,
         held_scale: 1.0,
         monument_scale: 1.0,
         starve_scale: 1.0,
@@ -256,9 +362,13 @@ pub mod v {
         c.held = held_premium(vr, g, p, rounds_left) * vr.held_scale;
         c.temple = temple_outlook(vr, g, p) * vr.temple_scale;
         c.engine = engine_value(vr, g, p, rounds_left, horizon) * vr.engine_scale;
-        c.board = board_position(vr, g, p, rounds_left) * vr.board_scale;
+        c.board = board_position(vr, g, p, rounds_left) * vr.board_scale
+            + hand_flat(vr, g, p, rounds_left);
         c.monument = monument_outlook(vr, g, p, horizon) * vr.monument_scale;
-        c.starvation = starvation_risk(g, p) * vr.starve_scale;
+        if vr.initiative != 0.0 && g.current == p {
+            c.banked += vr.initiative;
+        }
+        c.starvation = starvation_risk(vr, g, p) * vr.starve_scale;
         c
     }
 
@@ -292,7 +402,7 @@ pub mod v {
         let mut v = if vr.corn_depth {
             corn_value(g, p) * spendable
         } else {
-            (pl.corn as f32).min(LIQUID_CORN) * CORN_PREMIUM * spendable
+            (pl.corn as f32).min(vr.liquid_corn) * vr.corn_premium * spendable
         };
 
         let counts = [
@@ -301,18 +411,18 @@ pub mod v {
             pl.get(Resource::Gold) as f32,
         ];
         let total: f32 = counts.iter().sum();
-        v += total.min(9.0) * BLOCK_PREMIUM * spendable;
+        v += total.min(9.0) * vr.block_premium * spendable;
         let breadth = counts.iter().copied().fold(f32::INFINITY, f32::min);
-        v += breadth.min(3.0) * BLOCK_BREADTH * spendable;
+        v += breadth.min(3.0) * vr.block_breadth * spendable;
 
         let chichen_left = 9u32.saturating_sub(g.chichen_filled.count_ones()) as f32;
         if chichen_left > 0.0 {
             let usable = (pl.get(Resource::Skull) as f32).min(chichen_left);
-            v += usable * SKULL_PREMIUM * spendable;
+            v += usable * vr.skull_premium * spendable;
         }
 
         if g.face_up_monuments().next().is_some() {
-            v += (pl.corn_tiles + pl.wood_tiles) as f32 * TILE_PREMIUM * spendable;
+            v += (pl.corn_tiles + pl.wood_tiles) as f32 * vr.tile_premium * spendable;
         }
         v
     }
@@ -344,36 +454,60 @@ pub mod v {
 
     fn temple_outlook(vr: &V, g: &GameState, p: PlayerId) -> f32 {
         let mut v = 0.0;
+        // Confidence in a payout `d` days out. The committed rule is two
+        // levels keyed on *which* remaining day it is; `t_half` keys it on how
+        // far away the day actually is.
+        let conf = |n: usize, d: u8| -> f32 {
+            if vr.t_half > 0.0 {
+                let gap = (d.saturating_sub(g.day)) as f32;
+                vr.t_half / (vr.t_half + gap)
+            } else if n == 0 {
+                vr.t_near
+            } else {
+                vr.t_far
+            }
+        };
         for (n, &d) in POINT_DAYS.iter().filter(|&&d| d > g.day).enumerate() {
             let age = 1 + POINT_DAYS.iter().filter(|&&x| x < d).count() as u8;
             let pts = g.temple_points(p, age) as f32;
-            v += pts * if n == 0 { TEMPLE_NEAR } else { TEMPLE_FAR };
+            v += pts * conf(n, d);
         }
-        for (n, &_d) in RESOURCE_DAYS.iter().filter(|&&d| d > g.day).enumerate() {
+        for (n, &dd) in RESOURCE_DAYS.iter().filter(|&&d| d > g.day).enumerate() {
             let mut haul = 0.0;
             for t in Temple::ALL {
                 let step = g.temple_pos(p, t);
                 for &(at, r) in TEMPLES[t.idx()].resources {
                     if step >= at {
                         haul += match r {
-                            Resource::Skull => 3.0 + SKULL_PREMIUM,
-                            other => other.corn_value() as f32 / CORN_PER_POINT + BLOCK_PREMIUM,
+                            Resource::Skull => 3.0 + vr.skull_premium,
+                            other => other.corn_value() as f32 / CORN_PER_POINT + vr.block_premium,
                         };
                     }
                 }
             }
-            v += haul * if n == 0 { TEMPLE_NEAR } else { TEMPLE_FAR };
+            v += haul * conf(n, dd);
         }
 
         let mut climb = 0.0;
         for t in Temple::ALL {
             let d = &TEMPLES[t.idx()];
             let step = g.temple_pos(p, t) as usize;
-            if (step + 1) < d.steps as usize {
+            // `temple_ceiling` is private to `state.rs`; this is the same rule.
+            let top = (d.steps - 1) as usize;
+            let ceiling = if vr.ceiling
+                && PlayerId::ALL
+                    .iter()
+                    .any(|&q| q != p && g.temple_pos(q, t) as usize == top)
+            {
+                top - 1
+            } else {
+                top
+            };
+            if step + 1 <= ceiling {
                 climb += (d.points[step + 1] - d.points[step]) as f32;
             }
         }
-        v += climb * TEMPLE_CLIMB;
+        v += climb * vr.climb;
 
         if vr.contention || vr.contend_temple {
             v += temple_contention(g, p);
@@ -439,13 +573,13 @@ pub mod v {
             .count() as f32;
         let saved =
             pl.free_workers as f32 * 2.0 + (pl.worker_discount as f32).min(2.0) * workers;
-        v += saved * food_days_left / CORN_PER_POINT;
+        v += saved * food_days_left / CORN_PER_POINT * vr.food_saving;
 
         let uses = (rounds_left / 3.0).min(7.0);
         for s in Science::ALL {
             let lvl = g.level(p, s);
             for l in 1..=lvl {
-                v += research_step_value(s, l) * uses * RESEARCH_SCALE;
+                v += research_step_value(s, l) * uses * vr.research_scale;
             }
             if lvl == 2 && horizon > 0.15 {
                 v += 0.4;
@@ -506,6 +640,27 @@ pub mod v {
             (Science::Theology, 3) => 0.90,
             _ => 0.0,
         }
+    }
+
+    /// What the workers still in hand are worth over the generic action
+    /// `engine_value` already pays them.
+    ///
+    /// Counted only for the workers the player could actually put down: the
+    /// n-th placement of a turn costs `n + space_cost` corn, so the cheapest
+    /// possible k placements cost `k(k-1)/2`.
+    fn hand_flat(vr: &V, g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
+        if vr.hand_flat == 0.0 || rounds_left <= 0.0 {
+            return 0.0;
+        }
+        let corn = g.players[p.idx()].corn as u32;
+        let hand = g.available(p).count() as u32;
+        let mut k = 0u32;
+        while k < hand && k * (k + 1) / 2 <= corn {
+            k += 1;
+        }
+        // The action still has to be taken, so the credit fades with the
+        // calendar the same way `held_premium`'s does.
+        k as f32 * vr.hand_flat * (rounds_left / 6.0).min(1.0)
     }
 
     fn board_position(vr: &V, g: &GameState, p: PlayerId, rounds_left: f32) -> f32 {
@@ -581,6 +736,16 @@ pub mod v {
 
     /// What one worker sitting at `(gear, pos)` is worth: the best space it can
     /// still ride to, less a round of its own throughput per space ridden.
+    /// `rider_worth` / `space_value` for the tabulated variants, so
+    /// `--promise` can ask what the committed evaluator pays a worker without
+    /// building a `Pricer` it will not consult.
+    pub fn rider_worth_head(vr: &V, g: &GameState, p: PlayerId, gear: Gear, pos: u8, rl: f32) -> f32 {
+        rider_worth(vr, g, p, gear, pos, rl, &Pricer::None)
+    }
+    pub fn space_value_head(vr: &V, g: &GameState, p: PlayerId, gear: Gear, pos: u8) -> f32 {
+        space_value(vr, g, p, gear, pos, &Pricer::None)
+    }
+
     fn rider_worth(
         vr: &V,
         g: &GameState,
@@ -591,7 +756,8 @@ pub mod v {
         price: &Pricer,
     ) -> f32 {
         let last = gear.size() - 1;
-        let reach = last.min(pos.saturating_add(rounds_left as u8));
+        let ride = rounds_left.min(vr.reach) as u8;
+        let reach = last.min(pos.saturating_add(ride));
         let sv = |j: u8| space_value(vr, g, p, gear, j, price);
         let mut worth = sv(pos);
         for j in (pos + 1)..=reach {
@@ -672,10 +838,18 @@ pub mod v {
                 (Gear::Tikal, 3) => 0.23,
                 (Gear::Tikal, 5) => 2.27,
                 (Gear::Uxmal, 1) => 0.91,
-                _ => table_space_value(g, p, gear, pos),
+                _ => table_space_value(vr, g, p, gear, pos),
             },
+            // The table's *ranking* replaced by the one `--promise` measured,
+            // gates and all, because this multiplies the gated value rather
+            // than replacing it (F2: the gates are most of the table's value).
+            (Space::Calib, _) => {
+                table_space_value(vr, g, p, gear, pos)
+                    * RCAL[gear as usize][(pos as usize).min(10)].powf(vr.calib_alpha)
+                    * vr.space_scale
+            }
             (Space::Table, _) | (_, Pricer::None) => {
-                let base = table_space_value(g, p, gear, pos);
+                let base = table_space_value(vr, g, p, gear, pos);
                 if vr.gates {
                     base.min(gate_ceiling(g, p, gear, pos))
                 } else {
@@ -685,7 +859,7 @@ pub mod v {
             (Space::DerivedFloor, pr) => {
                 let cs = tzolkin::spaces::choices_at(g, p, gear, Pos(pos));
                 if cs.iter().all(|c| c.is_skip()) {
-                    table_space_value(g, p, gear, pos)
+                    table_space_value(vr, g, p, gear, pos)
                 } else {
                     cs.iter().map(|c| pr.of(c)).fold(0.0, f32::max) * vr.space_scale
                 }
@@ -800,7 +974,7 @@ pub mod v {
         }
     }
 
-    pub fn table_space_value(g: &GameState, p: PlayerId, gear: Gear, pos: u8) -> f32 {
+    pub fn table_space_value(vr: &V, g: &GameState, p: PlayerId, gear: Gear, pos: u8) -> f32 {
         let pl = &g.players[p.idx()];
         match gear {
             Gear::Palenque => match pos {
@@ -819,7 +993,7 @@ pub mod v {
                 3 => 1.8,
                 4 => {
                     if g.skulls_remaining > 0 {
-                        3.0 + SKULL_PREMIUM * 0.5
+                        3.0 + vr.skull_premium * 0.5
                     } else {
                         0.2
                     }
@@ -928,7 +1102,7 @@ pub mod v {
                 .iter()
                 .map(|&r| (d.cost[r.idx()] as i32 - pl.get(r) as i32).max(0))
                 .sum();
-            if short > 4 {
+            if short > vr.monument_gate {
                 continue;
             }
             let pays = (d.score)(g, p) as f32;
@@ -958,7 +1132,7 @@ pub mod v {
         best * horizon.min(1.0)
     }
 
-    fn starvation_risk(g: &GameState, p: PlayerId) -> f32 {
+    fn starvation_risk(vr: &V, g: &GameState, p: PlayerId) -> f32 {
         let Some(next) = RESOURCE_DAYS
             .iter()
             .chain(POINT_DAYS.iter())
@@ -978,13 +1152,13 @@ pub mod v {
         }
         let owed = (mouths - free) as f32 * each as f32;
         let rounds = (next - g.day) as f32;
-        let expected = pl.corn as f32 + rounds * CORN_INCOME_PER_ROUND;
+        let expected = pl.corn as f32 + rounds * vr.corn_income;
         let short = owed - expected;
         if short <= 0.0 {
             return 0.0;
         }
         let unfed = short / each as f32;
-        let urgency = (1.0 / (1.0 + rounds * 0.25)).max(0.3);
+        let urgency = (1.0 / (1.0 + rounds * vr.urgency)).max(vr.urgency_floor);
         unfed * STARVE_POINTS * urgency
     }
 }
@@ -1081,6 +1255,29 @@ fn variant(name: &str) -> Option<v::V> {
                             "held" => out.held_scale = f,
                             "monu" => out.monument_scale = f,
                             "starve" => out.starve_scale = f,
+                            "tnear" => out.t_near = f,
+                            "tfar" => out.t_far = f,
+                            "thalf" => out.t_half = f,
+                            "climb" => out.climb = f,
+                            "reach" => out.reach = f,
+                            "handv" => out.hand_flat = f,
+                            "rs" => out.research_scale = f,
+                            "cp" => out.corn_premium = f,
+                            "bp" => out.block_premium = f,
+                            "bb" => out.block_breadth = f,
+                            "sp" => out.skull_premium = f,
+                            "tp" => out.tile_premium = f,
+                            "ci" => out.corn_income = f,
+                            "mgate" => out.monument_gate = f as i32,
+                            "init" => out.initiative = f,
+                            "lc" => out.liquid_corn = f,
+                            "urg" => out.urgency = f,
+                            "ufl" => out.urgency_floor = f,
+                            "fs" => out.food_saving = f,
+                            "calib" => {
+                                out.space = Space::Calib;
+                                out.calib_alpha = f;
+                            }
                             _ => return None,
                         }
                     }
@@ -1091,6 +1288,8 @@ fn variant(name: &str) -> Option<v::V> {
                         "colour" => out.building_colour = true,
                         "gates" => out.gates = true,
                         "hand" => out.hand_worker = true,
+                        "ceiling" => out.ceiling = true,
+                        "noceiling" => out.ceiling = false,
                         _ => return None,
                     },
                 }
@@ -1298,7 +1497,7 @@ fn cmd_spacetab(pos: &[(GameState, PlayerId)]) {
             for (g, p) in pos.iter().take(take) {
                 let list = v::Pricer::List(v::derived_price(g, *p));
                 let probe = v::Pricer::Probe(tzolkin::mcts::Gradient::new(g, *p));
-                let t = v::table_space_value(g, *p, gear, q) as f64;
+                let t = v::table_space_value(&v::HEAD, g, *p, gear, q) as f64;
                 let l = v::derived_space_value(g, *p, gear, q, &list) as f64;
                 let pr = v::derived_space_value(g, *p, gear, q, &probe) as f64;
                 ts += t;
@@ -1359,7 +1558,7 @@ fn cmd_spacetab(pos: &[(GameState, PlayerId)]) {
                     }
                     best.1
                 };
-                let t = pick(&|j| v::table_space_value(g, *p, gear, j));
+                let t = pick(&|j| v::table_space_value(&v::HEAD, g, *p, gear, j));
                 let d = pick(&|j| v::derived_space_value(g, *p, gear, j, &list));
                 let st = pick(&|j| v::static_space_value(gear, j));
                 tot += 1;
@@ -1475,6 +1674,126 @@ fn cmd_terms(pos: &[(GameState, PlayerId)], take: usize) {
     }
 }
 
+/// What `board_position` promises a standing worker, against what taking its
+/// action actually delivers — measured in the evaluator's own points.
+///
+/// This is the calibration F2's derived table could not do. `derived` priced
+/// the `Effect`s a space emits in isolation and lost the interaction the hand
+/// number was carrying (−27.9). This prices the *whole evaluator's* change when
+/// the action is really taken, so every interaction is included by
+/// construction: `delivery = h(after the Take) − h(before) + promise`, the
+/// `+ promise` because retrieving the worker deletes its board credit.
+///
+/// Reported per gear and position against the hand table's own entry, so a
+/// systematically mis-priced space is one row rather than a sweep.
+fn cmd_promise(pos: &[(GameState, PlayerId)], take: usize) {
+    use tzolkin::phase::{ModeChoice, Step};
+    let vr = v::HEAD;
+
+    // (gear, pos) -> (n, sum promise, sum delivery, sum sv_now)
+    type Cell = (usize, f64, f64, f64);
+    let rows: Vec<(usize, u8, f64, f64, f64)> = pos
+        .par_iter()
+        .take(take)
+        .flat_map_iter(|(g0, p)| {
+            let mut out: Vec<(usize, u8, f64, f64, f64)> = Vec::new();
+            let mut g = *g0;
+            // Beg is a real decision; take the "don't beg" edge so the position
+            // is the one the turn started from.
+            if tzolkin::tree::step_within_turn(&mut g, Phase::Beg, *p, 0, &Step::Beg(None))
+                .is_none()
+            {
+                return out.into_iter();
+            }
+            let steps = tzolkin::tree::legal_steps(&g, Phase::Mode, *p, 0);
+            if !steps.contains(&Step::Mode(ModeChoice::Retrieve)) {
+                return out.into_iter();
+            }
+            let before = v::heuristic(&vr, &g, *p);
+            for st in tzolkin::tree::legal_steps(&g, Phase::PickWorker, *p, 0) {
+                let Step::PickWorker(w) = st else { continue };
+                let Some((gear, wp)) = g.loc(w).on_board() else {
+                    continue;
+                };
+                let ph = Phase::Take { worker: w };
+                let mut best = f32::NEG_INFINITY;
+                for t in tzolkin::tree::legal_steps(&g, ph, *p, 0) {
+                    let mut probe = g;
+                    if tzolkin::tree::step_within_turn(&mut probe, ph, *p, 0, &t).is_some() {
+                        best = best.max(v::heuristic(&vr, &probe, *p));
+                    }
+                }
+                if best == f32::NEG_INFINITY {
+                    continue;
+                }
+                let rounds_left = (tzolkin::state::LAST_DAY.saturating_sub(g.day)) as f32;
+                let promise =
+                    v::rider_worth_head(&vr, &g, *p, gear, wp.0, rounds_left) * vr.board_scale;
+                let sv_now = v::space_value_head(&vr, &g, *p, gear, wp.0);
+                out.push((
+                    gear as usize,
+                    wp.0,
+                    promise as f64,
+                    (best - before) as f64 + promise as f64,
+                    sv_now as f64,
+                ));
+            }
+            out.into_iter()
+        })
+        .collect();
+
+    let mut cells: std::collections::BTreeMap<(usize, u8), Cell> = Default::default();
+    let (mut np, mut sp, mut sd) = (0usize, 0.0f64, 0.0f64);
+    for (gi, pp, pr, de, sv) in &rows {
+        let c = cells.entry((*gi, *pp)).or_default();
+        c.0 += 1;
+        c.1 += pr;
+        c.2 += de;
+        c.3 += sv;
+        np += 1;
+        sp += pr;
+        sd += de;
+    }
+    println!(
+        "\n=== promise vs delivery, {np} standing workers over {} turn roots ===\n\
+         promise: BOARD_SCALE x rider_worth, what `board_position` pays the worker.\n\
+         delivery: h(best Take) - h(before) + promise, what taking the action is worth.\n\
+         table:   space_value(gear, pos) as the hand table has it, act-now.\n\
+         want:    delivery / BOARD_SCALE -- the table entry that would be honest.",
+        pos.len().min(take)
+    );
+    println!(
+        "  overall promise {:.3}  delivery {:.3}  ratio {:.3}",
+        sp / np as f64,
+        sd / np as f64,
+        sd / sp
+    );
+    println!(
+        "{:>10} {:>4} {:>7} {:>9} {:>9} {:>8} {:>8}",
+        "gear", "pos", "n", "promise", "deliver", "table", "want"
+    );
+    for ((gi, pp), c) in &cells {
+        if c.0 < 10 {
+            continue;
+        }
+        let n = c.0 as f64;
+        println!(
+            "{:>10} {pp:>4} {:>7} {:>9.3} {:>9.3} {:>8.2} {:>8.2}",
+            format!("{:?}", Gear::ALL[*gi]),
+            c.0,
+            c.1 / n,
+            c.2 / n,
+            c.3 / n,
+            (c.2 / n) / vr.board_scale as f64
+        );
+    }
+    println!("-- machine readable: gear pos n table want --");
+    for ((gi, pp), c) in &cells {
+        let n = c.0 as f64;
+        println!("RATIO {gi} {pp} {} {:.5} {:.5}", c.0, c.3 / n, (c.2 / n) / vr.board_scale as f64);
+    }
+}
+
 // =======================================================================
 // The mid-turn question
 // =======================================================================
@@ -1544,7 +1863,16 @@ fn step_counts(s: &tzolkin::phase::Step) -> (u8, u8) {
 /// exactly as `Mcts` would see them.
 ///
 /// `traj` collects `vr`'s own estimate at each depth *within* the turn.
-fn greedy_descent(vr: &v::V, g0: &GameState, turn: PlayerId, traj: &mut Vec<f32>) -> Option<Done> {
+/// `mode` reports the `ModeChoice` the descent took, because a placing turn
+/// and a retrieving turn move the estimate in opposite directions and averaging
+/// them together is what made F3's trajectory look non-monotone.
+fn greedy_descent(
+    vr: &v::V,
+    g0: &GameState,
+    turn: PlayerId,
+    traj: &mut Vec<f32>,
+    mode: &mut u8,
+) -> Option<Done> {
     let mut g = *g0;
     let mut ph = Phase::Beg;
     let mut done = 0u8;
@@ -1565,6 +1893,13 @@ fn greedy_descent(vr: &v::V, g0: &GameState, turn: PlayerId, traj: &mut Vec<f32>
             }
         }
         let (dp, dt) = step_counts(&steps[best.1]);
+        if let tzolkin::phase::Step::Mode(m) = &steps[best.1] {
+            *mode = match m {
+                tzolkin::phase::ModeChoice::Place => 0,
+                tzolkin::phase::ModeChoice::Retrieve => 1,
+                tzolkin::phase::ModeChoice::Pity => 2,
+            };
+        }
         let mut next = g;
         match tzolkin::tree::step_within_turn(&mut next, ph, turn, done, &steps[best.1]) {
             Some((p2, d2)) => {
@@ -1593,6 +1928,8 @@ struct MidRow {
     /// HEAD's estimate at each depth within the turn, and at the end.
     traj: Vec<f32>,
     head_end: f32,
+    /// `ModeChoice` HEAD's descent took: 0 place, 1 retrieve, 2 pity.
+    mode: u8,
     /// Per variant: the best completion, the greedy descent, and what the
     /// greedy descent is worth *under HEAD*.
     best: Vec<Done>,
@@ -1600,11 +1937,26 @@ struct MidRow {
     got_head: Vec<f32>,
 }
 
-fn cmd_midturn(pos: &[(GameState, PlayerId)], budget: i64, take: usize) {
-    let names: Vec<&str> = vec![
-        "head", "charge", "hand", "hand2", "corn", "contend", "flat", "derived-static", "derived",
-    ];
-    let vars: Vec<v::V> = names.iter().map(|n| variant(n).unwrap()).collect();
+fn cmd_midturn(pos: &[(GameState, PlayerId)], budget: i64, take: usize, vars_arg: Option<String>) {
+    // `;`-separated because a variant spec is itself comma-separated. The
+    // default list is the one F3 was measured with; pass `--vars` to put an
+    // old evaluator on the same binary as the committed one, which is the only
+    // way to tell a landing apart from a platform move (F14).
+    let owned: Vec<String> = match &vars_arg {
+        Some(s) => s.split(';').map(|x| x.to_string()).collect(),
+        None => [
+            "head", "charge", "hand", "hand2", "corn", "contend", "flat", "derived-static",
+            "derived",
+        ]
+        .iter()
+        .map(|x| x.to_string())
+        .collect(),
+    };
+    let names: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    let vars: Vec<v::V> = names
+        .iter()
+        .map(|n| variant(n).unwrap_or_else(|| panic!("unknown variant {n}")))
+        .collect();
 
 
     let attempted = std::sync::atomic::AtomicUsize::new(0);
@@ -1619,11 +1971,16 @@ fn cmd_midturn(pos: &[(GameState, PlayerId)], budget: i64, take: usize) {
             let mut got = Vec::new();
             let mut got_head = Vec::new();
             let mut head_end = 0.0;
+            let mut mode = 255u8;
             for (i, vr) in vars.iter().enumerate() {
                 let mut b = budget;
                 best.push(best_completion(vr, g, Phase::Beg, *p, 0, 0, 0, &mut b)?);
                 let mut t = Vec::new();
-                let d = greedy_descent(vr, g, *p, &mut t)?;
+                let mut m = 255u8;
+                let d = greedy_descent(vr, g, *p, &mut t, &mut m)?;
+                if i == 0 {
+                    mode = m;
+                }
                 // The same turn, re-scored by HEAD, so every variant is judged
                 // on one yardstick as well as on its own.
                 got_head.push(replay_under_head(g, *p, vr));
@@ -1635,7 +1992,7 @@ fn cmd_midturn(pos: &[(GameState, PlayerId)], budget: i64, take: usize) {
                 trajs.push(t);
                 got.push(d);
             }
-            Some(MidRow { trajs, traj, head_end, best, got, got_head })
+            Some(MidRow { trajs, traj, head_end, mode, best, got, got_head })
         })
         .collect();
 
@@ -1670,6 +2027,73 @@ fn cmd_midturn(pos: &[(GameState, PlayerId)], budget: i64, take: usize) {
         "\n  turn root under-states the completed turn by {:+.3} points on average",
         -(root.iter().sum::<f64>() / root.len() as f64)
     );
+
+    // ---- 1a. the same trajectory for every variant, on one binary --------
+    //
+    // The point of this table is F14's lesson: the only honest way to ask
+    // "did the landing move the mid-turn bias" is to run the old constants and
+    // the new ones through the same build, on the same corpus, in one process.
+    println!(
+        "\n-- v(k)-v(end) by variant, each on its own descent and its own scale --"
+    );
+    print!("{:>28}", "variant");
+    for d in 0..maxd.min(11) {
+        print!(" {:>7}", format!("d{d}"));
+    }
+    println!(" {:>8}", "drift");
+    for (i, name) in names.iter().enumerate() {
+        print!("{name:>28}");
+        for d in 0..maxd.min(11) {
+            let xs: Vec<f64> = out
+                .iter()
+                .filter(|r| r.trajs[i].len() > d + 1)
+                .map(|r| (r.trajs[i][d] - r.trajs[i].last().unwrap()) as f64)
+                .collect();
+            if xs.len() < 20 {
+                print!(" {:>7}", "-");
+            } else {
+                print!(" {:>+7.3}", xs.iter().sum::<f64>() / xs.len() as f64);
+            }
+        }
+        let (mut ds, mut dn) = (0.0f64, 0usize);
+        for r in &out {
+            let t = &r.trajs[i];
+            let end = *t.last().unwrap();
+            for k in 3..t.len().saturating_sub(1) {
+                ds += (t[k] - end) as f64;
+                dn += 1;
+            }
+        }
+        println!(" {:>+8.3}", if dn == 0 { 0.0 } else { ds / dn as f64 });
+    }
+
+    // ---- 1b. split by what the turn actually was -------------------------
+    //
+    // A placing turn adds board value it has not paid for yet and a retrieving
+    // turn converts board value into banked points, so the two move the
+    // estimate in opposite directions. Averaged together they cancel into a
+    // shape that looks like a hump and is really two lines crossing.
+    for (tag, want) in [("PLACE", 0u8), ("RETRIEVE", 1u8)] {
+        let sel: Vec<&MidRow> = out.iter().filter(|r| r.mode == want).collect();
+        if sel.len() < 20 {
+            continue;
+        }
+        println!("\n-- HEAD, {tag} turns only ({} of {}) --", sel.len(), out.len());
+        println!("{:>6} {:>7} {:>11} {:>8}", "depth", "n", "v(k)-v(end)", "sd");
+        for d in 0..maxd.min(12) {
+            let xs: Vec<f64> = sel
+                .iter()
+                .filter_map(|r| r.traj.get(d).map(|&x| (x - r.head_end) as f64))
+                .collect();
+            if xs.len() < 20 {
+                continue;
+            }
+            let m = xs.iter().sum::<f64>() / xs.len() as f64;
+            let sd =
+                (xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (xs.len() - 1) as f64).sqrt();
+            println!("{d:>6} {:>7} {m:>+11.3} {sd:>8.3}", xs.len());
+        }
+    }
 
     // ---- 2. does the mid-turn signal find the good completed turn? -------
     println!(
@@ -1992,7 +2416,8 @@ fn main() {
 
     let n_pos: u64 = get("--corpus").and_then(|v| v.parse().ok()).unwrap_or(40);
     let need_corpus =
-        has("--eqcheck") || has("--cost") || has("--midturn") || has("--spacetab") || has("--terms");
+        has("--eqcheck") || has("--cost") || has("--midturn") || has("--spacetab") || has("--terms")
+            || has("--promise");
     let pos = if need_corpus {
         let t = Instant::now();
         let c = corpus(n_pos, 8);
@@ -2019,10 +2444,14 @@ fn main() {
         let take: usize = get("--take").and_then(|v| v.parse().ok()).unwrap_or(4000);
         cmd_terms(&pos, take);
     }
+    if has("--promise") {
+        let take: usize = get("--take").and_then(|v| v.parse().ok()).unwrap_or(4000);
+        cmd_promise(&pos, take);
+    }
     if has("--midturn") {
         let budget: i64 = get("--budget").and_then(|v| v.parse().ok()).unwrap_or(60_000);
         let take: usize = get("--take").and_then(|v| v.parse().ok()).unwrap_or(2000);
-        cmd_midturn(&pos, budget, take);
+        cmd_midturn(&pos, budget, take, get("--vars"));
     }
 
     if let Some(cand) = get("--ab") {

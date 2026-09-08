@@ -61,11 +61,24 @@ const SKULL_PREMIUM: f32 = 2.2;
 /// Points lost per worker that goes unfed on a food day.
 const STARVE_POINTS: f32 = 3.0;
 
-/// Corn a player can expect to bring in per round, used only to decide whether
-/// a food day is survivable. Deliberately pessimistic: the penalty should fire
-/// on positions that are genuinely short, not on every position that is not
-/// already holding the whole bill.
-const CORN_INCOME_PER_ROUND: f32 = 1.9;
+/// Corn a player is assumed to bring in per round before the next food day.
+///
+/// **Zero, and that is the point.** At 1.9 this forgave any shortfall more than
+/// three rounds out — which is every shortfall at the start of a round block —
+/// so `starvation_risk` only ever fired on a player already almost out of time.
+/// Taking the assumption away is the largest single effect measured on this
+/// file since the term re-pricing: **+3.96 greedy:64 [+3.65, +4.28] and +2.11
+/// mcts:256 [+1.79, +2.44] at 800 blocks**, and +4.24 at `greedy:full`.
+///
+/// The mechanism is a double count rather than a calibration error. The corn
+/// this projected is exactly the corn the *search* is separately planning to
+/// gather, so crediting it here too pays for it twice; the term's job is to
+/// score the position as it stands. 0.0 and 0.2 are indistinguishable under
+/// MCTS (−0.11 [−0.35, +0.13] paired at 800 blocks) and greedy separates them
+/// in favour of 0.0 (+2.15 against +1.55 at 0.4, monotone). The constant is
+/// kept rather than deleted because it is the knob a future sweep needs.
+/// `docs/FINDINGS-eval.md` F23, F23a.
+const CORN_INCOME_PER_ROUND: f32 = 0.0;
 
 /// Value of one worker-action, in points, *averaged over the actions a player
 /// actually gets to take*. Well under the 2-3 the mid-range entries of the
@@ -133,7 +146,22 @@ const ROUNDS_PER_ACTION: f32 = 2.6;
 const BUILDING_VALUE: f32 = 0.45;
 
 /// Global scale on [`research_step_value`], which is priced per *use*.
-const RESEARCH_SCALE: f32 = 0.5;
+///
+/// The other half of the over-priced `engine_value` that [`ACTION_VALUE`] found
+/// in its worker half: at 0.5 a maxed track was several points of pure
+/// forecast. Located by `evalab --promise`, which measures what the estimate
+/// actually *moves by* when a standing worker's action is taken — the first
+/// research space is the widest disagreement on the board, priced at 2.00 by
+/// `space_value` and delivering 0.60. Sweeping the side that is not the space
+/// table settles which of the two is wrong: 0.0, 0.10 and 0.15 are a plateau at
+/// +1.6 greedy:64, 0.35 is +0.96 and 0.75 is −3.40, so it is this one.
+///
+/// Worth **+1.11 mcts:256 [+0.75, +1.47]** on its own at 400 blocks, and it
+/// adds to the [`CORN_INCOME_PER_ROUND`] change rather than overlapping it
+/// (+1.73 and +1.11 alone, +2.25 together). Kept just off zero so the search
+/// still has a reason to finish a track; the data cannot tell 0.0 from 0.15.
+/// `docs/FINDINGS-eval.md` F19b, F20, F23.
+const RESEARCH_SCALE: f32 = 0.05;
 
 /// Fraction of a face-up monument's score credited to the player closest to
 /// affording it. See [`monument_outlook`].
@@ -147,11 +175,17 @@ const TEMPLE_FAR: f32 = 0.55;
 /// What one more step on a temple is worth between scoring days, as a fraction
 /// of the jump it unlocks. Without it the search sees climbing as free.
 ///
-/// Known wart, left alone deliberately: the `climb` loop tests only
-/// `step + 1 < steps`, so it credits the move on to the **exclusive top step
-/// even while an opponent stands there** and `GameState::temple_ceiling` will
-/// refuse it. Worth ~0.1 of one step's jump, far below anything measurable
-/// here, and fixing it means reimplementing a private helper of `state.rs`.
+/// The `climb` loop stops at the ceiling `GameState::temple_ceiling` imposes
+/// rather than at the top of the track: the exclusive top step of a temple an
+/// opponent already stands on cannot be climbed to, and crediting it paid for a
+/// move `temple_step` clamps away. Small but measurable despite being ~0.1 of
+/// one step's jump — **+0.08 greedy:64 [+0.01, +0.14] and +0.19 mcts:256
+/// [+0.02, +0.35]** on its own — and it does not separate from zero once the
+/// two constants above have landed (+0.05 [−0.02, +0.12] paired at 800 blocks).
+/// It is kept because the rule says so, not because it pays.
+///
+/// The scale itself is at an optimum and flat around it: 0.0 and 0.25 both read
+/// zero, 0.50 is −0.32. `docs/FINDINGS-eval.md` F18, F21a.
 const TEMPLE_CLIMB: f32 = 0.10;
 
 /// Per-block bonus for holding a *spread* of block types rather than a stack of
@@ -414,7 +448,19 @@ fn temple_outlook(g: &GameState, p: PlayerId) -> f32 {
     for t in Temple::ALL {
         let d = &TEMPLES[t.idx()];
         let step = g.temple_pos(p, t) as usize;
-        if (step + 1) < d.steps as usize {
+        let top = (d.steps - 1) as usize;
+        // `GameState::temple_ceiling` is private; this is its rule. A track
+        // whose exclusive top an opponent holds stops one short, and a step
+        // that would go nowhere is not progress worth paying for.
+        let ceiling = if PlayerId::ALL
+            .iter()
+            .any(|&q| q != p && g.temple_pos(q, t) as usize == top)
+        {
+            top - 1
+        } else {
+            top
+        };
+        if step + 1 <= ceiling {
             climb += (d.points[step + 1] - d.points[step]) as f32;
         }
     }
@@ -708,6 +754,12 @@ fn monument_outlook(g: &GameState, p: PlayerId, horizon: f32) -> f32 {
 /// This is the term whose absence let the old evaluator buy a sixth worker with
 /// two corn in hand and call it progress. The rule costs 3 points a head, which
 /// is more than most single actions are worth.
+///
+/// Everything in here except [`CORN_INCOME_PER_ROUND`] is already at an
+/// optimum, checked in both directions on top of the corrected income: scaling
+/// the whole term by 0.7 or 1.4 reads −0.30 and −0.24, moving the urgency
+/// coefficient to 0.5 reads −0.26 and its floor to 0.1 reads −0.07, none of
+/// them distinguishable from zero at 400 blocks. `docs/FINDINGS-eval.md` F23a.
 fn starvation_risk(g: &GameState, p: PlayerId) -> f32 {
     let Some(next) = RESOURCE_DAYS
         .iter()
