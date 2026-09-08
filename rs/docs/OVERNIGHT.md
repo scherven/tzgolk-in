@@ -134,6 +134,23 @@ cores from runs that can finish. **The very high sims arms are the ones to cut
 first**: cost scales with the budget while the measured return on it is small
 even now that the axis is live, so they are the worst ratio on the machine.
 
+## Deliverable check — done at 05:55, 11h56m out
+
+`uidump 7 9 132 44 --agent mcts:8192:heuristic:cp=0.02` renders, and the Moves
+panel shows *the search's own ranking* rather than a one-ply fallback. So the
+path the user asked for works end to end with the new champion. Two things to
+fix in phase E:
+
+* The shortlist is dominated by **restatements of one retrieval** — `w0[+3
+  corn] w1[-3 corn, G+1]` then the same with `w2[skip]`, `w3[skip]`, and both,
+  in each order. These are genuinely distinct moves (picking a worker up with
+  `skip` still returns it to hand), so `Move::same_effect` is right to keep
+  them and this is a *display* problem, not a correctness one. The panel should
+  collapse trailing no-op pickups, or the ranking should show one row per
+  distinct outcome.
+* Scores run 55.7 then 5.5, 4.7 — a 10x gap to the runner-up. Worth checking
+  the units are what the panel claims before the user reads them.
+
 ## Coupling worth knowing
 
 `src/mcts.rs:1573` calls `eval::heuristic` **directly** to order edges, so the
