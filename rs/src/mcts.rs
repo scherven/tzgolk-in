@@ -22,42 +22,113 @@
 //!   the turn, a `Take` three levels down a cold branch sees a handful — and one
 //!   constant cannot be right for both.
 //!
-//! # Against the alpha-beta, at matched work
+//! # Against the alpha-beta
 //!
 //! Worth knowing before spending another day tuning `search.rs`. On the same
-//! positions and at the same cost per turn — `mcts:2048` at 20.97 ms against
-//! `minimax:8:...::greedy:capw=25` at 19.45 ms, interleaved position by
-//! position so contention is common-mode — this search is **+3.27** centred
-//! score head to head (95% CI +1.78..+4.77, p = 1.7e-5, **150 blocks / 600
-//! games**, solo mode) and takes 31.6% of its games against three of them
-//! (95% CI 27.9..35.3), where an equally strong agent would take 25%.
+//! positions, `mcts:2048` is **+6.37** centred score head to head against
+//! `minimax:8:600000::greedy:capw=25` (95% CI +4.71..+8.02, p = 4.9e-14, **127
+//! blocks / 508 games**, solo mode) and takes 35.2% of its games against three
+//! of them (CI 30.8..39.7), where an equally strong agent would take 25%.
 //!
-//! **That is a third of what this comment used to claim.** The earlier figure
-//! was +9.32 (CI +6.09..+12.55) from **39 blocks**, and the two intervals do
-//! not overlap. Block-level sd of centred score is 9.3, so 39 blocks buys
-//! +/-3.0 and 150 buys +/-1.5; a six-point move is two intervals, not one, so
-//! this is not simply the small n. Two things changed with it: the machine was
-//! running four other agents, and `eval.rs` has been tuned since — which the
-//! alpha-beta consumes at *every* leaf while this search consumes it only at
-//! expansions, so an evaluator that got better closes the gap from the other
-//! side. Either way the direction survives and the size does not: MCTS is
-//! ahead, by about three points rather than nine.
+//! **And it does that on less CPU, not the same.** The two budgets are
+//! different kinds of thing — simulations against a depth — so they are matched
+//! by measuring: `/usr/bin/time` on `sprobe mcts`, one spec per process, four
+//! alternating runs each, puts `mcts:2048` at 2.398 s of user CPU and the
+//! alpha-beta at 2.955 s. The alpha-beta gets **1.23x the work** and still
+//! loses by six points. Use CPU seconds and not the clock for this: the same
+//! two specs measured by wall clock on a loaded machine read 1.52x and 1.03x on
+//! two consecutive runs, while the CPU figures repeat to within 3%.
 //!
-//! The match is on *work* rather than on the clock, deliberately. Both sides
-//! are budget-invariant: this search runs its 2048 simulations whatever else
-//! the machine is doing, and the alpha-beta is given a budget too large to bind
-//! so that it stops at `max_depth`. The 20.97-vs-19.45 ms figures are what make
-//! the two budgets comparable at all. Re-measured, the two budget kinds now
-//! agree: a 600-second budget and a 200 ms one differ by -0.67 centred (CI
-//! -2.19..+0.85, 147 shared seeds), so the clock did not bind at the
-//! concurrency used and the shrunken effect is not an artefact of it.
+//! With the `quality` preset ([`Priors::OnePly`] at `prior_temp = 1`) the gap
+//! is **+7.73** (CI +6.09..+9.36, 142 blocks / 568 games) and it takes **40.8%
+//! of its games** against three alpha-betas. That is the ceiling this search
+//! currently has against `search.rs`, and it is a prior away rather than a
+//! budget away.
 //!
-//! Not done yet: this is single-threaded. Virtual loss is applied and removed
-//! for real, on the mover's component only, so the mechanism is exercised and
-//! the shape is right, but the statistics are plain `u32`/`f32` rather than
-//! §3.1's atomics and there is no batching. Swapping in `AtomicU32` and signed
-//! fixed-point `AtomicI32` is mechanical; the descent logic does not change.
-
+//! The number this comment used to carry was **+9.32** from 39 blocks, then
+//! **+3.27** from 150. Neither survived. The first was measured on a machine
+//! running four other agents; the second on a search whose wide nodes were
+//! ordered by `Choice`'s derived `Ord` (see [`EdgeOrder`]) and against an
+//! `eval.rs` that has been tuned repeatedly since — which the alpha-beta
+//! consumes at *every* leaf and this search only at expansions, so both sides
+//! move when it does. The direction has survived three measurements and the
+//! size has not: quote the interval, quote the block count, and re-measure
+//! before quoting the number.
+//!
+//! # The simulation budget does nothing — until the prior is real
+//!
+//! Six head-to-heads, solo mode, `mcts:S` against `mcts:S/2` and one across
+//! the whole span, all at temperature zero so nothing is sampled:
+//!
+//! | candidate | baseline | centred | 95% CI | blocks |
+//! |---|---|---|---|---|
+//! | `mcts:256`  | `mcts:128`  | -0.68 | -2.18..+0.82 | 150 |
+//! | `mcts:512`  | `mcts:256`  | -0.74 | -2.19..+0.71 | 150 |
+//! | `mcts:1024` | `mcts:512`  | +0.22 | -1.36..+1.80 | 150 |
+//! | `mcts:2048` | `mcts:1024` | +0.22 | -1.46..+1.90 | 145 |
+//! | `mcts:4096` | `mcts:2048` | +0.80 | -0.92..+2.52 | 100 |
+//! | `mcts:2048` | `mcts:128`  | -1.08 | -2.79..+0.64 | 150 |
+//!
+//! **Sixteen times the budget is worth nothing.** Not "a gain too small to
+//! resolve" — the wide-span interval excludes anything above +0.64. Every
+//! `sims` number this project has chosen, `run.sh`'s included, was chosen on an
+//! axis that has been measured flat.
+//!
+//! It is flat because of what a simulation carries, not because search does not
+//! help. `HeuristicEvaluator` fills `Evaluation::priors` with `1.0 / n_edges`,
+//! so PUCT's exploration term does the entire job of a policy head and the
+//! thousandth simulation is spread as thinly as the first. Give the edges a
+//! real prior — [`Priors::OnePly`] at `prior_temp = 1`, the `quality` preset —
+//! and the same axis comes back to life:
+//!
+//! | candidate | baseline | centred | 95% CI | blocks |
+//! |---|---|---|---|---|
+//! | `mcts:2048` | `mcts:128` | -1.08 | -2.79..+0.64 | 150 |
+//! | `mcts:2048:quality` | `mcts:256:quality` | +3.04 | +1.46..+4.62 | 150 |
+//!
+//! Same search, same budget ratio to within a factor of two, opposite answer.
+//! The prior is also worth a great deal on its own: at equal simulations
+//! `quality` is **+8.84** centred against `mcts:2048` (CI +7.24..+10.44, 202
+//! blocks), and at 1360 simulations — **0.83x the CPU** of the 2048-simulation
+//! default — still **+7.68** (CI +5.90..+9.46, 119 blocks, p = 2.4e-17).
+//!
+//! So the order to tune things in is: the prior first, then the budget, and
+//! `max_edges` / `widen_cap` / `widen_c` never — all three are measured inert
+//! at their own fields below.
+//!
+//! # Threading
+//!
+//! Still single-threaded. Virtual loss is applied and removed for real, on the
+//! mover's component only, so the mechanism is exercised and the shape is
+//! right, but the statistics are plain `u32`/`f32` rather than §3.1's atomics
+//! and there is no batching. Swapping in `AtomicU32` and signed fixed-point
+//! `AtomicI32` is mechanical; the descent logic does not change. It would buy
+//! latency rather than throughput, though: self-play and the arena already fill
+//! every core by running whole games in parallel.
+//!
+//! Where a single descent's time goes, from `sample` over a 20-second window of
+//! a running arena (91,387 running samples, 28% of threads parked):
+//!
+//! | | share | owner |
+//! |---|---|---|
+//! | `Choice` sort / compare / eq | 24.7% | `options.rs` |
+//! | `simulate` (descent + backup) | 16.9% | here |
+//! | allocator | 14.6% | mostly `options.rs` |
+//! | `eval::heuristic` | 7.3% | `eval.rs` |
+//! | memmove / memset | 5.7% | mixed |
+//! | `options::` generation | 5.6% | `options.rs` |
+//! | `options::dominated_dedup` | 4.9% | `options.rs` |
+//! | `search_at` (the prune sweep) | 4.4% | here |
+//! | Vec/SmallVec build | 3.9% | mixed |
+//! | transposition hash + eq | 3.3% | here |
+//!
+//! **Three tenths of the search is `options::dominated_dedup` and the
+//! lexicographic `Choice` comparison underneath it**, reached from
+//! `spaces::choices_at`. Nothing in this file can avoid it — a node generates
+//! its edges exactly once, and the transposition index already stops the same
+//! node being generated twice. It is the single biggest lever this search has
+//! and it is in someone else's file.
+//!
 use crate::effect::{Choice, Effect};
 use crate::ids::*;
 use crate::options::EffectPrice;
@@ -94,25 +165,57 @@ pub struct MctsConfig {
     pub dirichlet_scale: f32,
     /// K of §2.6: how many edges a node opens with.
     ///
-    /// **Measured inert at 32.** Over 1,446,918 node expansions from
+    /// **Measured inert at 32.** Over 2,713,782 node expansions from
     /// `mcts:2048` on real positions (`bin/sprobe nodes`), legal edges per node
-    /// run p50 2, p90 6, p99 24, max 136 — so this cap drops an edge on
-    /// **0.39%** of nodes. `cap_per_width` was the alpha-beta's biggest single
-    /// win because its nodes were 184-644 moves wide; the analogous cap here
-    /// has almost nothing to bite on, and sweeping it would be sampling noise.
-    /// The wide nodes are `Take` nodes deep in a descent, not the roots of a
-    /// turn's sub-decisions, which are p50 3.
+    /// run p50 2, p90 6, p99 27, max 441 — so this window is short of the legal
+    /// list on **0.78%** of nodes, and progressive widening opens the rest of a
+    /// 441-edge node by its 42nd visit. `cap_per_width` was the
+    /// alpha-beta's biggest single win because its nodes were 184-644 moves
+    /// wide; the analogous cap here has almost nothing to bite on. The wide
+    /// nodes are `Take` nodes deep in a descent, not the roots of a turn's
+    /// sub-decisions, which are p50 3.
+    ///
+    /// It is still the window that [`EdgeOrder`] is really about: 0.78% of
+    /// nodes is where all of the ordering's effect lives, and it is why that
+    /// effect is small.
     pub max_edges: usize,
     /// §2.6's progressive widening, `N >= widen_c * m^widen_alpha` for the
-    /// m-th child. **Also measured inert**: a node opens with
+    /// m-th child. **Also measured inert**, and doubly so: a node opens with
     /// `min(edges, max_edges)` already active, so widening only ever governs
-    /// the 33rd edge and up — 0.0% of nodes in the same 1.4M-expansion sample
-    /// were sitting below the cap waiting on it.
+    /// the 33rd edge and up — 0.0% of nodes in the same 2.7M-expansion sample
+    /// were sitting below the cap waiting on it — and at `2.0 * m^0.5` the
+    /// 33rd edge needs 12 visits and the 441st needs 42. It is a soft delay
+    /// measured in tens of visits, not a restriction.
     pub widen_c: f32,
     pub widen_alpha: f32,
     /// The absolute ceiling widening may reach, and the width past which edges
-    /// are **deleted**. See [`EdgeOrder`] before changing it: a truncation is
-    /// only as good as the key it truncates on.
+    /// are **deleted**.
+    ///
+    /// # It is not needed, and 128 is not why
+    ///
+    /// This is the one knob here that loses information: widening can reopen an
+    /// edge it has not reached yet and cannot reopen one that is gone. So it
+    /// was raced against `nocap` (`usize::MAX`), with [`EdgeOrder::Gradient`]
+    /// deciding the order on both sides: **+0.15 centred, CI -1.47..+1.77, 138
+    /// blocks / 552 games** — nothing, in either direction. It costs nothing
+    /// either: 2.390 s of user CPU against 2.398 for the capped default, which
+    /// is the same number.
+    ///
+    /// The reason is how little it cuts. Over **2,713,782 node expansions** by
+    /// `mcts:2048` on 120 positions strided across 40 games (`bin/sprobe
+    /// nodes`), legal edges per node run p50 2, p90 6, p99 27, max 441 — and
+    /// the cap fires on **1,058 nodes, 0.039%**, deleting 27,412 of 8,870,785
+    /// edges: **0.309% of all edge mass**. Memory says the same. `Edge` is 88
+    /// bytes and `Node` 400, so the widest node in that sample is 39 kB
+    /// uncapped against 11.7 kB capped, and the whole arena for a sub-decision
+    /// is ~3,000 nodes.
+    ///
+    /// Keep it as a ceiling: `phase.rs` measured the widest factored node over
+    /// 38,816 turns at **2,293** edges with a p99 of 164, so nodes past 128 do
+    /// exist even though a 2048-simulation descent has not been caught
+    /// expanding one, and 2,293 edges is 0.2 MB in a single node. But do not
+    /// attribute anything to it, and see [`EdgeOrder`] before lowering it: a
+    /// truncation is only as good as the key it truncates on.
     pub widen_cap: usize,
     /// How a node wider than `max_edges` decides which edges survive. See
     /// [`EdgeOrder`].
@@ -129,6 +232,14 @@ pub struct MctsConfig {
     /// Softmax temperature for [`Priors::OnePly`], **in points** — the same
     /// scale `eval::heuristic` returns, so 4.0 means "a four-point edge over a
     /// sibling is worth e times the prior".
+    ///
+    /// **Sweep it before using it.** Against `mcts:2048` at equal simulations,
+    /// centred score by temperature: 0.5 → +6.42 (22 blocks), **1.0 → +8.84
+    /// (CI +7.24..+10.44, 202 blocks)**, 2.0 → +5.56 (28), 4.0 → +1.01 (27),
+    /// 8.0 → +1.36 (20). The default of 4.0 throws away seven of the eight
+    /// points a one-ply prior is worth: at four points per e-fold the prior is
+    /// nearly flat again, which is the state [`Priors::Evaluator`] is already
+    /// in. `quality` is the name for 1.0.
     pub prior_temp: f32,
     /// Do not spend a one-ply pass on a node narrower than this.
     ///
@@ -137,6 +248,11 @@ pub struct MctsConfig {
     /// resolved by three simulations whatever its prior says. Widths here run
     /// 2..2293 with a median searched width of 3 (`phase.rs`), so the threshold
     /// is where most of the saving is.
+    ///
+    /// Set it low. At 3 the prior is worth +8.84 against `mcts:2048`; at 8 it
+    /// is worth **+3.46** (CI +2.06..+4.85, 200 blocks). Skipping the probe on
+    /// 3-to-7-edge nodes skips it on most of the tree, and most of the tree is
+    /// where the strength was.
     pub prior_min_edges: usize,
 }
 
@@ -162,25 +278,60 @@ pub enum Priors {
     /// `TEMPO_PER_ROUND` for riding a gear) rather than only what a player is
     /// holding — which is what makes a one-ply score of "put a worker on gear
     /// X" mean anything at all.
+    ///
+    /// **This is the largest measured effect in the file**, and the only knob
+    /// that moved the search more than a point. At `prior_temp = 1` and
+    /// `prior_min_edges = 3` — spelled `quality` — it is +8.84 centred against
+    /// `mcts:2048` at equal simulations (CI +7.24..+10.44, 202 blocks / 808
+    /// games) and +7.68 at 1360 simulations, which is 0.83x the default's CPU
+    /// (CI +5.90..+9.46, 119 blocks). Against `minimax:8:600000::greedy:capw=25`
+    /// it is +7.78 (CI +6.11..+9.45, 137 blocks) and takes **40.7% of its
+    /// games** against three of them, where an equal agent takes 25%.
+    ///
+    /// It costs 1.34x the CPU per simulation at 2048, which the flat
+    /// budget-vs-strength curve in the module header makes free: buy it by
+    /// lowering `sims`, an axis that has been measured worth nothing.
     OnePly,
 }
 
-/// How a node too wide for `max_edges` decides which edges survive.
+/// How a node too wide for `max_edges` decides which edges are opened first,
+/// and — past `widen_cap` — which survive at all.
 ///
 /// # Why this is not just "sort by prior"
 ///
-/// It was, and it was the most expensive bug in this file. `sort_by` is stable
-/// and `HeuristicEvaluator` returns `1.0 / n_edges` for every edge, so sorting
-/// a uniform prior is a no-op: the truncation kept the first `widen_cap` edges
-/// in **generation order**, which is `Choice`'s derived lexicographic `Ord` --
-/// a fact about the declaration order of the `Effect` variants and about
-/// nothing whatsoever in the game. Measured over 446 wide nodes, which hold
-/// 52.8% of all edge mass, that deleted the one-ply-best edge at 55.6% of them.
+/// It was, and it was wrong. `sort_by` is stable and `HeuristicEvaluator`
+/// returns `1.0 / n_edges` for every edge, so sorting a uniform prior is a
+/// no-op: the window opened in **generation order**, which is `Choice`'s
+/// derived lexicographic `Ord` — a fact about the declaration order of the
+/// `Effect` variants and about nothing whatsoever in the game.
 ///
-/// Deleted, not deprioritised. Progressive widening can reopen an edge it has
-/// not reached yet; it cannot reopen one that is no longer in the array. Every
-/// strength number this search has ever produced was measured with the best
-/// move missing at half its wide nodes.
+/// How much that cost, priced against a one-ply score of every edge
+/// (`bin/sprobe trunc`, three position samples of 210 / 1,320 / 2,880):
+///
+/// | | best outside the opening 32 | mean regret |
+/// |---|---|---|
+/// | generation order | 65.6% / 38.0% / 34.5% of wide nodes | 0.63 / 0.37 / 0.28 pts |
+/// | gradient order | 12.5% / 12.5% / 6.0% | 0.02 / 0.06 / 0.01 pts |
+///
+/// **Read that as a delay, not a loss.** An earlier version of this comment
+/// said the truncation "deleted the one-ply-best edge at 55.6% of wide nodes"
+/// and that every number this search had produced was measured with the best
+/// move missing. That conflated the two halves of §2.6. The column above is
+/// `max_edges`, the *opening* window, and progressive widening reaches the
+/// 33rd edge after 12 visits. Actual deletion needs a node past `widen_cap`,
+/// and in a real descent that is 0.039% of expanded nodes and 0.309% of edge
+/// mass — see [`MctsConfig::widen_cap`].
+///
+/// Which is why the head-to-head is small. `ord=grad` against `ord=prior`,
+/// everything else equal: **+0.40 centred (CI -0.77..+1.57, 252 blocks / 1,008
+/// games)**, and an earlier 200-block run of the same pair read +1.03 (CI
+/// -0.33..+2.40). Inverse-variance pooled over both, **+0.67 (CI -0.22..+1.56,
+/// 452 blocks / 1,808 games)** — under a point and not distinguishable from
+/// zero. It is the right default anyway: it costs 1.8% of CPU (2.398 s against
+/// 2.355 of user time), it is the only one of the two orders that is a fact
+/// about the game rather than about `Effect`'s declaration order, and it is
+/// what makes `widen_cap` safe to leave alone. It is just not where the
+/// strength is — see [`Priors::OnePly`], which is worth twenty times as much.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EdgeOrder {
     /// Sort on the prior as it stands. Right when the prior is real -- a
@@ -204,10 +355,18 @@ pub enum EdgeOrder {
 /// every interaction between the effects of one choice; that is exactly why it
 /// is allowed to *order* edges and never to value them.
 ///
-/// Sixteen `heuristic` calls to build, then **16.0 ns per edge** to apply,
-/// against **123.0 ns** for the `apply_step`-and-score one-ply probe. That 7.7x
-/// is what makes a 7,784-edge node orderable at all, and it cuts the mean
-/// regret below the best surviving edge from 0.747 points to 0.057.
+/// Sixteen `heuristic` calls to build, then a handful of nanoseconds per edge
+/// to apply, against roughly 8x that for the `apply_step`-and-score one-ply
+/// probe — 16.0 against 123.0 ns on a quiet machine, 41.4 against 121.3 on a
+/// loaded one, so quote the ratio and not the figures. That is what makes a
+/// several-hundred-edge node orderable at all, and it cuts the mean regret
+/// below the best edge in the opening window from 0.28-0.63 points to
+/// 0.01-0.06 (see [`EdgeOrder`] for the samples).
+///
+/// It is an approximation and it says so: at the widest node in
+/// `tests/search.rs::the_edge_cap_deletes_nothing_the_search_can_reach` — 298
+/// edges — the gradient's top 128 misses the one-ply best just as generation
+/// order does. Ordering, never valuing.
 #[derive(Clone, Copy)]
 pub struct Gradient {
     price: EffectPrice,
@@ -254,7 +413,7 @@ impl Gradient {
     /// One `Step`, priced.
     ///
     /// Only `Take` carries a `Choice`, and only `Take` nodes are ever wide: the
-    /// 7,784-edge worst case is one worker's options on a full gear, where
+    /// 2,293-edge worst case (`phase.rs`) is one worker's options on a full gear, where
     /// `Placing` runs to a few hundred and every other phase is p50 3. A step
     /// this cannot price returns 0 and the stable tie-break leaves it in
     /// generation order, which is what those phases had anyway.
@@ -450,10 +609,23 @@ pub struct Mcts<E: Evaluator> {
     cfg: MctsConfig,
     rng: StdRng,
     nodes: Vec<Node>,
-    /// Transposition index. `FxHashMap` rather than the default: the key is a
-    /// whole 320-byte `GameState`, and SipHash over that costs about as much as
-    /// encoding the position for the network.
-    index: FxHashMap<NodeKey, u32>,
+    /// Transposition index, `digest -> the nodes carrying it`.
+    ///
+    /// **The key is eight bytes, not the position.** A map keyed by `NodeKey`
+    /// stores a 320-byte `GameState` per entry, so the index for one
+    /// sub-decision's 3,184 nodes was 1.3 MB of table that every probe walked
+    /// and every insert memcpy'd -- while the arena already holds each of those
+    /// states anyway. Keyed by the digest it is 76 kB, the insert copies eight
+    /// bytes, and `retain` renumbers without touching a state at all. Measured
+    /// **5.8% less CPU per turn** (+/-2.6%, six paired runs of `sprobe mcts
+    /// mcts:2048`), output bit-identical.
+    ///
+    /// Collisions are resolved against the arena, not by the hash: a bucket is
+    /// a list of node ids and [`Mcts::find_hashed`] compares the whole
+    /// `NodeKey` against each. That is the same comparison `HashMap` was doing
+    /// through `Eq`, so nothing about correctness moved -- see [`NodeKey`] for
+    /// what the digest is allowed to leave out because of it.
+    index: FxHashMap<u64, smallvec::SmallVec<[u32; 2]>>,
     /// Nodes carried over from the previous sub-decision, and nodes thrown
     /// away, for the last `search_at`. Observability for the reuse: if `reused`
     /// stays at zero across a turn the retention is not firing.
@@ -602,9 +774,7 @@ impl<E: Evaluator> Mcts<E> {
         let reusable = if self.reuse_disabled {
             None
         } else {
-            self.index
-                .get(&key)
-                .copied()
+            self.find(&key)
                 .filter(|&i| self.nodes[i as usize].in_root_turn)
         };
 
@@ -779,6 +949,24 @@ impl<E: Evaluator> Mcts<E> {
 
     pub fn arena_len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// What one edge and one node cost in bytes.
+    ///
+    /// The whole argument for `widen_cap` is that an uncapped node is
+    /// unaffordable, and that claim is arithmetic that nothing outside this
+    /// module can do: `Edge` holds a `Step`, and a `Step::Take` holds a
+    /// `Choice`, which is a `SmallVec<[Effect; 8]>` — inline, so an edge is far
+    /// wider than the `u32` an edge index suggests. A node's array is
+    /// `n_legal * edge_bytes()`.
+    pub const fn edge_bytes() -> usize {
+        std::mem::size_of::<Edge>()
+    }
+
+    /// A `Node` without its edge array. Dominated by the `GameState` it holds,
+    /// which is the transposition key and so has to be there anyway (§3).
+    pub const fn node_bytes() -> usize {
+        std::mem::size_of::<Node>()
     }
 
     /// `(legal edges, edges open)` for every node in the arena, interior ones
@@ -1065,21 +1253,36 @@ impl<E: Evaluator> Mcts<E> {
         }
         self.nodes = kept;
 
-        // Renumber the index in place rather than rebuilding it. The key is a
-        // 320-byte `GameState` and `retain` never touches a hash, where
-        // reinserting every surviving node hashes each of them again: at 2,310
-        // nodes retained per sub-decision and ~0.4 us a hash (the figure in
-        // `Cargo.toml` that bought `rustc-hash` in the first place) that rebuild
-        // was ~0.9 ms of a ~4.7 ms search. A `sample` profile put
-        // `BuildHasher::hash_one` at 17% of all stack tops, most of it here.
-        self.index.retain(|_, v| match mapping[*v as usize] {
-            Some(n) => {
-                *v = n;
-                true
+        // Renumber the index in place rather than rebuilding it. Reinserting
+        // every survivor would hash each of them again -- 2,310 nodes retained
+        // per sub-decision -- where `retain` hashes nothing. With the digest
+        // key this is now pure integer work: no state is read, compared or
+        // copied by the sweep.
+        self.index.retain(|_, b| {
+            b.retain(|i| mapping[*i as usize].is_some());
+            for i in b.iter_mut() {
+                *i = mapping[*i as usize].expect("the survivors were just filtered");
             }
-            None => false,
+            !b.is_empty()
         });
         0
+    }
+
+    /// The node holding this key, if the arena already has one.
+    ///
+    /// Two positions in one bucket is a digest collision, which at 64 bits over
+    /// the ~3,200 nodes of a sub-decision is not something that happens; the
+    /// list is there so that when it does, the answer is still right.
+    fn find(&self, key: &NodeKey) -> Option<u32> {
+        self.find_hashed(key.digest(), key)
+    }
+
+    fn find_hashed(&self, digest: u64, key: &NodeKey) -> Option<u32> {
+        let bucket = self.index.get(&digest)?;
+        bucket.iter().copied().find(|&i| {
+            let n = &self.nodes[i as usize];
+            n.phase == key.phase && n.turn == key.turn && n.done == key.done && n.state == key.state
+        })
     }
 
     fn node_for(
@@ -1098,18 +1301,14 @@ impl<E: Evaluator> Mcts<E> {
             return (self.push_terminal(state), true);
         }
         let key = NodeKey { state, phase, turn, done };
-        // `entry` rather than `get` then `insert`: the miss path is the common
-        // one -- an edge is only walked through here the first time it is
-        // followed, after which `Edge::child` caches the answer -- and hashing
-        // the position twice for it was half of all the hashing this search
-        // did. The index is claimed before the node exists, which is sound only
-        // because nothing between here and the `push` below touches
-        // `self.nodes`; the `debug_assert` there is what keeps that true.
-        let idx = self.nodes.len() as u32;
-        match self.index.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => return (*e.get(), false),
-            std::collections::hash_map::Entry::Vacant(e) => e.insert(idx),
-        };
+        // Digest once and carry it to the insert below. The miss path is the
+        // common one -- an edge reaches here only the first time it is
+        // followed, after which `Edge::child` caches the answer -- so the probe
+        // that finds nothing is what this hash is mostly paying for.
+        let digest = key.digest();
+        if let Some(i) = self.find_hashed(digest, &key) {
+            return (i, false);
+        }
 
         // A dead node would back up a terminal value for a live position, which
         // is worse than crashing, so this is an assert rather than a fallback.
@@ -1189,11 +1388,11 @@ impl<E: Evaluator> Mcts<E> {
         }
 
         let active = edges.len().min(self.cfg.max_edges);
-        debug_assert_eq!(
-            self.nodes.len() as u32,
-            idx,
-            "node_for claimed an index the push did not land on"
-        );
+        // Indexed after the push, not before it: the id is `nodes.len()`, and
+        // everything between the probe above and here -- `legal_steps`, the
+        // evaluator, `select_edges` -- is free to touch the arena.
+        let idx = self.nodes.len() as u32;
+        self.index.entry(digest).or_default().push(idx);
         self.nodes.push(Node {
             state,
             phase,
@@ -1274,8 +1473,8 @@ impl<E: Evaluator> Mcts<E> {
         let g = self.gradient(state, phase.mover(turn));
         let key: Vec<f32> = steps.iter().map(|s| g.step(s)).collect();
         let mut order: Vec<u32> = (0..steps.len() as u32).collect();
-        // A full sort of the widest node seen (7,784 edges) is ~50 us against
-        // the ~125 us its pricing already cost, so `select_nth_unstable` would
+        // A full sort of the widest node `phase.rs` has measured (2,293 edges)
+        // is well under the pricing it already cost, so `select_nth_unstable` would
         // be optimising the smaller half. Ties break on generation order rather
         // than on `sort_unstable`'s arbitrary choice, so that a node's surviving
         // edge set is a function of the position and two runs of the same seed
@@ -1435,13 +1634,17 @@ struct NodeKey {
     done: u8,
 }
 
-impl std::hash::Hash for NodeKey {
+impl NodeKey {
+    /// The bucket this key lands in. One `write_u64`'s worth of work: the
+    /// map's key *is* this number, so `FxHasher` sees eight bytes rather than
+    /// the ~270 rounds a derived `Hash` over nested `u8` arrays would cost. A
+    /// `sample` profile of `mcts:2048` had `GameState::hash` at **11.2% of all
+    /// stack tops** before this existed; it is 3.3% now, and the paired
+    /// measurement of the change alone is **8.5% less CPU per turn** (+/-3.2%,
+    /// six runs).
     #[inline]
-    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
-        // One `write_u64` rather than one per field: `FxHasher`'s per-call work
-        // is the same multiply either way, so the win is in how few times it is
-        // reached.
-        h.write_u64(mix(state_digest(&self.state), self.phase_word()));
+    fn digest(&self) -> u64 {
+        mix(state_digest(&self.state), self.phase_word())
     }
 }
 

@@ -240,7 +240,13 @@ fn main() {
             let mut all: Vec<(u32, u32)> = Vec::new();
             let (mut conc, mut uniform, mut nconc) = (0f64, 0f64, 0usize);
             let t = Instant::now();
-            for g in ps.iter().take(60) {
+            // Strided, not `take(n)`. `positions` emits game by game, so the
+            // first 60 of a six-game sample are two games -- and a claim about
+            // how wide a node the search ever expands is exactly the claim a
+            // two-game sample cannot make. `SPROBE_NODES` sets how many.
+            let want = env("SPROBE_NODES", 60).max(1);
+            let stride = (ps.len() / want).max(1);
+            for g in ps.iter().step_by(stride).take(want) {
                 let mut st = *g;
                 let mut at = (Phase::Beg, st.current, 0u8);
                 for _ in 0..32 {
@@ -295,6 +301,22 @@ fn main() {
                     inner.len(), iq(0.5), iq(0.9), iq(0.99), inner[inner.len() - 1],
                     cfg.max_edges, over, 100.0 * over as f64 / inner.len() as f64,
                     part, 100.0 * part as f64 / inner.len() as f64
+                );
+                // The only line that speaks to `widen_cap`, which is the half
+                // of §2.6 that deletes rather than delays. `n_legal` is the
+                // pre-cap width, so the edges past the cap are exactly the ones
+                // no widening can ever reopen.
+                let cut: u64 = inner
+                    .iter()
+                    .map(|&l| (l as usize).saturating_sub(cfg.widen_cap) as u64)
+                    .sum();
+                let total: u64 = inner.iter().map(|&l| l as u64).sum();
+                let past = inner.iter().filter(|&&l| l as usize > cfg.widen_cap).count();
+                println!(
+                    "past widen_cap={} on {past} nodes ({:.3}%), deleting {cut}/{total} edges ({:.3}% of edge mass)",
+                    cfg.widen_cap,
+                    100.0 * past as f64 / inner.len() as f64,
+                    100.0 * cut as f64 / total.max(1) as f64
                 );
             }
             widths.sort_unstable();
@@ -466,6 +488,18 @@ fn main() {
                      wide_mass, mass, 100.0 * wide_mass as f64 / mass.max(1) as f64, q(0.5), q(0.9), worst);
             println!("per edge: gradient {:.1} ns   one-ply {:.1} ns   ({:.1}x)",
                      t_grad * 1e9 / n_edges as f64, t_oneply * 1e9 / n_edges as f64, t_oneply / t_grad.max(1e-12));
+            // What an uncapped node actually costs. The cap is defended as a
+            // memory bound as much as a time one, and that defence is
+            // arithmetic nobody had done: an `Edge` carries a whole `Choice`.
+            let eb = tzolkin::mcts::Mcts::<tzolkin::phase::HeuristicEvaluator>::edge_bytes();
+            let nb = tzolkin::mcts::Mcts::<tzolkin::phase::HeuristicEvaluator>::node_bytes();
+            // `phase.rs` measured the widest factored node over 38,816 turns at
+            // 2,293 edges; that is the number the cap was written against.
+            println!("node {nb} B + {eb} B/edge: widest here ({worst}) = {:.1} kB uncapped vs {:.1} kB at wcap=128; \
+                      phase.rs's widest measured node (2293) would be {:.2} MB",
+                     (nb + worst * eb) as f64 / 1024.0,
+                     (nb + worst.min(128) * eb) as f64 / 1024.0,
+                     (nb + 2293 * eb) as f64 / 1048576.0);
             println!();
             println!("{:<11} {:>8} | {:>16} {:>10} | {:>16} {:>10}", "order", "cap", "best deleted", "regret", "best not in top32", "regret");
             for (ord, cap, r) in &rows {

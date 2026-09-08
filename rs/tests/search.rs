@@ -921,7 +921,7 @@ fn a_prior_bias_steers_without_excluding() {
 /// cannot be attributed to either.
 #[test]
 fn mcts_flags_reach_the_config_and_the_label() {
-    use tzolkin::mcts::Priors;
+    use tzolkin::mcts::{EdgeOrder, MctsConfig, Priors};
     use tzolkin::record::AgentSpec;
 
     let spec = |s: &str| AgentSpec::parse(s, false).unwrap_or_else(|e| panic!("{s}: {e}"));
@@ -937,6 +937,41 @@ fn mcts_flags_reach_the_config_and_the_label() {
     assert_eq!(cfg("mcts:64:cp=1.5,fpu=0.4,k=16").max_edges, 16);
     assert!(!cfg("mcts:64:noreuse").tree_reuse);
     assert!(AgentSpec::parse("mcts:64:nonsense=3", false).is_err());
+
+    // `nocap` is the readable spelling of "never truncate"; `wcap=0` would be
+    // clamped to a one-edge node instead.
+    assert_eq!(cfg("mcts:64:nocap").widen_cap, usize::MAX);
+    assert_eq!(cfg("mcts:64:wcap=512").widen_cap, 512);
+    assert_eq!(cfg("mcts:64:ord=prior").ordering, EdgeOrder::Prior);
+    assert_eq!(cfg("mcts:64:ord=grad").ordering, EdgeOrder::Gradient);
+    assert_eq!(
+        MctsConfig::default().ordering,
+        EdgeOrder::Gradient,
+        "the measured default"
+    );
+
+    // A preset is a claim about a measurement, so pin what it expands to.
+    // `quality` means "one-ply priors at a temperature of one", which is the
+    // config that measured +8.84 centred against `mcts:2048` over 202 blocks
+    // and +5.39 over 61 blocks at 0.83x its CPU. Re-point the word at a
+    // different config and those numbers stop being about it -- and the spec
+    // string is the only thing a results table records.
+    let d = MctsConfig::default();
+    let q = cfg("mcts:64:quality");
+    assert_eq!(q.priors, Priors::OnePly);
+    assert_eq!(q.prior_temp, 1.0);
+    // And *only* those two: a preset that quietly moved a third knob would
+    // invalidate every number measured under the flags it replaced.
+    assert_eq!(q.prior_min_edges, d.prior_min_edges);
+    assert_eq!(q.max_edges, d.max_edges);
+    assert_eq!(q.widen_cap, d.widen_cap);
+    assert_eq!(q.ordering, d.ordering);
+    assert_eq!(q.c_puct_init, d.c_puct_init);
+    assert_eq!(
+        spec("mcts:64:quality").name(),
+        spec("mcts:64:pri=1ply,ptemp=1").name(),
+        "sugar and its expansion are one agent and must share one name"
+    );
 
     // No two variants may share a name, or the progress file cannot say which
     // side of a race a block belongs to.
@@ -1046,4 +1081,123 @@ fn mcts_ranks_its_own_turns_and_does_not_claim_the_whole_move_space() {
             }
         }
     }
+}
+
+// =======================================================================
+// MCTS: what the §2.6 cap and the edge ordering are allowed to do
+// =======================================================================
+
+/// The two halves of §2.6 are not the same decision, and only one of them
+/// loses information.
+///
+/// `widen_cap` **deletes** edges: progressive widening can reopen an edge it
+/// has not reached yet, never one that is no longer in the array. `max_edges`
+/// only sets which edges open *first*; the rest arrive once the node has
+/// `widen_c * m^widen_alpha` visits, which for the 33rd edge is twelve.
+///
+/// So this checks the deleting half is inert at the widths the game actually
+/// produces, and that the ordering earns its place in the half that is not.
+/// Both bounds are relative — gradient no worse than generation order — rather
+/// than thresholds, because `eval::heuristic` is tuned continually and a magic
+/// number here would go red on somebody else's improvement.
+#[test]
+fn the_edge_cap_deletes_nothing_the_search_can_reach() {
+    use tzolkin::mcts::{Gradient, MctsConfig};
+    use tzolkin::phase::Phase;
+
+    let cfg = MctsConfig::default();
+    let ps = positions(40, &[10, 15]);
+
+    let (mut wide, mut widest) = (0usize, 0usize);
+    let (mut del_gen, mut del_grad) = (0usize, 0usize);
+    let (mut miss_gen, mut miss_grad) = (0usize, 0usize);
+    let (mut reg_gen, mut reg_grad) = (0f64, 0f64);
+
+    for g in &ps {
+        for &p in PlayerId::ALL.iter() {
+            for w in g.on_board(p).collect::<Vec<_>>() {
+                let phase = Phase::Take { worker: w };
+                let steps = tzolkin::tree::legal_steps(g, phase, p, 0);
+                if steps.len() <= cfg.max_edges {
+                    continue;
+                }
+                wide += 1;
+                widest = widest.max(steps.len());
+
+                // Ground truth: score every edge one ply deep, for the mover.
+                let one: Vec<f32> = steps
+                    .iter()
+                    .map(|st| {
+                        let mut next = *g;
+                        let _ = tzolkin::tree::apply_step(&mut next, phase, p, 0, st);
+                        eval::heuristic(&next, p)
+                    })
+                    .collect();
+                let best = one.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+                let grad = Gradient::new(g, p);
+                let key: Vec<f32> = steps.iter().map(|st| grad.step(st)).collect();
+                let mut by_grad: Vec<usize> = (0..steps.len()).collect();
+                by_grad.sort_by(|&a, &b| key[b].total_cmp(&key[a]).then(a.cmp(&b)));
+                let by_gen: Vec<usize> = (0..steps.len()).collect();
+
+                let top = |o: &[usize], n: usize| {
+                    o[..n.min(o.len())]
+                        .iter()
+                        .map(|&i| one[i])
+                        .fold(f32::NEG_INFINITY, f32::max)
+                };
+                let cap = cfg.widen_cap.max(cfg.max_edges);
+                if top(&by_gen, cap) < best {
+                    del_gen += 1;
+                }
+                if top(&by_grad, cap) < best {
+                    del_grad += 1;
+                }
+                if top(&by_gen, cfg.max_edges) < best {
+                    miss_gen += 1;
+                }
+                if top(&by_grad, cfg.max_edges) < best {
+                    miss_grad += 1;
+                }
+                reg_gen += (best - top(&by_gen, cfg.max_edges)) as f64;
+                reg_grad += (best - top(&by_grad, cfg.max_edges)) as f64;
+            }
+        }
+    }
+
+    // Wide `Take` nodes are rare — roughly one per three positions, and they
+    // are mid-game rather than late, when a player is holding enough to pay
+    // for a long combination. A dozen is enough to catch a sign flip.
+    assert!(wide >= 10, "too few wide nodes in the sample: {wide}");
+    println!(
+        "{wide} wide Take nodes, widest {widest}; deleted best: gen {del_gen} \
+         grad {del_grad}; outside the opening {} edges: gen {miss_gen} \
+         (regret {:.3}) grad {miss_grad} ({:.3})",
+        cfg.max_edges,
+        reg_gen / wide as f64,
+        reg_grad / wide as f64
+    );
+
+    // The deleting half, which is the half that cannot be undone. It only
+    // fires past `widen_cap`, and enumerating every `Take` node of this sample
+    // reaches ~300 edges where a real `mcts:2048` descent, over 1,446,102
+    // expansions, never saw a node past **136** — so the truncation is rare in
+    // enumeration and all but unreachable in search. What it must never do is
+    // throw the best move away, and that is a property of the key it sorts on,
+    // not of the cap.
+    assert!(
+        del_grad <= del_gen,
+        "gradient order deleted the one-ply best at {del_grad} wide nodes \
+         against generation order's {del_gen}"
+    );
+
+    // The opening half, which is where the ordering pays. Generation order is
+    // `Choice`'s derived lexicographic `Ord` — a fact about the declaration
+    // order of `Effect`, and about nothing in the game.
+    assert!(
+        miss_grad <= miss_gen && reg_grad <= reg_gen,
+        "gradient order lost to generation order: missed {miss_grad}/{wide} \
+         (regret {reg_grad:.3}) against {miss_gen}/{wide} ({reg_gen:.3})"
+    );
 }

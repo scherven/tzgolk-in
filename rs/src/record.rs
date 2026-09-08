@@ -2972,6 +2972,28 @@ fn parse_mcts_flags(flags: &str) -> Result<MctsConfig, String> {
                 .map_err(|_| format!("mcts {what}= needs a number, got {v:?}"))
         };
         match k {
+            // The quality-first preset: one-ply priors at a temperature of
+            // one. Measured **+8.84 centred** against `mcts:2048` (95% CI
+            // +7.24..+10.44, 202 blocks / 808 games) at equal simulations, and
+            // still **+7.68** (CI +5.90..+9.46, 119 blocks) at 1360
+            // simulations, which is 0.83x the *CPU* of the 2048-simulation
+            // default -- so it is a win on strength per unit of work, not only
+            // per simulation. Nothing else in `MctsConfig` earned a place
+            // here: the simulation budget is flat from 128 to 2048 under the
+            // uniform prior (all five rungs within +/-1.1 points), and `nocap`
+            // is +0.15 (CI -1.47..+1.77, 138 blocks). It does unflatten the
+            // budget -- `mcts:2048:quality` beats `mcts:256:quality` by +3.04
+            // (CI +1.46..+4.62, 150 blocks) where `mcts:2048` does not beat
+            // `mcts:128` at all -- so raise `sims` *after* setting this, never
+            // instead of it.
+            //
+            // Sugar only. `mcts_label` prints the flags this expands to, never
+            // the word, so a preset that drifts can never share a name with the
+            // config it used to mean (`examples/nametest.rs`).
+            "quality" => {
+                cfg.priors = Priors::OnePly;
+                cfg.prior_temp = 1.0;
+            }
             "priors" | "pri" => {
                 cfg.priors = match v {
                     "eval" | "evaluator" | "uniform" => Priors::Evaluator,
@@ -3128,7 +3150,10 @@ impl AgentSpec {
                 let is_flags = |f: &str| {
                     !f.is_empty()
                         && f.split(',')
-                            .all(|x| x.contains('=') || matches!(x, "noreuse" | "reuse" | "nocap"))
+                            .all(|x| {
+                                x.contains('=')
+                                    || matches!(x, "noreuse" | "reuse" | "nocap" | "quality")
+                            })
                 };
                 let (ev, flags) = match tail.rsplit_once(':') {
                     Some((e, f)) if is_flags(f) => (e, f),
