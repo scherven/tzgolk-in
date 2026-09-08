@@ -1,0 +1,81 @@
+# Overnight run — deadline **2026-09-08 17:50 EDT**, hard
+
+Sole use of the machine (14 cores) from 2026-09-07 23:50. The deliverable at the
+deadline is **the strongest agent we have, playable and legible in the TUI**:
+the user wants to step through a game, see the moves it is making, and see its
+plan if it has one.
+
+If you are a fresh session picking this up: read this file, then
+`docs/FINDINGS-eval.md`, then `git log --oneline -12`. Orchestration scripts are
+in `<scratch>/orch/` (`status.sh` prints progress and ETAs for everything
+running; `heartbeat.sh N` sleeps N minutes then prints status and exits, which
+is what wakes a turn-based session). Re-create them from this description if the
+scratchpad is gone.
+
+## Decisions the user made before leaving
+
+* **`data/replay/` (10 GB) is expendable.** The `phase.rs` sub-space factoring
+  of wide `Take` nodes is authorised even though it invalidates the
+  `TREE_EDGE` index space. Reordering `tree::legal_steps` is likewise allowed.
+* **Strength at any cost.** No per-turn time cap. If a turn takes seconds the
+  TUI must show progress rather than appear frozen.
+
+## Standing rules
+
+* **Log durably, immediately.** Every measurement goes into a findings file the
+  moment it lands, with what varied, the baseline, the number with CI and block
+  count, the output filename, and one line of meaning. Three agent runs were
+  killed by usage limits today; the only work that survived was what had been
+  written to disk. Assume the same will happen again.
+* **Commit at every boundary**, after `cargo test --release` is green.
+* **Arena runs cost CPU, not tokens.** Agent turns cost tokens and the session
+  has hit usage limits repeatedly. Prefer long CPU experiments over many short
+  agent turns; keep concurrent agents low.
+* **User CPU, never wall clock**, for any cost claim: the same pair measured
+  1.52x and 1.03x on consecutive wall-clock runs under load, while
+  `/usr/bin/time` user CPU repeated to 3%.
+* The block is the independent unit, not the game; null win rate is 25%; never
+  call an effect smaller than its interval an improvement.
+
+## Phase plan, with a hard reserve
+
+| phase | window | content |
+| --- | --- | --- |
+| A | 00:00-02:00 | land known wins: `prior_temp` 1.0, term re-pricing, `Priors::Gradient` as the prior. Establish the reigning best spec. |
+| B | 02:00-08:00 | MCTS parameter sweeps on top of a real prior: `c_puct`, `fpu_reduction`, `pmin`, and the sims curve, which only becomes live once the prior is not flat. Throughput: `Choice` sort + `dominated_dedup` are ~30% of runtime. |
+| C | 08:00-12:00 | structural: `phase.rs` sub-space factoring; plan priors; whatever the agents propose. |
+| D | 12:00-15:30 | **the headline race** — best greedy vs best MCTS at high block count, plus the full ladder. |
+| E | 15:30-17:50 | **RESERVED, do not spend.** TUI work, final verification, the write-up. |
+
+Phase E is not optional. The deliverable is a thing the user can *see*, not a
+number in a log.
+
+## The reigning champion
+
+Updated whenever something beats it. Always give the spec, not a description.
+
+| when | spec | beats | by |
+| --- | --- | --- | --- |
+| start | `mcts:2048:heuristic:quality` | `mcts:2048` | +8.84 [+7.24, +10.44], 202 blk |
+
+## Known, measured, not yet landed
+
+* `prior_temp` default is **4.0**; 1.0 measures **+8.84** where 4.0 measures
+  +1.01 (202 blocks). Left at 4.0 only because an experiment was running.
+* `board=0.5` is **+10.48 greedy / +9.04 MCTS** (150 blk) — largest single
+  effect measured. Corroborated independently by the plan workstream's refit
+  (+11.85 from board alone, +8.71 engine, **-3.86 temple**).
+* A gradient softmax as the *prior* (not just the truncation key) is **+3.21**
+  over uniform (240 blk) and would be near-free through `Mcts::gradient`.
+* The simulation budget is dead under a flat prior (16x = -1.08, interval
+  excludes anything above +0.64) and worth **+3.04 for 8x** once it is real.
+* `Choice` sort/compare/eq 24.7% + `options::dominated_dedup` 4.9% of MCTS
+  runtime. Biggest throughput lever; no owner.
+* `docs/TRAINING.md:552-554` describes truncation behaviour that is now wrong
+  twice over.
+
+## Open
+
+* Is MCTS actually stronger than `heuristic:full`? **Never measured directly.**
+  Race running at `<scratch>/vs_greedy/`.
+* Is `temple_outlook` negative because of a weight or a bug?
