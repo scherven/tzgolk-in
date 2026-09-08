@@ -2723,13 +2723,12 @@ against the evaluator **before** the board re-fit (`board = 0.5`):
   mcts:256  -0.99*   null   +0.56*  +1.06*  +1.46*  +2.17*
 ```
 
-**Monotone increasing on both agents all the way to 0.8, and still climbing.**
-0.80 is +2.17 [+1.81, +2.53] * on `mcts:256` with a win rate of 0.316 — twice
-what the landed 0.65 buys, and this run landed 0.65 because the sweep had only
-reached 0.65 when the decision was made. **That is a point and a half left on
-the table**, and it is being swept out now against the *landed* evaluator in
-`<scratch>/f3/ab/bh_*` (0.8 / 0.9 / 1.0 / 1.2, greedy:64 and mcts:256) and
-`bd_*` (0.8 / 1.0, `mcts:1024:cp=0.05`).
+**Monotone increasing on both agents all the way to 0.8** — 0.80 reads +2.17
+[+1.81, +2.53] * on `mcts:256`, twice what the landed 0.65 buys against the same
+base, which looked like a point and a half left on the table.
+
+**It is not. See F31a: that reading is against the wrong base and the landed
+0.65 is already at the optimum.**
 
 The mechanism, and why nobody should have been surprised: `BOARD_SCALE = 0.5`
 was **never a statement about the space table**. Its doc comment says so — it
@@ -2745,5 +2744,82 @@ monotone climb.
 
 **The general rule this run keeps re-learning: when a constant exists to cancel
 another constant, moving either one invalidates the other, and a ±20% check
-around the old value will not tell you.** It cost F29a a retraction and it has
-now cost this landing a point and a half.
+around the old value will not tell you.** That much is still true — `F22`'s
+0.4/0.6 check could not have seen the climb from 0.5 to 0.65 that F29c found,
+and the climb is real. What is *not* true is that it continues past 0.65 once
+the rest of the landing is in place.
+
+### F31a. **The third time, and the same mistake: `board = 0.8` buys nothing on the landed evaluator**
+
+The table above is measured on `evalab-p21`, whose `v::HEAD` has
+**`board_scale = 0.5` and `pal_need = 0.0`**. The evaluator that shipped has
+`board_scale = 0.65` **and `HUNGRY_CORN = 0.25`. Re-measured against *that*,
+on `evalab-p23`:
+
+| variant | agent | blocks | centred |
+| --- | --- | --- | --- |
+| `board = 0.80` | greedy:64 | 400 | **−0.03** [−0.44, +0.38] |
+| `board = 0.80` | mcts:256 | 258 | **−0.10** [−0.55, +0.35] |
+
+Nothing, on either agent. **`BOARD_SCALE = 0.65` is at the optimum and there is
+no point and a half to collect.** What the `yb_*` sweep was measuring is the
+*sum* of two overlapping corrections: raising `BOARD_SCALE` and adding
+`HUNGRY_CORN` both make `board_position` larger, and `HUNGRY_CORN` makes it
+larger exactly where it matters most — a player who cannot eat. Against a base
+with neither, the board scale absorbs some of what the gate would have done; on
+top of the gate, it has nothing left to absorb.
+
+This is the **third** instance in this run of one error: **a constant measured
+against one base is a different constant against another.** F20 checked for it
+between `rs`, `av` and `board` and found no interaction, which is probably why
+it stopped being checked. The three instances, worth listing together because
+they cost very different amounts:
+
+| | what happened | cost |
+| --- | --- | --- |
+| F29a | `pneed = 1.0` carried from a `g_pal = 1.0` base onto 1.5 | a landing retracted, ~15 min |
+| F30c | `pneed = 0.33` looked better than 0.25 on the pre-`board` base | caught before landing, ~20 min |
+| F31a | `board = 0.8` looked +2.17 on the pre-`HUNGRY_CORN` base | caught before landing, and a wrong claim in a report |
+
+**The rule, stated so it can be followed mechanically: before landing constant
+X, re-measure X against the exact evaluator it will ship in — not against the
+base its sweep happened to start from.** Every one of the three would have been
+caught by one 400-block run costing under a minute of CPU on `greedy:64`.
+
+## F32. `BOARD_SCALE` does **not** climb past 0.65 — F31's climb is a framing artefact
+
+F31 read the sweep `0.40 → 0.80` as monotone increasing and called 0.80 "a
+point and a half sitting in a one-line change". Every cell of that table was
+measured **against a field of `board = 0.5`**, an evaluator two landings old.
+Re-measured head-to-head against the *landed* evaluator (`--base head`, which is
+`board = 0.65`), binary `evalab-p23`, seeds 3000000+:
+
+| framing | agent | blocks | centred |
+| --- | --- | --- | --- |
+| `board=0.65` vs field of 0.50 (`yb_065`) | greedy:64 | 400 | +1.72 [+1.31, +2.13] * |
+| `board=0.80` vs field of 0.50 (`yb_080`) | greedy:64 | 400 | +2.68 [+2.23, +3.13] * |
+| **`board=0.80` vs field of 0.65** (`bh_080`) | **greedy:64** | **400** | **−0.03 [−0.44, +0.38]** |
+| `board=0.65` vs field of 0.50 (`yb_065`) | mcts:256 | 400 | +1.06 [+0.72, +1.40] * |
+| `board=0.80` vs field of 0.50 (`yb_080`) | mcts:256 | 400 | +2.17 [+1.81, +2.53] * |
+| **`board=0.80` vs field of 0.65** (`bh_080`) | **mcts:256** | **199** | **+0.02 [−0.49, +0.54]** |
+
+The indirect subtraction says 0.80 − 0.65 is **+0.96 greedy / +1.11 mcts**. The
+direct head-to-head says **−0.03 / +0.02**, with intervals of ±0.4 and ±0.5 that
+exclude the indirect estimate. These are not two noisy readings of one quantity;
+they are two different quantities, and only the second one is the question
+"should the constant move".
+
+Why they differ: the A/B is **one candidate seat against three baseline seats**
+(`centred = cand − mean of four`, null win rate 0.25). `board_position` is a
+*contention* term — it prices the spaces a worker can still ride to, and its
+payoff is in taking the good space before someone else does. Against three
+opponents who under-weight the board, weighting it harder keeps paying; against
+three opponents who weight it the same, it stops. So the vs-a-fixed-old-field
+framing systematically **over-states** exactly the terms whose value is
+positional, and the over-statement grows with the distance to the field.
+
+**Standing rule, and it supersedes the F31 sentence that sent me here: a
+constant is landed on the head-to-head against the evaluator it would replace,
+never on a subtraction between two runs against an older field.** The
+subtraction is what produced "a point and a half"; there is no point and a half.
+`BOARD_SCALE` stays at **0.65**.
