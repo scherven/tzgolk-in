@@ -927,7 +927,14 @@ fn mcts_flags_reach_the_config_and_the_label() {
     let spec = |s: &str| AgentSpec::parse(s, false).unwrap_or_else(|e| panic!("{s}: {e}"));
     let cfg = |s: &str| *spec(s).mcts_config().expect("not an mcts spec");
 
-    assert_eq!(cfg("mcts:64").priors, Priors::Evaluator);
+    // The bare spec carries the shipped default, which is the `quality` prior:
+    // `Priors::OnePly` at `prior_temp = 1` is +8.84 over the uniform prior this
+    // used to ship with. Both directions are asserted so that the flag is
+    // tested as a *knob* and not merely as agreement with whatever the default
+    // happens to be today.
+    assert_eq!(cfg("mcts:64").priors, Priors::OnePly);
+    assert_eq!(cfg("mcts:64").prior_temp, 1.0);
+    assert_eq!(cfg("mcts:64:pri=eval").priors, Priors::Evaluator);
     assert_eq!(cfg("mcts:64:heuristic:pri=1ply").priors, Priors::OnePly);
     assert_eq!(cfg("mcts:64:pri=1ply").priors, Priors::OnePly);
     assert_eq!(cfg("mcts:64:pri=1ply,ptemp=2.5").prior_temp, 2.5);
@@ -975,9 +982,13 @@ fn mcts_flags_reach_the_config_and_the_label() {
 
     // No two variants may share a name, or the progress file cannot say which
     // side of a race a block belongs to.
+    // Every entry must denote a *different* config, or a shared name is correct
+    // rather than a bug. `pri=1ply` is now the default, so it is spelled here
+    // as its opposite: `pri=eval` is the uniform prior this used to ship with,
+    // and it is a genuinely different player.
     let names: Vec<String> = [
         "mcts:64",
-        "mcts:64:pri=1ply",
+        "mcts:64:pri=eval",
         "mcts:64:pri=1ply,ptemp=2",
         "mcts:64:pri=1ply,pmin=8",
         "mcts:64:cp=1.5",

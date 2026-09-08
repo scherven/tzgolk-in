@@ -444,8 +444,17 @@ impl Default for MctsConfig {
             virtual_loss: 1,
             max_depth: 2048,
             seed: 0,
-            priors: Priors::Evaluator,
-            prior_temp: 4.0,
+            // `Priors::OnePly` at `prior_temp = 1` -- what the `quality` preset
+            // spelled -- is the default because it is worth +8.84 centred
+            // against this same search with the old defaults (95% CI
+            // +7.24..+10.44, 202 blocks), and because the simulation budget is
+            // a dead axis without it: 16x the budget measures -1.08 under a
+            // flat prior and 8x is worth +3.04 once the prior is real. The
+            // `prior_temp` sweep against `mcts:2048` reads 0.5 -> +6.42,
+            // 1.0 -> +8.84, 2.0 -> +5.56, 4.0 -> +1.01, so the 4.0 this
+            // shipped with was throwing away seven of the eight points.
+            priors: Priors::OnePly,
+            prior_temp: 1.0,
             prior_min_edges: 3,
         }
     }
