@@ -72,7 +72,58 @@ const CORN_INCOME_PER_ROUND: f32 = 1.9;
 /// space table pay, because most of a worker's actions are the cheap ones it
 /// takes on the way to the good one, and because a worker that has to be fed
 /// four times over the calendar has already spent 2 points of corn on itself.
-const ACTION_VALUE: f32 = 1.2;
+///
+/// It is this low because [`BOARD_SCALE`]'s term has already paid for the
+/// action every *placed* worker is about to take; what is left here is the
+/// throughput of workers that are not on a gear yet. Measured, not reasoned:
+/// swept jointly with `BOARD_SCALE` (`evalab --ab 'board=..,av=..'`, 150 blocks
+/// a cell) the score is flat over 0.2..0.4 and falls away by 0.6, and the old
+/// 1.2 is off the end of the ridge — along the committed `TEMPO_PER_ROUND` the
+/// score is monotone decreasing in this constant all the way down to 0.0.
+///
+/// 0.2 rather than 0.4 on a **600-block** paired re-run, +0.71 [+0.51, +0.91]
+/// greedy:64 and +0.38 [+0.09, +0.68] mcts:256 — the one comparison of the two
+/// that was run end to end on a single build. Anything inside 0.2..0.4 is
+/// within noise of it once this file's own change is compiled into the MCTS
+/// prior (`eval::heuristic` orders MCTS's edges, so landing here moves the
+/// platform every later sweep is measured on — `docs/FINDINGS-eval.md` F14).
+/// Treat the digit as "the low end of a plateau", not as resolved to 0.1.
+/// `docs/FINDINGS-eval.md` F7, F10, F14.
+const ACTION_VALUE: f32 = 0.2;
+
+/// `board_position` sums, over every placed worker, the best space that worker
+/// can still ride to. That sum is optimistic twice over, and the two compound:
+/// the action it prices is *also* paid for by [`ACTION_VALUE`]'s per-worker
+/// throughput in `engine_value`, and each worker is credited with the maximum
+/// over its whole gear as if no other worker of its own and no opponent were
+/// competing for those spaces.
+///
+/// Halving the term is the largest single effect measured on this file:
+/// **+10.48 greedy:64 [+9.07, +11.89] and +9.04 mcts:256 [+7.86, +10.23]** at
+/// 150 blocks. The optimum is a plateau, not a digit — 0.35, 0.40 and 0.50 are
+/// mutually indistinguishable on both agents while 0.25 and 0.70 are clearly
+/// worse — so read this as "about a half". `docs/FINDINGS-eval.md` F5a, F7.
+///
+/// Do **not** also subtract the placed worker from `engine_value`'s action
+/// count. That corrects the same double count a second time and measures
+/// −12.09 / −9.95 with a 0.028 win rate, the worst configuration in the log
+/// after ungating the space table entirely (F5b).
+const BOARD_SCALE: f32 = 0.5;
+
+/// [`temple_outlook`] is *under*-priced, which is the one thing nobody
+/// expected: scaling it alone is monotone improving from 0.5 to 1.4 on both
+/// agents, and shrinking it to 0.5 costs 14 points and drops the MCTS win rate
+/// to 0.065. On top of a corrected `BOARD_SCALE`/`ACTION_VALUE` the joint peak
+/// is here, worth **+1.41 mcts:256 [+0.40, +2.41]** paired at 150 blocks; 1.6
+/// and 1.8 fall away again.
+///
+/// This contradicts the plan workstream's refit, which fitted `temple_outlook`
+/// at −3.86 and read it as harmful. That fit was taken against an evaluator
+/// whose `board` and `engine` were 30 of a 43-point estimate; the three terms
+/// are strongly collinear, so least squares drove the temple coefficient
+/// negative to cancel the other two rather than because temples are worth
+/// less. Correct board and engine first and the sign flips. `docs/FINDINGS-eval.md` F8.
+const TEMPLE_SCALE: f32 = 1.4;
 
 /// Rounds a worker typically spends riding a gear between actions.
 const ROUNDS_PER_ACTION: f32 = 2.6;
@@ -95,6 +146,12 @@ const TEMPLE_FAR: f32 = 0.55;
 
 /// What one more step on a temple is worth between scoring days, as a fraction
 /// of the jump it unlocks. Without it the search sees climbing as free.
+///
+/// Known wart, left alone deliberately: the `climb` loop tests only
+/// `step + 1 < steps`, so it credits the move on to the **exclusive top step
+/// even while an opponent stands there** and `GameState::temple_ceiling` will
+/// refuse it. Worth ~0.1 of one step's jump, far below anything measurable
+/// here, and fixing it means reimplementing a private helper of `state.rs`.
 const TEMPLE_CLIMB: f32 = 0.10;
 
 /// Per-block bonus for holding a *spread* of block types rather than a stack of
@@ -228,9 +285,12 @@ pub fn components(g: &GameState, p: PlayerId) -> Components {
     let horizon = rounds_left / LAST_DAY as f32;
 
     c.held = held_premium(g, p, rounds_left);
-    c.temple = temple_outlook(g, p);
+    // The two scales are applied here rather than inside the functions so that
+    // "this term is mis-priced by k" stays one number, in the same place
+    // `plan::Schedule` applies its weights and `bin/evalab` measured them.
+    c.temple = temple_outlook(g, p) * TEMPLE_SCALE;
     c.engine = engine_value(g, p, rounds_left, horizon);
-    c.board = board_position(g, p, rounds_left);
+    c.board = board_position(g, p, rounds_left) * BOARD_SCALE;
     c.monument = monument_outlook(g, p, horizon);
     c.starvation = starvation_risk(g, p);
 

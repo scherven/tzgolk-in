@@ -169,8 +169,19 @@ pub mod v {
         pub gates: bool,
     }
 
+    /// Must track `eval.rs` exactly — `--eqcheck` is the assertion, and every
+    /// A/B here is meaningless the moment it drifts. Because this is a *copy*
+    /// and not an import, landing a change in `eval.rs` does not move the
+    /// baseline arm on its own; update it here in the same edit, then re-run
+    /// `--eqcheck`. That is also the property that lets a run keep measuring
+    /// against a pinned baseline while `eval.rs` is being changed underneath.
+    ///
+    /// `action_value`, `board_scale` and `temple_scale` were moved here from
+    /// (1.2, 1.0, 1.0) when `docs/FINDINGS-eval.md` F11 landed the re-pricing,
+    /// so `--ab 'board=0.5,av=0.2,temple=1.4'` is now the null and must measure
+    /// 0 against this.
     pub const HEAD: V = V {
-        action_value: 1.2,
+        action_value: 0.2,
         tempo: 0.52,
         building_value: 0.45,
         space: Space::Table,
@@ -183,9 +194,9 @@ pub mod v {
         contend_monument: false,
         charge_placed: false,
         hand_lag: 1.0,
-        board_scale: 1.0,
+        board_scale: 0.5,
         engine_scale: 1.0,
-        temple_scale: 1.0,
+        temple_scale: 1.4,
         held_scale: 1.0,
         monument_scale: 1.0,
         starve_scale: 1.0,
