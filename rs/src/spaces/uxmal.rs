@@ -95,10 +95,15 @@ pub fn mirror_choices(g: &GameState, p: PlayerId, depth: u8) -> Vec<Choice> {
         all.extend(at_d(&probe, p, Pos(i), depth - 1));
     }
 
-    all.into_iter()
-        .filter(|c| !c.is_skip())
-        .map(|c| Choice::one(Effect::Corn(-1)).chain(&c))
-        .collect()
+    // Prefixed in place rather than rebuilt: the fee has to lead so that
+    // `Choice::affordable` sees it before the action spends, and this list is
+    // the widest one generation builds -- the whole of Palenque, Yaxchilan and
+    // Tikal -- so a second copy of every choice is a malloc and a free each.
+    all.retain(|c| !c.is_skip());
+    for c in all.iter_mut() {
+        c.0.insert(0, Effect::Corn(-1));
+    }
+    all
 }
 
 fn or_skip(v: Vec<Choice>) -> Vec<Choice> {

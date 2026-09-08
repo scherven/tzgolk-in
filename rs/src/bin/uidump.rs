@@ -68,6 +68,13 @@ fn main() {
         // Every turn is at the full budget now that recording no longer drags
         // playout-cap randomisation along with it, so this loop is a guard
         // against a forced turn rather than against a 1-in-4 write rate.
+        //
+        // The ranking is asked for whatever came back. Requiring a populated
+        // decision list first meant an agent that builds no tree — `minimax`,
+        // `heuristic:full` — played twelve turns and then rendered the
+        // *heuristic* fallback, so the one view that would have shown its score
+        // scale was the one view unreachable for it. Those scales differ (see
+        // `docs/FINDINGS-tui.md` T1), which is exactly what wanted checking.
         for _ in 0..12 {
             let p = game.state.current;
             match agent.play_turn(&game.state, p, 0.0, &mut rng) {
@@ -75,12 +82,11 @@ fn main() {
                     last_decisions = ui::decisions_from(&o.nodes);
                     game.play(p, &o.mv);
                     game.state.current = game.state.current.next(1);
-                    if !last_decisions.is_empty() {
-                        // The `agent` view: the agent's own ranking of whole
-                        // turns, which is the thing the panel claims to show
-                        // and used to substitute a one-ply heuristic for.
-                        agent_ranking =
-                            agent.ranked_moves(&game.state, game.state.current, 10);
+                    // The `agent` view: the agent's own ranking of whole
+                    // turns, which is the thing the panel claims to show
+                    // and used to substitute a one-ply heuristic for.
+                    agent_ranking = agent.ranked_moves(&game.state, game.state.current, 10);
+                    if agent_ranking.is_some() {
                         break;
                     }
                 }
@@ -88,6 +94,19 @@ fn main() {
             }
         }
     }
+
+    // `--thinking SECS` renders the mid-search screen. There is no other way to
+    // review it: by the time a search returns, the thing being checked is gone.
+    let thinking = std::env::args()
+        .position(|a| a == "--thinking")
+        .map(|i| {
+            let secs: f64 = std::env::args().nth(i + 1).and_then(|v| v.parse().ok()).unwrap_or(2.4);
+            ui::Thinking {
+                what: format!("searching {}'s turn", game.state.players[game.state.current.idx()].color),
+                detail: format!("{} · one search per sub-decision", ui::short_agent(&agent_name)),
+                elapsed: std::time::Duration::from_secs_f64(secs),
+            }
+        });
 
     let source = match (&agent_ranking, full) {
         (Some(_), _) => MoveSource::Agent,
@@ -104,6 +123,7 @@ fn main() {
         game,
         agent: None,
         agent_name,
+        thinking: None,
         last_decisions,
         ranking,
         selected: 0,

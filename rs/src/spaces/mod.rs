@@ -22,18 +22,31 @@ use crate::state::GameState;
 pub const MAX_DEPTH: u8 = 1;
 
 pub fn choices_at(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> Vec<Choice> {
-    let v = match gear {
-        Gear::Palenque => palenque::at(g, p, pos),
-        Gear::Yaxchilan => yaxchilan::at(g, p, pos),
-        Gear::Tikal => tikal::at(g, p, pos),
-        Gear::Uxmal => uxmal::at(g, p, pos),
-        Gear::Chichen => chichen::at(g, p, pos),
-    };
+    let v = raw_at(g, p, gear, pos);
     // `dominated_dedup` rather than `dedup` because a free-choice space stacks
     // several routes to one action on top of each other: Uxmal 6 offers the
     // unlock for nothing (space 3) and again for a corn (space 5's mirror), and
     // the same doubling runs through every action the mirror can reach.
     crate::options::dominated_dedup(v)
+}
+
+/// The space's list before the dominance pass.
+///
+/// `choices_for_worker` stacks one of these per step-down fee and runs
+/// `dominated_dedup` over the concatenation, and dominance is transitive: a
+/// choice beaten inside one space's list is beaten inside the union, and the
+/// lexicographic tie-break between two spellings of one position picks the same
+/// survivor either way. So the inner pass cannot change the answer there, only
+/// the size of the list the outer pass sees -- which makes it a throughput
+/// question, measured in `docs/FINDINGS-generation.md`, not a rules one.
+pub fn raw_at(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> Vec<Choice> {
+    match gear {
+        Gear::Palenque => palenque::at(g, p, pos),
+        Gear::Yaxchilan => yaxchilan::at(g, p, pos),
+        Gear::Tikal => tikal::at(g, p, pos),
+        Gear::Uxmal => uxmal::at(g, p, pos),
+        Gear::Chichen => chichen::at(g, p, pos),
+    }
 }
 
 /// The spaces that repeat every action below them for free: 6 and 7 on the

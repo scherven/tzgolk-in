@@ -1757,6 +1757,26 @@ fn main() {
         wall.elapsed().as_secs_f64()
     );
 
+    // SCRATCH: the throughput bench. Level 2 because that is what ships.
+    if std::env::var("GENBENCH").is_ok() {
+        set_prune(
+            std::env::var("PRUNE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+        );
+        let d: usize = std::env::var("DESCENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let reps: usize = std::env::var("REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        gen_bench(&positions, d, reps);
+        return;
+    }
+
     // The MCTS-facing pass. `Take`-node width, not moves per turn: the
     // factored search never enumerates a whole turn, so the six-figure number
     // is one nobody pays.
@@ -2028,4 +2048,162 @@ fn main() {
 
     let _ = Effect::UnlockWorker;
     println!("\nwall {:.1}s", wall.elapsed().as_secs_f64());
+}
+
+// ---------------------------------------------------------------------------
+// SCRATCH: the generation throughput bench. Delete with the rest of this file.
+// ---------------------------------------------------------------------------
+
+/// An order-sensitive digest of a generated list.
+///
+/// The whole point of a throughput change is that it must not move the answer,
+/// and "the same set" is not enough: `choices_for_worker` ends in a sort, so
+/// the *sequence* is canonical and any reordering would silently repermute the
+/// `TREE_EDGE` index space. Hash the sequence, not a set.
+fn digest(cs: &[Choice]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    cs.len().hash(&mut h);
+    for c in cs {
+        c.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Time `choices_for_worker` over a fixed bag of `Take` nodes.
+///
+/// The bag is what MCTS actually pays for: `tree::legal_steps`'s `Take` arm is
+/// a `choices_for_worker` and nothing else, and `take_nodes` walks the turn
+/// chain the way a descent does. Reps rather than a time budget so two builds
+/// do exactly the same work -- the machine is shared and wall clock is a lie
+/// here (`docs/OVERNIGHT.md`), so this prints a checksum and lets
+/// `/usr/bin/time` do the measuring.
+fn gen_bench(positions: &[(GameState, PlayerId)], descents: usize, reps: usize) {
+    let mut nodes: Vec<TakeNode> = Vec::new();
+    for (i, &(ref g, p)) in positions.iter().enumerate() {
+        let mut rng = StdRng::seed_from_u64(0xbe0c_1000 + i as u64);
+        take_nodes(g, p, &mut rng, descents, &mut nodes);
+    }
+    let widths: Vec<usize> = nodes
+        .iter()
+        .map(|n| moves::choices_for_worker(&n.state, n.turn, n.gear, Pos(n.pos)).len())
+        .collect();
+    let edges: usize = widths.iter().sum();
+    let mut w = widths.clone();
+    w.sort_unstable();
+    eprintln!(
+        "genbench: {} take nodes, {edges} edges, mean {:.1} p50 {} p90 {} p99 {} max {}",
+        nodes.len(),
+        edges as f64 / nodes.len().max(1) as f64,
+        pct(&w, 0.5),
+        pct(&w, 0.9),
+        pct(&w, 0.99),
+        w[w.len() - 1],
+    );
+
+    // The checksum is computed once, outside the timed loop: a change here has
+    // to be provably answer-preserving, but hashing every effect of every edge
+    // is real work and would land in the per-edge number as generation cost.
+    let mut check = 0u64;
+    for (i, n) in nodes.iter().enumerate() {
+        let cs = moves::choices_for_worker(&n.state, n.turn, n.gear, Pos(n.pos));
+        check = check
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(digest(&cs) ^ i as u64);
+    }
+    let mut check2 = 0u64;
+    for (i, n) in nodes.iter().enumerate() {
+        let cs = choices_at(&n.state, n.turn, n.gear, Pos(n.pos));
+        check2 = check2
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(digest(&cs) ^ i as u64);
+    }
+    println!("GENBENCH check cfw={check:016x} cat={check2:016x}");
+
+    // Where the transient allocation is: a `Choice` whose effect list outgrows
+    // `Effects`' inline capacity is a heap allocation, and every fee prefix and
+    // every `chain` pushes a list one element longer.
+    {
+        let mut hist = [0usize; 24];
+        let mut spilled = 0usize;
+        let mut total = 0usize;
+        let mut inputs: Vec<usize> = Vec::new();
+        for n in &nodes {
+            let mut raw = 1usize;
+            for j in 0..=n.pos {
+                let fee = n.pos - j;
+                if fee > n.state.players[n.turn.idx()].corn {
+                    continue;
+                }
+                if tzolkin::spaces::is_free_choice(n.gear, Pos(n.pos)) && j < n.pos {
+                    continue;
+                }
+                let mut probe = n.state;
+                probe.players[n.turn.idx()].corn -= fee;
+                raw += tzolkin::spaces::raw_at(&probe, n.turn, n.gear, Pos(j)).len();
+            }
+            inputs.push(raw);
+            for c in moves::choices_for_worker(&n.state, n.turn, n.gear, Pos(n.pos)) {
+                hist[c.0.len().min(23)] += 1;
+                if c.0.spilled() {
+                    spilled += 1;
+                }
+                total += 1;
+            }
+        }
+        inputs.sort_unstable();
+        eprintln!(
+            "effect-list length: {} choices, {spilled} spilled ({:.1}%), hist {:?}",
+            total,
+            100.0 * spilled as f64 / total.max(1) as f64,
+            &hist[..14]
+        );
+        eprintln!(
+            "dominated_dedup input size: mean {:.1} p50 {} p90 {} p99 {} max {}",
+            inputs.iter().sum::<usize>() as f64 / inputs.len() as f64,
+            pct(&inputs, 0.5),
+            pct(&inputs, 0.9),
+            pct(&inputs, 0.99),
+            inputs[inputs.len() - 1]
+        );
+    }
+
+    let t = Instant::now();
+    let mut n_edges = 0usize;
+    for _ in 0..reps {
+        for n in &nodes {
+            let cs = moves::choices_for_worker(&n.state, n.turn, n.gear, Pos(n.pos));
+            n_edges += cs.len();
+            std::hint::black_box(&cs);
+        }
+    }
+    let el = t.elapsed();
+    println!(
+        "GENBENCH cfw  reps={reps} nodes={} edges={n_edges} ns/edge={:.1} wall={:.2}s",
+        nodes.len(),
+        el.as_nanos() as f64 / n_edges.max(1) as f64,
+        el.as_secs_f64()
+    );
+
+    // The inner layer on its own: `choices_at` is one space's list plus its own
+    // `dominated_dedup`, and `choices_for_worker` runs it once per step-down
+    // fee. Splitting them says which of the two dedup layers the time is in.
+    if std::env::var("CAT").is_ok() {
+        let t = Instant::now();
+        let mut n2 = 0usize;
+        for _ in 0..reps {
+            for n in &nodes {
+                let cs = choices_at(&n.state, n.turn, n.gear, Pos(n.pos));
+                n2 += cs.len();
+                std::hint::black_box(&cs);
+            }
+        }
+        let el = t.elapsed();
+        println!(
+            "GENBENCH cat  reps={reps} nodes={} edges={n2} ns/edge={:.1} wall={:.2}s",
+            nodes.len(),
+            el.as_nanos() as f64 / n2.max(1) as f64,
+            el.as_secs_f64()
+        );
+    }
 }

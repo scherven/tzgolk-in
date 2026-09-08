@@ -1,3 +1,12 @@
+# Overnight run — **PAUSED 2026-09-08 09:40, resumes tomorrow**
+
+The 17:50 deadline below is **void**: the user stopped the run near a weekly
+usage limit and will restart it another day. No agents are running; the tick
+and reaper monitors are stopped. Read `## Where this stopped` at the bottom
+before doing anything.
+
+Original plan follows.
+
 # Overnight run — deadline **2026-09-08 17:50 EDT**, hard
 
 Sole use of the machine (14 cores) from 2026-09-07 23:50. The deliverable at the
@@ -187,3 +196,38 @@ positive.
   0.250. Real but not a landslide -- and that is the version whose prior was
   flat. The quality-prior rerun is at `<scratch>/vs_greedy/quality.jsonl`.
 * Is `temple_outlook` negative because of a weight or a bug?
+
+
+## Where this stopped
+
+**State: green.** `cargo build --release` clean, `cargo test --release`
+**181 passed, 0 failed**. HEAD is the commit this note is in.
+
+**The champion is `mcts:8192:heuristic:deeper`** (`cp=0.02,pmin=2`),
++13.32 centred against `heuristic:full` at a **0.725** win rate where an equal
+agent takes 0.250; +10.40 [+9.29, +11.51] over the old champion on a common
+opponent, 110 paired blocks. ~181 ms/turn of user CPU.
+
+**Unfinished, in priority order:**
+
+1. **The TUI is half-refactored and it is the deliverable.** An agent died
+   mid-change having added `App::thinking` and moved `App::agent` to `Arc` so a
+   worker thread can search off the draw loop. I completed the mechanical half
+   (both binaries and the test now compile and pass) but **the feature itself is
+   not built**: nothing sets `thinking`, so there is still no progress display,
+   and the two display bugs it was spawned for are open — the shortlist is
+   mostly one retrieval restated with trailing no-op pickups, and the score
+   column's units are unlabelled. `docs/FINDINGS-tui.md` has its notes.
+2. **`board = 0.90` is probably worth taking**: +2.45 [+1.74, +3.17] at 122
+   blocks on `mcts:1024:cp=0.05`, nothing on either shallow agent. It was left
+   because 122 blocks is under this project's own bar for a deep number. If a
+   250-block reading exists in the scratchpad, take it.
+3. **The headline race never ran on a frozen build.** Every number above was
+   measured while `eval.rs` was still moving. Before believing the champion's
+   margin, re-run it on one pinned binary.
+4. `pmin=2` x budget above 8,192 is open — memory, not CPU, is the binding
+   constraint there (deep trees are 300-800 MB resident and jetsam kills them).
+
+**The one thing to carry forward above any result:** every workstream's log
+(`FINDINGS-eval.md` ~93 KB, `-mcts.md`, `-generation.md`, `-tui.md`) survived
+eight agent deaths by usage limit. Nothing else did.

@@ -95,9 +95,11 @@ fn main() -> io::Result<()> {
     // its root priors and playout-cap randomisation dropping seven turns in
     // eight to an eighth of the budget. Noise is a replay-buffer device; a
     // human watching wants the policy the search actually believes.
-    let agent = match &spec {
+    // `Arc`, not `Box`: the viewer hands a clone to a worker thread so a
+    // multi-second turn does not block the draw loop.
+    let agent: Option<std::sync::Arc<dyn tzolkin::record::Agent>> = match &spec {
         Some(s) => match tzolkin::record::parse_analysis_agent(s) {
-            Ok(a) => Some(a),
+            Ok(a) => Some(std::sync::Arc::from(a)),
             Err(e) => {
                 eprintln!("tui: --agent {s}: {e}");
                 std::process::exit(2);
@@ -142,6 +144,7 @@ fn main() -> io::Result<()> {
         game,
         agent,
         agent_name,
+        thinking: None,
         last_decisions: Vec::new(),
         ranking: Ranking::default(),
         selected: 0,

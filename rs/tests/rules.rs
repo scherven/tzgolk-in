@@ -1018,6 +1018,7 @@ fn ui_renders_at_many_sizes() {
                         game: Game::new(3),
                         agent: None,
                         agent_name: "net".into(),
+                        thinking: None,
                         last_decisions: Vec::new(),
                         ranking: Ranking {
                             exhaustive,

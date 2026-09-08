@@ -3516,3 +3516,99 @@ Pinned `<scratch>/f3/evalab-p24`, `--eqcheck` **0e0 over 48,784 pairs**, and the
 null is now `--ab 'board=0.8,av=0.2,temple=1.4,rs=0.05,ci=0.0,ceiling,pal=1.5,
 chi=0.7,pneed=0.25'`. Verification against `--base 'board=0.65'` is running in
 `<scratch>/f3/ab/r2_land_*`.
+
+### F34l. The 2x2, the control and the replication: `board = 0.80` is worth **+1.47** to a searching agent and nothing to a shallow one
+
+All cells `--ab board=0.8 --base head` on `evalab-p23`, so the field is the
+shipped evaluator every time and F32's framing rule is satisfied throughout.
+
+| agent | c_puct | sims | blocks | centred | win |
+| --- | --- | --- | --- | --- | --- |
+| `greedy:64` | — | — | 400 | −0.03 [−0.44, +0.38] | 0.257 |
+| `mcts:256` | **2.0** (default) | 256 | 400 | −0.03 [−0.39, +0.33] | 0.250 |
+| `mcts:256:cp=0.05` | 0.05 | 256 | 204 | **+0.66** [+0.17, +1.14] * | 0.282 |
+| `mcts:1024` | **2.0** (default) | 1024 | 64 | **+1.53** [+0.69, +2.37] * | 0.301 |
+| `mcts:1024:cp=0.05` | 0.05 | 1024 | **249** | **+1.47** [+1.00, +1.94] * | 0.320 |
+
+Lower `c_puct` at fixed sims, or more sims at fixed `c_puct`, each flips the
+sign. **The two cells that read zero are the two agents every constant in this
+file was fitted on.** The `mcts:1024:cp=0.05` cell is at a full 249 blocks with
+a win rate of 0.320 against a null of 0.250 — this is not a thin reading.
+
+Two checks, because a scale change measured on MCTS has an obvious confound:
+`eval::heuristic` is the **prior** as well as the leaf value (`mcts.rs:1573`), so
+anything that widens `margin`'s spread acts like a lower `c_puct`, and a lower
+`c_puct` is worth +6.5 on its own (`docs/OVERNIGHT.md`).
+
+* **Spread control.** `temple = 1.6` adds *more* absolute magnitude to the
+  estimate than `board = 0.8` does (`temple_outlook` is 18.5 points, F28d), and
+  reads −0.54 on `mcts:256` and −0.57 on `greedy:64`. On the deep tier it reads
+  **−0.83 [−1.81, +0.15]** at 67 blocks — still negative. The deep search is not
+  rewarding a bigger number; it is rewarding *this* term.
+* **Independent seeds.** `bd5_080` re-runs `board = 0.8` deep from seed
+  **5,000,000**, disjoint from the 3,000,000 block every other cell uses:
+  **+0.94 [−0.01, +1.88]** at 59 blocks, same direction, same size.
+
+And the curve does not stop at 0.8: `board = 0.9` deep is **+2.28 [+1.63,
++2.93] \*** at 145 blocks. `bx_050/090/100/120_cp05` are mapping the rest of it
+on `mcts:256:cp=0.05`, which is a *searching* agent at a quarter of the deep
+tier's cost.
+
+**What this does and does not overturn.** F31a and F32 are correct about what
+they measured: `board = 0.80` buys `greedy:64` and `mcts:256` nothing, and the
++2.17 that came from subtracting two runs against a `board = 0.5` field was a
+framing artefact. What neither of them measured is an agent that searches. The
+brief's instruction that `BOARD_SCALE` is settled rests on those two agents, and
+the deliverable is `mcts:8192:heuristic:cp=0.02`.
+
+## F37. The 2x2 resolves, and `temple = 1.6` is the control that kills the rival explanation
+
+F34k left the board result with two live explanations and one confound. All
+three are now answered. Every cell `evalab-p23`, `--base head` (i.e. board 0.65
+as the base, which is what these were started against):
+
+| | `c_puct = 2.0` (default) | `c_puct = 0.05` |
+| --- | --- | --- |
+| **256 sims** | −0.03 [−0.39, +0.33], 400 blk | **+0.76** [+0.24, +1.28] *, 181 blk |
+| **1,024 sims** | **+1.78** [+0.94, +2.62] *, 58 blk | **+1.48** [+1.00, +1.96] *, 241 blk |
+
+**It is not the `c_puct` column or the sims row — it is both, because both are
+the same thing.** 1,024 sims at `c_puct = 2.0` descends further than 256 sims at
+`c_puct = 2.0` for the ordinary reason that a bigger tree is a deeper tree, and
+lowering `c_puct` at fixed budget spends the same simulations narrower and
+deeper. The three positive cells are the three that descend further than
+`mcts:256`, and the one null cell is the one that does not. The controlling
+variable is **depth of descent**, exactly as F34c guessed and for a duller
+reason than "a `c_puct` interaction".
+
+Two consequences worth having:
+
+* **`mcts:256:cp=0.05` is a usable cheap deep proxy.** It reads +0.76 where
+  `mcts:1024:cp=0.05` reads +1.48 on the identical variant — same sign, about
+  **half** the magnitude, at roughly a quarter of the CPU and half the resident
+  memory. That is the right workhorse for *sign* questions, which is what the
+  F34 hypothesis actually asks; keep `mcts:1024:cp=0.05` for confirming whatever
+  is about to land. **Read proxy numbers as roughly half the deep effect.**
+* The 58-block `mcts:1024` cell is above F30e's bar for halving and should be
+  read as "positive", not as "+1.78".
+
+### F37a. `temple = 1.6` — the magnitude confound is dead
+
+F34k's worry was that a deep search simply rewards a **larger spread in
+`margin`**, since `eval::heuristic` is MCTS's prior as well as its leaf value, so
+a wider spread acts like a lower `c_puct`. `temple = 1.6` is the control: it
+*raises* the biggest term in the evaluator and, as F34k notes, adds **more**
+absolute magnitude to the estimate than `board = 0.8` does.
+
+| variant | magnitude effect | `mcts:1024:cp=0.05` | blocks |
+| --- | --- | --- | --- |
+| `board = 0.8` | larger | **+1.48** [+1.00, +1.96] * | 241 |
+| `temple = 1.6` | larger *still* | **−0.95** [−2.00, +0.10] | 62 |
+
+Same direction of magnitude, opposite sign of result. **So the deep search is
+not buying spread, it is buying shape** — which is the F34 hypothesis's central
+claim and its first real test. `temple = 1.6` is only 62 blocks and its interval
+touches zero, so the strong reading ("raising the projected term actively hurts
+at depth") is not yet earned; the weak reading is enough to kill the confound,
+because the rival explanation predicted `temple = 1.6` would be *positive* and
+of at least `board = 0.8`'s size.

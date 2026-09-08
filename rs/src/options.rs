@@ -14,8 +14,8 @@ use crate::state::GameState;
 /// Combinations, not permutations: the Go version recursed over all three block
 /// types at every level, so paying wood-then-stone and stone-then-wood were two
 /// separate options all the way up the tree.
-pub fn pay_blocks(res: [u8; 4], n: u8) -> Vec<Bundle> {
-    fn go(res: &[u8; 4], idx: usize, left: u8, cur: Bundle, out: &mut Vec<Bundle>) {
+pub fn pay_blocks(res: [u8; 4], n: u8) -> Splits {
+    fn go(res: &[u8; 4], idx: usize, left: u8, cur: Bundle, out: &mut Splits) {
         if left == 0 {
             out.push(cur);
             return;
@@ -29,10 +29,17 @@ pub fn pay_blocks(res: [u8; 4], n: u8) -> Vec<Bundle> {
             go(res, idx + 1, left - take, c, out);
         }
     }
-    let mut out = Vec::new();
+    let mut out = Splits::new();
     go(&res, 0, n, EMPTY, &mut out);
     out
 }
+
+/// Every way to split one bill across the three block types.
+///
+/// The dearest research advance costs three blocks, which splits ten ways, so
+/// this never touches the heap in the base game -- and `recurse` asks for one
+/// per science track per level, which was a malloc and a free apiece.
+pub type Splits = smallvec::SmallVec<[Bundle; 12]>;
 
 fn payment_effects(pay: Bundle, into: &mut Effects) {
     for r in Resource::BLOCKS {
@@ -42,9 +49,12 @@ fn payment_effects(pay: Bundle, into: &mut Effects) {
     }
 }
 
+/// The level-3 payoffs of one track: at most one per temple or per track.
+pub type Payoffs = smallvec::SmallVec<[Effects; 4]>;
+
 /// The one-off payoff for advancing a track that is already at level 3.
-fn top_payoffs(g: &GameState, p: PlayerId, s: Science) -> Vec<Effects> {
-    let mut out: Vec<Effects> = Vec::new();
+fn top_payoffs(g: &GameState, p: PlayerId, s: Science) -> Payoffs {
+    let mut out: Payoffs = Payoffs::new();
     match s {
         Science::Agriculture => {
             for t in Temple::ALL {
@@ -81,7 +91,7 @@ pub fn research_choices(g: &GameState, p: PlayerId, n: u8, free: bool) -> Vec<Ch
     let res = g.players[p.idx()].res;
     let lvls = g.research[p.idx()];
     recurse(g, p, res, lvls, n, free, 0, EMPTY, &Choice::new(), &mut out);
-    dedup(out)
+    dedup_unordered(out)
 }
 
 /// Two spellings of one decision, collapsed.
@@ -260,9 +270,9 @@ pub fn building_choices(
 /// expanded against a probe with the cost already paid, and every generator is
 /// monotone in the player's holdings, so the cheaper branch's payoffs are a
 /// superset of the dearer one's.
-fn affordable_costs(g: &GameState, p: PlayerId, cost: Bundle, discount: bool) -> Vec<Bundle> {
+fn affordable_costs(g: &GameState, p: PlayerId, cost: Bundle, discount: bool) -> Splits {
     let player = &g.players[p.idx()];
-    let mut out = Vec::new();
+    let mut out = Splits::new();
     // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
     if !pruning_on() && player.can_pay(cost) {
         out.push(cost);
@@ -307,7 +317,12 @@ pub fn expand_payoff(
                 return vec![Choice::skip()];
             }
             let mut out = Vec::new();
-            let steppable: Vec<Temple> = Temple::ALL
+            // Inline: three temples, so this never reaches the heap. Threading
+            // an output buffer through the whole payoff expansion was tried
+            // and measured neutral (11.26 s against 11.30, four interleaved
+            // rounds); the allocations that matter were the ones inside the
+            // recursion, not the one per payoff.
+            let steppable: smallvec::SmallVec<[Temple; 3]> = Temple::ALL
                 .iter()
                 .copied()
                 .filter(|&t| g.can_temple_step(p, t, 1))
@@ -315,7 +330,7 @@ pub fn expand_payoff(
             for second in building_choices(g, p, Some(self_id), true, depth - 1) {
                 if steppable.is_empty() {
                     // The step is wasted, but the build still happens.
-                    out.push(second.clone());
+                    out.push(second);
                 } else {
                     for &t in &steppable {
                         out.push(second.clone().with(Effect::TempleStep(t, 1)));
@@ -370,19 +385,18 @@ pub fn corn_exchange(g: &GameState, p: PlayerId) -> Vec<Choice> {
     ];
     let player = &g.players[p.idx()];
 
-    // Every way to sell some of what is held.
-    let mut sells: Vec<([u8; 3], u32)> = Vec::new();
+    let mut out = Vec::new();
+    // One buffer for the whole exchange rather than one per sale: the sell
+    // loop runs (wood+1)(stone+1)(gold+1) times and each pass used to allocate
+    // and free its own list of purchases.
+    let mut bought: Vec<[u8; 3]> = Vec::new();
+    // Every way to sell some of what is held, crossed with every way to spend
+    // the proceeds.
     for w in 0..=player.get(Resource::Wood) {
         for st in 0..=player.get(Resource::Stone) {
             for gd in 0..=player.get(Resource::Gold) {
-                let gained = w as u32 * 2 + st as u32 * 3 + gd as u32 * 4;
-                sells.push(([w, st, gd], gained));
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    for (sold, gained) in sells {
+        let sold = [w, st, gd];
+        let gained = w as u32 * 2 + st as u32 * 3 + gd as u32 * 4;
         let budget = (player.corn as u32 + gained).min(u8::MAX as u32) as u8;
 
         // Every way to spend that budget on blocks. Buying back something just
@@ -399,10 +413,10 @@ pub fn corn_exchange(g: &GameState, p: PlayerId) -> Vec<Choice> {
                 buys(budget - take * price, idx + 1, c, out);
             }
         }
-        let mut bought = Vec::new();
+        bought.clear();
         buys(budget, 0, [0; 3], &mut bought);
 
-        for buy in bought {
+        for &buy in &bought {
             if (0..3).any(|i| sold[i] > 0 && buy[i] > 0) {
                 continue;
             }
@@ -424,8 +438,10 @@ pub fn corn_exchange(g: &GameState, p: PlayerId) -> Vec<Choice> {
             }
             out.push(c);
         }
+            }
+        }
     }
-    dedup(out)
+    dedup_unordered(out)
 }
 
 // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
@@ -438,6 +454,17 @@ pub fn corn_exchange(g: &GameState, p: PlayerId) -> Vec<Choice> {
 pub static PRUNE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
 // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
 pub fn prune_level() -> u8 {
+    // SCRATCH: `TZ_PRUNE` pins the level for a whole process, which is how the
+    // "does the dominance rule earn its cost under MCTS" run reaches `arena` --
+    // a binary this workstream does not own and cannot add a flag to. Read once
+    // through a `Once`; `movestats` still stores directly and wins, because it
+    // stores after this has already fired.
+    static ENV: std::sync::Once = std::sync::Once::new();
+    ENV.call_once(|| {
+        if let Some(v) = std::env::var("TZ_PRUNE").ok().and_then(|v| v.parse().ok()) {
+            PRUNE.store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     PRUNE.load(std::sync::atomic::Ordering::Relaxed)
 }
 // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
@@ -484,9 +511,79 @@ pub fn dedup_by_position(g: &GameState, p: PlayerId, v: Vec<Choice>) -> Vec<Choi
 /// reach the same bundle of effects -- and identical choices are worth
 /// collapsing before they multiply through move generation.
 pub fn dedup(mut v: Vec<Choice>) -> Vec<Choice> {
-    v.sort();
+    // Unstable: the only elements the comparator calls equal are *identical*
+    // choices, so which copy survives is not a question, and the stable sort's
+    // scratch buffer was showing up as `driftsort` plus a malloc at every
+    // `research_choices` and `corn_exchange` call.
+    v.sort_unstable();
     v.dedup();
     v
+}
+
+/// Collapse exact duplicates, imposing no order.
+///
+/// Every list built in this module is on its way into `dominated_dedup`, and
+/// that pass's output is a function of its input *multiset*: the sweep orders
+/// by group and by total wealth moved, two choices can only prune each other
+/// when their nets are equal, and the equal case picks the lexicographically
+/// first spelling explicitly. So the canonical order `dedup` used to leave
+/// behind was never read by anything downstream -- and finding duplicates by
+/// sorting was 35% of all generation time, spread over `research_choices`,
+/// `corn_exchange` and `tikal::at_d`.
+///
+/// A digest collision leaves a duplicate standing rather than dropping a
+/// distinct choice, and a surviving duplicate is collapsed by `dominated_dedup`
+/// anyway, so the hash is an accelerator here too.
+pub fn dedup_unordered(mut v: Vec<Choice>) -> Vec<Choice> {
+    if v.len() < 2 {
+        return v;
+    }
+    // Short lists are the common case and a hash map for eight elements costs
+    // more than looking at all of them; `keep` never runs ahead of `r`, so the
+    // survivors are always the prefix being compared against.
+    if v.len() <= 16 {
+        let mut keep = 0usize;
+        'outer: for r in 0..v.len() {
+            for k in 0..keep {
+                if v[k] == v[r] {
+                    continue 'outer;
+                }
+            }
+            v.swap(keep, r);
+            keep += 1;
+        }
+        v.truncate(keep);
+        return v;
+    }
+    let mut seen = SCRATCH.take_seen();
+    seen.clear();
+    let mut keep = 0usize;
+    for r in 0..v.len() {
+        let d = choice_digest(&v[r]);
+        if let Some(&i) = seen.get(&d) {
+            if v[i as usize] == v[r] {
+                continue;
+            }
+        }
+        seen.insert(d, keep as u32);
+        v.swap(keep, r);
+        keep += 1;
+    }
+    v.truncate(keep);
+    SCRATCH.put_seen(seen);
+    v
+}
+
+/// An order-sensitive digest of a whole choice, wealth included.
+#[inline]
+fn choice_digest(c: &Choice) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ c.0.len() as u64;
+    for &e in &c.0 {
+        h ^= pack(e) as u64;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+    }
+    h
 }
 
 /// Sort, deduplicate, and drop every choice another choice strictly beats.
@@ -541,73 +638,254 @@ pub fn dominated_dedup(mut v: Vec<Choice>) -> Vec<Choice> {
     if !pruning_on() {
         return dedup(v);
     }
-    // Order by "what it does, ignoring the price", then by total wealth moved.
-    // A dominator moves at least as much on every axis, so it also moves at
-    // least as much in total: sorting by the sum descending puts every
-    // dominator ahead of everything it beats, which turns the Pareto front into
-    // one forward pass. The key is compared as an iterator rather than
-    // materialised, because this runs at every node of the retrieval walk and a
-    // per-choice allocation there is not free.
+    // One element cannot dominate anything and is already in order; the p50
+    // space returns a list this short, so the early exit is most of the calls.
+    if v.len() < 2 {
+        return v;
+    }
     // SCRATCH: measurement switch, delete with src/bin/movestats.rs.
     let wide = wide_pruning_on();
-    let group = |a: &Choice, b: &Choice| {
-        a.is_skip() == b.is_skip()
-            && a.0
-                .iter()
-                .filter(|e| !is_wealth(e, wide))
-                .cmp(b.0.iter().filter(|e| !is_wealth(e, wide)))
-                .is_eq()
-    };
-    v.sort_unstable_by(|a, b| {
-        a.is_skip()
-            .cmp(&b.is_skip())
-            .then_with(|| {
-                a.0.iter()
-                    .filter(|e| !is_wealth(e, wide))
-                    .cmp(b.0.iter().filter(|e| !is_wealth(e, wide)))
-            })
-            .then_with(|| {
-                wealth(b, wide)
-                    .iter()
-                    .sum::<i32>()
-                    .cmp(&wealth(a, wide).iter().sum::<i32>())
-            })
-            .then_with(|| a.cmp(b))
+
+    // Summarise every choice once instead of re-deriving the key inside a
+    // comparator. The old shape spent 21% of all generation time in
+    // `Iterator::cmp_by`, comparing two filtered effect iterators O(n log n)
+    // times per list, and another 15% in the comparator that drove it; the
+    // summary is one linear pass and the sort then compares two `u64`s.
+    //
+    // Deliberately one straight-line body rather than a `sweep` helper and a
+    // stack-array path for short lists: both were tried and both measured
+    // slower (12.57 s against 12.67 and 12.87, four interleaved rounds), so
+    // the shared buffers are already cheaper than anything that avoids them.
+    let mut scratch = SCRATCH.take();
+    let keys = &mut scratch.keys;
+    keys.clear();
+    keys.extend(v.iter().map(|c| Key::of(c, wide)));
+
+    let idx = &mut scratch.idx;
+    idx.clear();
+    idx.extend(0..v.len() as u32);
+    // Group, then total wealth moved descending: a dominator moves at least as
+    // much on every axis and so also in total, which puts every dominator ahead
+    // of everything it beats and turns the Pareto front into one forward pass.
+    idx.sort_unstable_by(|&a, &b| {
+        let (ka, kb) = (&keys[a as usize], &keys[b as usize]);
+        ka.group.cmp(&kb.group).then_with(|| kb.sum.cmp(&ka.sum))
     });
 
-    // Compact in place: `keep` is the write cursor and never runs ahead of the
-    // read cursor, so the survivors of the group being scanned are always the
-    // slice this compares against.
-    let mut front: Vec<[i32; N_WEALTH]> = Vec::new();
-    let mut keep = 0usize;
+    let keep = &mut scratch.keep;
+    keep.clear();
+    keep.resize(v.len(), false);
+    let front = &mut scratch.front;
     let mut i = 0usize;
-    while i < v.len() {
+    while i < idx.len() {
+        let g = keys[idx[i] as usize].group;
         let mut j = i + 1;
-        while j < v.len() && group(&v[i], &v[j]) {
+        while j < idx.len() && keys[idx[j] as usize].group == g {
             j += 1;
         }
         front.clear();
-        for r in i..j {
-            let w = wealth(&v[r], wide);
-            // Equal vectors count as dominated: identical key and identical net
-            // means an identical position, so the first spelling stands for all
-            // of them. That collapses pairs plain `dedup` misses, such as the
-            // mirror's `-1 corn, +3 corn` against a bare `+2 corn`.
-            if front.iter().any(|f| (0..N_WEALTH).all(|k| f[k] >= w[k])) {
+        for s in &idx[i..j] {
+            let r = *s as usize;
+            let w = keys[r].w;
+            // `group` is a 64-bit digest, so a collision would put two genuinely
+            // different actions in one group and could drop a legal move.
+            // Confirming the real key before a prune fires -- and only then,
+            // which over 27M edges is a few compares per list rather than
+            // n log n -- makes the digest an accelerator and never the rule.
+            let mut dominated = false;
+            for (f, fw) in front.iter_mut() {
+                if !(0..N_WEALTH).all(|k| fw[k] >= w[k]) || !same_group(&v[*f], &v[r], wide) {
+                    continue;
+                }
+                // Equal vectors count as dominated: identical key and identical
+                // net means an identical position, so one spelling stands for
+                // all of them, which collapses pairs plain `dedup` misses --
+                // the mirror's `-1 corn, +3 corn` against a bare `+2 corn`.
+                //
+                // Which spelling is settled here rather than in the sort. Two
+                // choices can only dominate each other when their nets are
+                // equal (a dominator's total is at least the dominated one's,
+                // and the sweep runs in total order), so the lexicographic
+                // tie-break the comparator used to carry was doing work for
+                // exactly this case -- and paying a `Choice` compare on every
+                // one of the n log n sort steps to do it.
+                if *fw == w && v[r] < v[*f] {
+                    keep[*f] = false;
+                    keep[r] = true;
+                    *f = r;
+                }
+                dominated = true;
+                break;
+            }
+            if dominated {
                 continue;
             }
-            front.push(w);
-            v.swap(keep, r);
-            keep += 1;
+            front.push((r, w));
+            keep[r] = true;
         }
         i = j;
     }
-    v.truncate(keep);
-    // Back into `Choice` order, which is what every other generator returns and
-    // what makes the traversal order of `legal_moves` stable.
+
+    // Compact in place, then back into `Choice` order -- what every other
+    // generator returns, and what makes the traversal order of `legal_moves`
+    // stable.
+    let mut w = 0usize;
+    for r in 0..v.len() {
+        if keep[r] {
+            v.swap(w, r);
+            w += 1;
+        }
+    }
+    v.truncate(w);
+    SCRATCH.put(scratch);
     v.sort_unstable();
     v
 }
+
+/// What a choice looks like to the dominance test, computed in one pass.
+///
+/// `group` digests the *structural* effects in order -- everything that is not
+/// liquid wealth -- with the skip flag folded in, because "pick the worker up
+/// and do nothing" is one of the three options the rules name and must never be
+/// priced away by a space whose action is pure corn (`Palenque 1`). `w` is the
+/// net the dominance test compares and `sum` orders the sweep.
+#[derive(Clone, Copy)]
+struct Key {
+    group: u64,
+    w: [i32; N_WEALTH],
+    sum: i32,
+}
+
+impl Key {
+    #[inline]
+    fn of(c: &Choice, wide: bool) -> Key {
+        // A distinct seed rather than a flag field: the skip is the only empty
+        // effect list, so seeding it apart is what keeps it out of the group of
+        // every all-wealth choice at zero extra cost in the sweep.
+        let mut group: u64 = if c.0.is_empty() { 0x9e37_79b9_7f4a_7c15 } else { 0 };
+        let mut w = [0i32; N_WEALTH];
+        for &e in &c.0 {
+            match e {
+                Effect::Corn(n) => {
+                    w[0] += n as i32;
+                    continue;
+                }
+                Effect::Res(r, n) if wide && r != Resource::Skull => {
+                    w[1 + r.idx()] += n as i32;
+                    continue;
+                }
+                Effect::Points(n) if wide => {
+                    w[4] += n as i32;
+                    continue;
+                }
+                _ => {}
+            }
+            group ^= pack(e) as u64;
+            group = group.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            group ^= group >> 33;
+        }
+        let sum = w[0] + w[1] + w[2] + w[3] + w[4];
+        Key { group, w, sum }
+    }
+}
+
+/// The exact test the digest stands in for: same skip flag, same structural
+/// effects in the same order. Only reached when a prune is about to fire.
+#[inline]
+fn same_group(a: &Choice, b: &Choice, wide: bool) -> bool {
+    a.0.is_empty() == b.0.is_empty()
+        && a.0
+            .iter()
+            .filter(|e| !is_wealth(e, wide))
+            .cmp(b.0.iter().filter(|e| !is_wealth(e, wide)))
+            .is_eq()
+}
+
+/// One effect as a `u32`, order-isomorphic to `Effect`'s derived `Ord`.
+///
+/// The vocabulary is 14 variants whose widest payload is a 16-bit corn delta,
+/// so tag and payload fit a word with room to spare, and every field is either
+/// a fieldless enum (declaration order, which is what the derive compares) or a
+/// `u8` newtype. Biasing the signed fields keeps the packed order the same as
+/// the derived one; `packed_order_matches_derived_ord` in `tests/rules.rs`
+/// holds that.
+#[inline]
+pub fn pack(e: Effect) -> u32 {
+    let (tag, payload): (u32, u32) = match e {
+        Effect::Corn(n) => (0, (n as i32 + 32_768) as u32),
+        Effect::SetCorn(n) => (1, n as u32),
+        Effect::Res(r, n) => (2, ((r as u32) << 9) | (n as i32 + 128) as u32),
+        Effect::Points(n) => (3, (n as i32 + 128) as u32),
+        Effect::TempleStep(t, n) => (4, ((t as u32) << 9) | (n as i32 + 128) as u32),
+        Effect::AdvanceResearch(s) => (5, s as u32),
+        Effect::UnlockWorker => (6, 0),
+        Effect::FreeWorker(n) => (7, (n as i32 + 128) as u32),
+        Effect::WorkerDiscount(n) => (8, (n as i32 + 128) as u32),
+        Effect::TakePalenqueTile(pos, k) => (9, ((pos.0 as u32) << 9) | k as u32),
+        Effect::BurnPalenqueWood(pos) => (10, pos.0 as u32),
+        Effect::FillChichen(pos) => (11, pos.0 as u32),
+        Effect::Build(b) => (12, b.0 as u32),
+        Effect::TakeMonument(m) => (13, m.0 as u32),
+    };
+    (tag << 20) | payload
+}
+
+/// Buffers `dominated_dedup` would otherwise allocate four times per call.
+///
+/// The allocator is 14.6% of a running search and generation is where most of
+/// that comes from, so the working set of a pass that runs at every `Take` node
+/// is worth keeping. Taken out of the cell rather than borrowed: a future
+/// nested call then allocates its own instead of panicking on the borrow.
+#[derive(Default)]
+struct Scratch {
+    keys: Vec<Key>,
+    idx: Vec<u32>,
+    keep: Vec<bool>,
+    front: Vec<(usize, [i32; N_WEALTH])>,
+    seen: rustc_hash::FxHashMap<u64, u32>,
+}
+
+thread_local! {
+    static SCRATCH_CELL: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+struct ScratchSlot;
+const SCRATCH: ScratchSlot = ScratchSlot;
+
+impl ScratchSlot {
+    #[inline]
+    fn take(&self) -> Scratch {
+        // Taken out of the cell rather than borrowed across the body: nothing
+        // nests today -- `raw_at` finishes before `dominated_dedup` starts --
+        // and a future nesting then allocates its own buffers instead of
+        // aliasing these.
+        SCRATCH_CELL.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+    #[inline]
+    fn put(&self, s: Scratch) {
+        SCRATCH_CELL.with(|c| {
+            let mut slot = c.borrow_mut();
+            if slot.keys.capacity() < s.keys.capacity() {
+                *slot = s;
+            }
+        });
+    }
+    #[inline]
+    fn take_seen(&self) -> rustc_hash::FxHashMap<u64, u32> {
+        SCRATCH_CELL.with(|c| std::mem::take(&mut c.borrow_mut().seen))
+    }
+    #[inline]
+    fn put_seen(&self, m: rustc_hash::FxHashMap<u64, u32>) {
+        SCRATCH_CELL.with(|c| {
+            if let Ok(mut slot) = c.try_borrow_mut() {
+                if slot.seen.capacity() < m.capacity() {
+                    slot.seen = m;
+                }
+            }
+        });
+    }
+}
+
 
 /// Corn, the three block types, and points.
 const N_WEALTH: usize = 5;
@@ -626,21 +904,6 @@ fn is_wealth(e: &Effect, wide: bool) -> bool {
         Effect::Res(r, _) => wide && *r != Resource::Skull,
         _ => false,
     }
-}
-
-/// Net corn, wood, stone, gold and points a choice moves.
-#[inline]
-fn wealth(c: &Choice, wide: bool) -> [i32; N_WEALTH] {
-    let mut w = [0i32; N_WEALTH];
-    for e in &c.0 {
-        match *e {
-            Effect::Corn(n) => w[0] += n as i32,
-            Effect::Res(r, n) if wide && r != Resource::Skull => w[1 + r.idx()] += n as i32,
-            Effect::Points(n) if wide => w[4] += n as i32,
-            _ => {}
-        }
-    }
-    w
 }
 
 /// A linear price on the resolved effect vocabulary: the prior a `Choice` can

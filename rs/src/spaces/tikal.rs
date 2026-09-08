@@ -20,7 +20,7 @@ pub fn at_d(g: &GameState, p: PlayerId, pos: Pos, depth: u8) -> Vec<Choice> {
         3 => {
             let mut v = research_choices(g, p, 1, false);
             v.extend(research_choices(g, p, 2, false));
-            or_skip(crate::options::dedup(v))
+            or_skip(crate::options::dedup_unordered(v))
         }
         4 => or_skip(build_two(g, p, depth)),
         5 => or_skip(two_temple_steps(g, p)),

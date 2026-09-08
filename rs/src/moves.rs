@@ -8,7 +8,6 @@
 
 use crate::effect::{Choice, Effect};
 use crate::ids::*;
-use crate::spaces::choices_at;
 use crate::state::GameState;
 use smallvec::SmallVec;
 use std::collections::HashSet;
@@ -586,14 +585,25 @@ pub fn choices_for_worker_by<O: Priority>(
         let mut probe = *g;
         probe.players[p.idx()].corn -= fee;
 
-        for c in choices_at(&probe, p, gear, Pos(j)) {
-            if fee == 0 {
-                out.push(c);
-            } else if !c.is_skip() {
-                // Paying corn to reach a space that does nothing is strictly
-                // dominated by doing nothing for free.
-                out.push(Choice::one(Effect::Corn(-(fee as i16))).chain(&c));
+        let mut raw = crate::spaces::raw_at(&probe, p, gear, Pos(j));
+        if fee == 0 {
+            out.append(&mut raw);
+            continue;
+        }
+        for mut c in raw {
+            // Paying corn to reach a space that does nothing is strictly
+            // dominated by doing nothing for free.
+            if c.is_skip() {
+                continue;
             }
+            // Moved and prefixed in place rather than `Choice::one(fee).chain`:
+            // the fee has to lead, because `Choice::affordable` walks the list
+            // in order and a discounted action must not spend corn the fee
+            // consumed, and 15% of generated choices are long enough to have
+            // spilled off the inline `Effects`, where building a second copy is
+            // a malloc and a free.
+            c.0.insert(0, Effect::Corn(-(fee as i16)));
+            out.push(c);
         }
     }
     // The rest of the step-down redundancy is priced, not structural: the same
