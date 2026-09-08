@@ -1,6 +1,88 @@
 //! Phase-dependent evaluation, layered *over* `eval::components` rather than
 //! forked from it.
 //!
+//! # What it measured
+//!
+//! Read this before the design sections below, because the design is more
+//! interesting than the result and that is the wrong way round.
+//!
+//! Two independent halves — a **value head** (this file's schedule) and a
+//! **prior** ([`PlanBias`]) — and they are not the same size. Every number is a
+//! centred score over rotation blocks, null 0; the greedy arms are `greedy:32`
+//! over [`PlanEvaluator`] against `heuristic:32`, and the MCTS arms are
+//! `mcts:256` against the *identical* search on `phase::HeuristicEvaluator`, so
+//! the simulation count is matched and only the evaluator or the prior differs.
+//!
+//! ```text
+//!   the value head                greedy         mcts:256
+//!     Schedule::IDENTITY (null)    -0.10           +0.00      500 / 300 blocks
+//!     FITTED                       -6.37             ---
+//!     HALF                        +14.60             ---
+//!     REFIT                       +18.97          +14.89
+//!     REFIT, calendar removed     +14.72             ---
+//!
+//!   the prior, on `heuristic` both sides             mcts:256
+//!     PlanBias k=32                                   +8.61   240 blocks
+//!     ... blind control (same edges, no leader)       +3.26   240 blocks
+//!     ... shuffled control (same weights, moved)      -1.41   240 blocks
+//!     Priors::OnePly through the same seam            +1.40   120 blocks
+//!     ... the same probe over FITTED instead          +6.55   120 blocks
+//!     a softmax over `mcts::Gradient`                 +3.21   240 blocks
+//!
+//!   both halves at once                              mcts:256
+//!     REFIT value + PlanBias k=32                    +17.49   240 blocks
+//!
+//!   and at 4x the budget                            mcts:1024   60 blocks
+//!     REFIT value alone                              +17.31
+//!     PlanBias k=32 alone                             +5.48
+//!     both                                           +19.10
+//! ```
+//!
+//! Five things follow, and two of them are negative.
+//!
+//! * **Most of the value head is not a phase, and it is two terms.**
+//!   [`Schedule::flattened`] keeps each term's average level and throws the
+//!   calendar away; paired block by block it costs only **+4.25**
+//!   (+3.43..+5.07) of [`REFIT`]'s +18.97, so the day axis is a quarter of the
+//!   story. Per-term ablations put the other three quarters in `board` (+11.85
+//!   alone) and `engine` (+8.71) — both terms the schedule *lowers*. The
+//!   finding under all of this is that `eval::board_position` and
+//!   `eval::engine_value` are over-priced by 2-4x.
+//! * **A fit must be shrunk or refitted.** [`FITTED`] — the same directions at
+//!   full magnitude, measured off-policy — is 25 points worse than [`REFIT`]
+//!   and worse than doing nothing at all.
+//! * **The prior is the cheap half and it works.** [`PlanBias`] reads the
+//!   effect vocabulary of an edge and never touches the state: **5.6 ns an
+//!   edge against 123.8** for the one-ply probe it beats by **+7.15**
+//!   (+5.45..+8.84). Both controls hold: promoting the same edges without the
+//!   leader test is +5.35 worse, and taking the plan's own multipliers and
+//!   attaching them to shuffled edges is +10.03 worse and *negative in absolute
+//!   terms*. The gain is which line this player is on, not "prefer edges that
+//!   score" and not "concentrate the prior somewhere".
+//! * **A prior is not a value function, and the two want different numbers.**
+//!   The one-ply probe run over [`FITTED`] scores +6.55 where the same probe
+//!   over `eval::heuristic` scores +1.40 — paired, **+5.15** (+3.46..+6.84) —
+//!   even though [`FITTED`] is 25 points *worse* as a value head. A prior only
+//!   has to rank siblings, so a schedule that exaggerates `monument` and
+//!   `starvation` and ignores `engine` is a better ranking key and a much worse
+//!   estimate. Nothing about "fit the evaluator" transfers to "fit the prior".
+//! * **The two halves are strongly sub-additive.** Value +14.89 and prior +8.61
+//!   compose to **+17.49**, not +23.5. Paired on the same 240 seeds, adding the
+//!   prior to the value head buys **+2.28** (+1.49..+3.07) where the prior is
+//!   worth +8.61 on its own, and adding the value head to the prior buys
+//!   **+8.87** (+7.82..+9.93). They are two routes to the same better moves,
+//!   and only about a quarter of the prior survives a value head that has
+//!   already been told what matters. If only one of the two ships, it is the
+//!   value head.
+//!
+//! What did **not** work is recorded where it lives, and it is three of the
+//! four ideas this file was written around: [`PlanWeights::focus`], the
+//! convexity term the last section argues for, is inert below a weight of 1 and
+//! costs points above it; [`BiasWeights::name_temple`] loses -0.74; and
+//! [`BiasWeights::place`] loses **-9.22**. The plan is worth something at
+//! exactly one grain — which *action* serves the line — and worth nothing or
+//! less at every grain coarser or finer than that.
+//!
 //! # The problem
 //!
 //! `eval::heuristic` is one function applied identically on day 1 and day 26.
@@ -126,12 +208,18 @@
 //! storing anything. Abandonment is automatic and continuous: a line whose
 //! calendar feasibility has run out contributes zero, and the max moves to
 //! whatever is still reachable.
+//!
+//! **That argument is correct and the term it produced is worth nothing** —
+//! see [`PlanWeights::focus`] for the grid. The same [`Line`] statistic reached
+//! through the *prior* instead of the value ([`PlanBias`]) is worth +8.61, so
+//! what failed is the channel and not the vocabulary: a bonus of a fraction of
+//! a point inside a 200-point sum cannot outvote anything, where a multiplier
+//! on a prior decides which 32 edges of a wide node the search may play at all.
 
 use crate::effect::Effect;
 use crate::eval;
 use crate::ids::*;
 use crate::moves::Placement;
-use crate::options::EffectPrice;
 use crate::phase::{Evaluation, Evaluator, Phase, Step};
 use crate::state::{GameState, LAST_DAY, POINT_DAYS, RESOURCE_DAYS};
 
@@ -305,6 +393,13 @@ pub const FITTED: Schedule = Schedule {
 /// so the further the schedule moves the further off-distribution the estimate
 /// it came from is. Shrinking is the cheap insurance against that, and the
 /// arena says which of the two to keep.
+///
+/// **It said shrink.** Against `heuristic:32` over 500 rotation blocks,
+/// [`FITTED`] is **-6.37** centred (-6.88..-5.85) and this is **+14.60**
+/// (+13.94..+15.26) — a 21-point swing for moving the same weights halfway
+/// back. Under `mcts:256` on both sides the same pair is -16.77 and +12.93.
+/// The fit's *direction* is worth a great deal and its *magnitude* is not the
+/// number to use, which is exactly what "measured off-policy" predicts.
 pub const HALF: Schedule = Schedule {
     w: [
         /* day  0 */ [1.00, 1.00, 0.50, 0.50, 0.50, 0.50, 2.25, 1.10],
@@ -336,7 +431,62 @@ pub const HALF: Schedule = Schedule {
 /// * `temple` is 0.23 on day 0 and ~1.1 from day 8 on: nothing about a day-2
 ///   temple standing survives to the day-14 payout.
 ///
-/// Measured against the flat-rescale control in `planlab`; see the report.
+/// # What it is worth, and how much of that is the calendar
+///
+/// The best value head this file has. Against `heuristic:32` over 500 rotation
+/// blocks it is **+18.97** centred (+18.32..+19.61), against [`HALF`]'s +14.60
+/// and [`FITTED`]'s -6.37; under `mcts:256` on both sides, **+14.89**
+/// (+14.15..+15.62) over 300 blocks. [`Schedule::IDENTITY`] measures -0.10
+/// (-0.91..+0.70), which is the null doing its job.
+///
+/// The refit is also correctly *scaled*, which is the thing the first fit was
+/// not. [`Schedule::shrunk`] sweeps the distance from identity, 500 blocks a
+/// rung:
+///
+/// ```text
+///   shrink   0.25    0.50    0.75    1.00    1.25
+///     pts   +4.76  +11.41  +16.85  +18.97  +17.60
+/// ```
+///
+/// A clean interior maximum at 1.0 — the published table — where the same sweep
+/// over [`FITTED`] runs +6.87 at 0.25 and +14.60 at 0.50 and then *falls* to
+/// -6.37 at 1.0. One refit round is what moved the optimum from "a quarter of
+/// the way" to "all the way", and that is the whole case for closing the loop.
+///
+/// # And two terms are the whole of it
+///
+/// `--only T` leaves every term but `T` at its identity weight, so these six
+/// arms say which part of the table is doing the work. 500 blocks each:
+///
+/// ```text
+///    board  engine    held  monum   starv   temple      all six together
+///   +11.85   +8.71   +1.52  -0.18   -0.01    -3.86                +18.97
+/// ```
+///
+/// They sum to +18.03 against the joint +18.97, so the terms are very nearly
+/// separable — and **`board` and `engine` are the entire effect**. Both are
+/// terms this schedule *lowers*: `board` runs 0.23-0.90 and `engine` 0.00-0.84
+/// where `eval` charges 1.0 for each. So the finding underneath all of the
+/// above is not really about phases at all. It is that `eval::board_position`
+/// and `eval::engine_value` are over-priced by roughly 2-4x, exactly as
+/// `tests/rules.rs::evaluator_calibration` said, and that correcting those two
+/// prices is worth about twenty points on its own.
+///
+/// `temple` is the one term that is worse than leaving it alone (-3.86), which
+/// is a caution about reading a fitted coefficient as a price: the fit wants
+/// `temple` near zero early because a day-2 standing predicts nothing, and an
+/// agent told that acts as if the tracks do not matter until day 8 and arrives
+/// at the day-14 payout behind.
+///
+/// **But most of it is a rescale, not a phase.** [`Schedule::flattened`] — the
+/// same average level with every knot equalised, so the calendar shape is gone
+/// and nothing else is — scores **+14.72** (+14.06..+15.37) on the same 500
+/// seeds. Paired block by block, the shape is worth **+4.25** (+3.43..+5.07) of
+/// the +18.97, and the other 78% is `eval` mispricing its terms by a constant
+/// this file happens to have measured. That is the honest reading and it is
+/// worth more than the schedule is: the day axis earns about four points, and
+/// the claim that phase-dependence is where the win lives does not survive its
+/// own control.
 pub const REFIT: Schedule = Schedule {
     w: [
         //           banked  liquid   held  temple  engine  board  monum  starv
@@ -561,9 +711,50 @@ pub fn line_progress(g: &GameState, p: PlayerId, l: Line) -> f32 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlanWeights {
     /// Multiplier on the best line's progress.
+    ///
+    /// # Swept, and it is worth nothing
+    ///
+    /// `greedy:32` over [`REFIT`] against `heuristic:32`, 500 rotation blocks a
+    /// rung, and every rung paired against `focus = 0` on its own seeds:
+    ///
+    /// ```text
+    ///   focus     0     0.5      1       2       4       8      16
+    ///    pts  +18.97 +19.00  +19.00  +18.76  +18.57  +17.97  +15.40
+    ///  paired      -  +0.03   +0.03   -0.21   -0.40   -1.00   -3.57
+    ///     CI      -  +/-.24  +/-.30  +/-.37  +/-.45  +/-.56  +/-.67
+    /// ```
+    ///
+    /// Flat to the width of the interval up to 1 and then monotonically down;
+    /// at 8 it costs a real point (-1.00, -1.55..-0.44, p = 0.0005) and at 16 it
+    /// costs -3.57 (-4.24..-2.90). So the
+    /// commitment term is **inert where it is safe and harmful where it bites**,
+    /// which is the worst shape a term can have and is a clean negative result.
+    ///
+    /// The mechanism is visible in the size of the number rather than in its
+    /// sign. `max - mean` over three fractions is bounded by 2/3, and a single
+    /// turn moves one of those fractions by a few percent — a skull is a third
+    /// of a Chichen visit, a building a sixth of a construction game — so at
+    /// `focus = 1` the whole term separates two candidate turns by ~0.02 points
+    /// against a `raw` that runs to 200 and is then squashed through
+    /// `tanh(x/25)`. It cannot outvote anything until it is large enough to
+    /// outvote *everything*, and by then it is paying for concentration in
+    /// positions where spreading was correct.
+    ///
+    /// Kept, at zero by default, because it is the only implementation of the
+    /// module's convexity argument and a later fit over a coarser progress
+    /// statistic could revive it. It is not kept because it works.
     pub focus: f32,
     /// Whether the schedule's `held` weight is modulated by
     /// [`conversion_reach`].
+    ///
+    /// **The one part of the plan that pays.** Paired block by block against
+    /// the same schedule with it off, over 500 rotation blocks of `greedy:32`
+    /// over [`REFIT`]: **+0.32 (+0.13..+0.51, p = 0.0011)**. Small, and it is
+    /// the *only* term in [`PlanWeights`] whose interval clears zero — which
+    /// makes sense, because it is the only one that is arithmetic about the
+    /// position rather than an opinion about it. Three skulls with no reachable
+    /// Chichen space really are worth 3 apiece, and `eval::held_premium`'s
+    /// global `rounds_left / 6` clock really does not know that.
     pub reach: bool,
 }
 
@@ -607,12 +798,6 @@ pub fn focus(g: &GameState, p: PlayerId, k: f32) -> f32 {
 // The evaluator
 // =======================================================================
 
-/// `eval::components`, reweighted by the calendar and by what the position can
-/// still convert, plus the plan's convexity term.
-///
-/// Deliberately owns no pricing of its own: every point in the sum came out of
-/// `eval::components`, so a change to `eval.rs`'s constants moves this
-/// evaluator with it instead of leaving the two to drift apart.
 /// How the starting-tile draft is decided.
 ///
 /// A named choice rather than a bool because the interesting control is the
@@ -639,6 +824,23 @@ pub enum DraftMode {
     Unweighted,
 }
 
+/// `eval::components`, reweighted by the calendar and by what the position can
+/// still convert, plus the plan's convexity term.
+///
+/// Deliberately owns no pricing of its own: every point in the sum came out of
+/// `eval::components`, so a change to `eval.rs`'s constants moves this
+/// evaluator with it instead of leaving the two to drift apart.
+///
+/// It implements `phase::Evaluator` with `HeuristicEvaluator`'s exact shaping —
+/// centre across the four seats, `tanh(x / 25)`, uniform priors — so the two
+/// are interchangeable in `GreedyAgent` and in `Mcts`, and a duel between them
+/// measures the weights and nothing else. It is also not more expensive than
+/// the evaluator it replaces: benched back to back in the same loop it runs at
+/// **0.70x** `HeuristicEvaluator::evaluate`, because both spend their time in
+/// `eval::components` and the reweighting is eight multiplies. `PlanEvaluator::identity()` against
+/// `HeuristicEvaluator` under `mcts:256` measures **+0.00 with a zero-width
+/// interval**: identical agents, so the seat rotation cancels exactly. That is
+/// the null this file is read against.
 pub struct PlanEvaluator {
     pub sched: Schedule,
     pub plan: PlanWeights,
@@ -965,10 +1167,52 @@ fn lines_placed(step: &Step) -> u8 {
 pub struct BiasWeights {
     /// Strength, in nats of prior per unit of the leading line's lead. Zero is
     /// the identity bias, and must reproduce the unbiased search exactly.
+    ///
+    /// # The sweep
+    ///
+    /// `mcts:256` on `HeuristicEvaluator` against the same search with no
+    /// bias, so the value head is common-mode and the *only* difference is this
+    /// number. Centred score, 80 blocks a rung (120 at 64 and 128), CI ~+/-1.4:
+    ///
+    /// ```text
+    ///    k       1      2      4      8     16     32     64    128
+    ///  pts   +1.80  +2.03  +3.00  +4.67  +7.25  +8.28  +8.56  +8.10
+    /// ```
+    ///
+    /// **Monotone to a plateau at 32-64 and then flat.** Four times the budget
+    /// takes about a third of it away — `mcts:1024` measures +5.48
+    /// (+3.95..+7.01) over 60 blocks where `mcts:256` measures +8.61 — which is
+    /// the direction a prior should move: its job is to aim a *small* number of
+    /// simulations, and PUCT finds the same edges on its own once it has
+    /// enough. The value head moves the other way over the same step, +14.89 to
+    /// +17.31.
+    ///
+    /// The shape should still be read with suspicion rather than satisfaction: at `k = 32` and a typical
+    /// lead of 0.2, `up/down` is about 90, which is not a nudge but a filter on
+    /// the 32-edge active window of every wide node. A prior that only gets
+    /// better the harder it is applied is as consistent with "concentrating the
+    /// prior anywhere is worth points at 256 simulations" as it is with "the
+    /// plan is right" — which is what [`BiasWeights::blind`] and
+    /// [`BiasWeights::shuffled`] exist to separate.
     pub k: f32,
     /// Also steer `Step::Place`, by gear. A separate knob because a placement
     /// commits to an option rather than to an action, and the two claims are
     /// worth measuring apart.
+    ///
+    /// # Measured apart, and it is the worst thing in the file
+    ///
+    /// `mcts:256`, `k = 32`, 120 blocks: **-9.22** (-10.59..-7.84), against the
+    /// same prior without it at +8.61 — paired on the seed, **-17.76**
+    /// (-19.44..-16.08). An 18-point swing from one extra line of
+    /// classification.
+    ///
+    /// `lines_placed` resolves a whole *gear*, which is far too coarse for
+    /// the decision it is steering. "Tikal serves construction and temples" is
+    /// true of all eleven Tikal spaces at once, so at `k = 32` this does not
+    /// prefer a good placement, it forbids Palenque and Uxmal — and Palenque is
+    /// where the corn that feeds the workers comes from. A prior may bias and
+    /// never exclude; a multiplier of 90 applied to a claim this vague excludes
+    /// in everything but name.
     pub place: bool,
     /// Below this lead the plan abstains — and does no per-edge work at all.
     ///
@@ -983,6 +1227,30 @@ pub struct BiasWeights {
     /// Off is the honest null: `Line::Temples` folds `max` over the three
     /// tracks, so without this the prior promotes any climb at all — including
     /// the two that pay 2 where the third pays 6.
+    ///
+    /// # It does not work, and the mechanism says why
+    ///
+    /// Paired against the unnamed prior at `k = 32` over 240 blocks of
+    /// `mcts:256`, naming the temple is **-0.74** (-1.37..-0.10, p = 0.022) —
+    /// a small, real *loss*. The same claim through [`PricedBias`], where the
+    /// temple axis is repriced on top of `mcts::Gradient` instead of gating a
+    /// multiplier, is **+0.07** (-0.56..+0.70) against the plain gradient: an
+    /// exact zero, and -0.64 against the arm that credits all three tracks.
+    ///
+    /// The diagnostic in `planlab priors` predicted it. Over 4,298 real nodes
+    /// [`temple_target`] names a temple at 92.2% of them, but naming changes a
+    /// single weight at only **5.1%** and moves the top-weighted edge at
+    /// **2.1%**. A node offering steps on two different temples is rare — most
+    /// `Take` nodes offer one climb or none — so the argmax the naming resolves
+    /// is usually not contested, and the 2% where it is cannot pay for the
+    /// times the target is stale. `next_scoring_age` looks only at the *next*
+    /// payout, so on day 13 the plan names brown for a day-14 prize the player
+    /// is one step short of, and then spends the remaining 13 days having
+    /// committed to the track that pays 2.
+    ///
+    /// Kept, off, because it is the sharpest available statement of the age
+    /// inversion and the cost of asking is 0.6 ns an edge. It is not kept
+    /// because it works.
     pub name_temple: bool,
     /// **The control, not a mode to ship.** Raise every line-advancing edge by
     /// the leader's multiplier and demote nothing, so the bias no longer knows
@@ -994,7 +1262,43 @@ pub struct BiasWeights {
     /// arm holds the gate, the strength schedule and the edge set fixed and
     /// varies only the *direction*, so the difference between it and
     /// [`PlanBias`] is exactly the plan.
+    ///
+    /// **The direction is most of the effect.** `mcts:256` on
+    /// `HeuristicEvaluator` both sides, paired on the seed:
+    ///
+    /// ```text
+    ///            plan    blind   plan - blind          blocks
+    ///   k =  8  +4.67    +0.63   +4.12 (+2.37..+5.87)      80
+    ///   k = 32  +8.61    +3.26   +5.35 (+4.37..+6.33)     240
+    /// ```
+    ///
+    /// Promoting every line-advancing edge and demoting nothing is worth
+    /// **nothing at all** at `k = 8` (+0.63, -0.52..+1.78) and 38% of the
+    /// plan's score at 32. Whatever this prior is doing, it is not simply
+    /// "prefer edges that score".
     pub blind: bool,
+    /// **The harder control.** Keep every weight the plan computed and attach
+    /// them to *different edges*, by a permutation that is a function of the
+    /// node and of nothing in the edges.
+    ///
+    /// [`BiasWeights::blind`] holds the edge set fixed and varies the
+    /// direction. This holds the whole multiset of multipliers fixed — the same
+    /// count promoted, the same count demoted, the same strength — and varies
+    /// *which edges get them*. It exists because the k-sweep rises
+    /// monotonically, and a prior that gets better the harder it is applied is
+    /// equally consistent with "the plan is right" and with "concentrating a
+    /// uniform prior on any 40% of a wide node's edges is worth points at 256
+    /// simulations". Only this arm can tell those apart.
+    ///
+    /// **It told them apart, decisively.** At `k = 32` over 240 blocks the
+    /// shuffle scores **-1.41** (-2.33..-0.49) where the plan scores +8.61: not
+    /// merely worthless but *worse than no prior at all*, which is what a
+    /// confident wrong prior should be. Paired, the plan is **+10.03**
+    /// (+8.98..+11.08) ahead of its own weights pointed somewhere else, and
+    /// **+5.35** ahead of [`BiasWeights::blind`] — so the ordering is
+    /// shuffle < uniform < blind < plan, and every step of it is the content of
+    /// the classification rather than the shape of the distribution.
+    pub shuffled: bool,
 }
 
 impl BiasWeights {
@@ -1004,6 +1308,7 @@ impl BiasWeights {
         min_lead: 0.02,
         name_temple: false,
         blind: false,
+        shuffled: false,
     };
 }
 
@@ -1036,6 +1341,30 @@ impl BiasWeights {
 /// wider than `MctsConfig::max_edges`, where `Mcts::node_for` sorts by prior
 /// before truncating to `widen_cap`; there a prior really is an exclusion, and
 /// that is why `k` is swept rather than assumed.
+///
+/// # Where it lands, measured
+///
+/// `mcts.rs` now defaults to [`crate::mcts::EdgeOrder::Gradient`], which prices
+/// and truncates a wide node with `mcts::Gradient` **before** `priors_for` is
+/// reached — so a plan can re-rank the survivors and cannot rescue an edge the
+/// gradient dropped. The obvious worry is that the gradient silently deletes
+/// whatever the plan wanted. It does not: over 4,298 real nodes from
+/// `planlab priors --games 12`, only 26 are past the 128-edge cap at all, and
+/// at **none** of them was every plan-promoted edge deleted, nor was a step on
+/// the [`temple_target`] ever cut (21 kept, 0 dropped).
+///
+/// What the bias does reach is `Edge::prior` itself, and it reaches it hard.
+/// `node_for` re-sorts by the *biased* prior whenever a node is wider than
+/// `max_edges`, and only the first `max_edges` are opened — so on any node
+/// between 33 and 128 edges wide the bias, not the gradient, chooses which 32
+/// the search may play. Run at one simulation, where PUCT reduces to argmax of
+/// the prior, installing this changes the edge the search takes at **176 of 471
+/// wide `Take` nodes (37.4%)**.
+///
+/// It has an opinion at 66.6% of `Take` nodes and moves 41.8% of their edges,
+/// and abstains completely on every other phase — a `Place` is priced only with
+/// [`BiasWeights::place`] on, and `Beg`, `Mode`, `PickWorker` and `ExtraDay`
+/// carry no `Choice` to read.
 pub struct PlanBias {
     pub w: BiasWeights,
 }
@@ -1055,6 +1384,33 @@ impl PlanBias {
 /// advancing one of the other two. Derived, not fitted: see [`PlanBias`].
 const LEAD_SLOPE: f32 = 2.0 / 3.0;
 const FOLLOW_SLOPE: f32 = -1.0 / 3.0;
+
+/// Permute `out` in place by a shuffle seeded from the position and the width,
+/// so the *distribution* of multipliers is untouched and their attachment to
+/// edges carries no information. See [`BiasWeights::shuffled`].
+///
+/// Deterministic rather than random: `PriorBias::bias` takes `&self` and is
+/// `Sync`, and a control arm whose two runs of the same seed disagree is not a
+/// control. Seeded off the calendar day, the mover, the width and the mover's
+/// corn — enough to differ between nodes, and nothing that a *good* edge could
+/// correlate with.
+fn shuffle_weights(g: &GameState, p: PlayerId, out: &mut [f32]) {
+    let mut z = (g.day as u64) << 40
+        ^ (p.idx() as u64) << 32
+        ^ (out.len() as u64) << 16
+        ^ g.players[p.idx()].corn as u64;
+    let mut next = move || {
+        // splitmix64: one multiply-xor chain, no state beyond the counter.
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut x = z;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    };
+    for i in (1..out.len()).rev() {
+        out.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+}
 
 impl crate::mcts::PriorBias for PlanBias {
     fn bias(
@@ -1115,15 +1471,19 @@ impl crate::mcts::PriorBias for PlanBias {
                 down
             };
         }
+        if self.w.shuffled {
+            shuffle_weights(state, mover, out);
+        }
     }
 
     fn name(&self) -> String {
         format!(
-            "plan-bias:k={}{}{}{}",
+            "plan-bias:k={}{}{}{}{}",
             self.w.k,
             if self.w.place { ":place" } else { "" },
             if self.w.name_temple { ":named" } else { "" },
-            if self.w.blind { ":blind" } else { "" }
+            if self.w.blind { ":blind" } else { "" },
+            if self.w.shuffled { ":shuffled" } else { "" }
         )
     }
 }
@@ -1138,8 +1498,39 @@ impl crate::mcts::PriorBias for PlanBias {
 ///
 /// It exists to answer one question and is not meant to be shipped. The costs
 /// are not comparable: `O(width)` state copies and full evaluations here
-/// against [`PlanBias`]'s `O(width)` eight-element scans, so a tie is a loss
-/// for this one.
+/// against [`PlanBias`]'s `O(width)` eight-element scans — 123.8 ns an edge
+/// against 5.6 — so a tie is a loss for this one.
+///
+/// **Which evaluator it carries is the whole experiment.** `planlab`'s
+/// `--bias-1ply` builds this from `--sched`, and `--sched identity` is the
+/// honest baseline arm: [`PlanEvaluator`] under [`Schedule::IDENTITY`] is
+/// `eval::heuristic` to the bit, so it reproduces `mcts::Priors::OnePly`
+/// exactly through the bias seam.
+///
+/// # And the answer inverts the value-head ranking
+///
+/// `mcts:256`, 120 blocks, temperature 4.0 throughout:
+///
+/// ```text
+///   over Schedule::IDENTITY (= Priors::OnePly)   +1.40  (-0.07..+2.87)
+///   over FITTED                                  +6.55  (+5.37..+7.73)
+///   paired difference                            +5.15  (+3.46..+6.84)
+/// ```
+///
+/// [`FITTED`] is 25 points *worse* than [`REFIT`] as a value head and is the
+/// better prior by five points. A prior only has to rank a node's siblings,
+/// and a schedule that exaggerates `monument` and `starvation` and zeroes
+/// `engine` ranks them better than the calibrated estimate does — the estimate
+/// spends its accuracy on the level, which cancels between siblings. So
+/// "fit the evaluator" does not transfer to "fit the prior", and a fitted
+/// schedule should be swept in both roles rather than assumed to serve one
+/// because it serves the other.
+///
+/// The true `Priors::OnePly` is also *worse* than the far cheaper gradient
+/// softmax it was supposed to justify: -1.93 (-3.78..-0.07) against
+/// [`PricedBias`] with [`PriceSource::Gradient`], at 123.8 ns an edge against
+/// the gradient's ~16 amortised. That is `mcts.rs`'s own regret finding
+/// reproduced from the strength side.
 ///
 /// `done` is passed as 0 because [`crate::mcts::PriorBias::bias`] is not given
 /// it. That is safe rather than approximate: `tree::advance_within_turn` uses
@@ -1240,6 +1631,15 @@ pub fn temple_target(g: &GameState, p: PlayerId) -> Option<Temple> {
 /// [`temple_share`] is linear in the step, so its derivative is a constant per
 /// temple per age: prize over climbable steps. Brown pays 1.20 points a step in
 /// age 1 and 0.40 in age 2; yellow 0.29 then 0.86. No state is touched.
+///
+/// # And it is worth nothing, which is the interesting part
+///
+/// The argument above is sound and the measurement is flat: adding this to the
+/// gradient's temple axis moves the search by +0.10 (-0.77..+0.98) — see
+/// [`PriceSource`]. Having strictly more information than the gradient is not
+/// the same as having information the *search* can spend. Most `Take` nodes
+/// offer at most one climb, so the ranking this sharpens is between edges that
+/// are not competing, and a prior can only pay where two good edges are.
 pub fn plan_temple_step(t: Temple, age: u8) -> f32 {
     let d = &crate::data::temples::TEMPLES[t.idx()];
     let top = (d.steps - 1) as f32;
@@ -1248,16 +1648,45 @@ pub fn plan_temple_step(t: Temple, age: u8) -> f32 {
     prize / (top - base)
 }
 
-/// Where the 21 numbers in an [`EffectPrice`] come from.
+/// Where the temple axis of the prior comes from.
 ///
-/// The three arms differ **only in the three temple entries**. That is the
-/// whole experiment: 18 of the 21 prices are held at the gradient's own values,
-/// so the difference between arms is exactly the claim being tested and not a
-/// second, differently-tuned price table.
+/// The three arms share **one** price list — `mcts::Gradient`, the exact key
+/// `EdgeOrder::Gradient` truncates a wide node on — and differ only in what
+/// they add on top of it for a temple step. That is what makes the difference
+/// between two arms the claim being tested rather than two differently-tuned
+/// tables.
+///
+/// # The answer is no, and the two halves of it disagree
+///
+/// `mcts:256` on `HeuristicEvaluator` both sides, 240 rotation blocks, every
+/// difference paired on the seed:
+///
+/// ```text
+///   Gradient                +3.21  (+2.40..+4.03)
+///   PlanFlat  (w = 4)       +3.93  (+3.15..+4.70)   vs Gradient  +0.71 (+0.01..+1.42)
+///   PlanNamed (w = 4)       +3.28  (+2.47..+4.09)   vs Gradient  +0.07 (-0.56..+0.70)
+///                                                   vs PlanFlat  -0.64 (-1.25..-0.03)
+/// ```
+///
+/// **Knowing the age inversion is worth about two thirds of a point and naming
+/// the temple gives it back.** `PlanFlat` clears zero by 0.01 at p = 0.046,
+/// which is the smallest claim this file is willing to make; `PlanNamed` is
+/// exactly the gradient, and is a real -0.64 behind the arm that credits all
+/// three tracks. Tripling the plan's weight does not rescue it — `PlanNamed` at
+/// `w = 12` measures +3.26 (+2.15..+4.37) against `w = 4`'s +3.28, so this is
+/// the axis being inert and not the term being too quiet.
+///
+/// That is the same verdict [`BiasWeights::name_temple`] reaches through the
+/// cheaper seam (-0.74) and the one the mechanical count predicts: naming moves
+/// the top-weighted edge at 2.1% of nodes, and the 2% cannot pay for the
+/// positions where `next_scoring_age` names a temple for a payout this player
+/// will not reach. Crediting every climb keeps the age information and drops
+/// the commitment, and that is the half that survives.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PriceSource {
-    /// `eval::heuristic`'s local gradient and nothing else: the baseline the
-    /// generation agent measured at 16 ns an edge and 0.057 points of regret.
+    /// The search's own gradient and nothing else: the baseline to beat, at
+    /// 16 ns an edge and 0.057 points of regret where a full one-ply probe
+    /// costs 123.
     Gradient,
     /// The gradient plus [`plan_temple_step`] on **all three** temples. Knows
     /// the age inversion; does not know which temple is this player's.
@@ -1271,47 +1700,75 @@ pub enum PriceSource {
     PlanNamed,
 }
 
-/// A prior over a `Take` node's edges built on [`EffectPrice`], with the temple
-/// axis optionally supplied by the plan instead of by the gradient.
+/// A prior over a `Take` node's edges: the search's own edge-ordering gradient,
+/// with the temple axis optionally topped up by the plan.
 ///
-/// # Why a price and not an evaluation
+/// # Why this is built on `mcts::Gradient` and not on a table of its own
 ///
-/// `effect.rs` resolves every value at generation time, so a `Choice` is
-/// already a summary of what it does and can be priced by a dot product with no
-/// state copy. That is the difference between 16 ns an edge and the 123 ns an
-/// `apply_step` plus `eval::heuristic` costs — and at a node 2,293 edges wide it
-/// is the difference between a prior and a second search.
+/// An earlier version filled its own `options::EffectPrice` by re-probing
+/// `eval::heuristic`. It measured the same thing and it was the wrong
+/// experiment: the five unprobeable effects had different constants from the
+/// search's, so `PriceSource::Gradient` was *a* gradient rather than **the**
+/// gradient, and a win over it would not have been a win over what the search
+/// actually does. `Gradient::step` is public, so the honest arm is to call it.
 ///
-/// # Where the cost actually is, measured
+/// # What the plan adds, and why only here
+///
+/// `eval::temple_outlook` prices a step by what it changes **today**:
+/// `temple_points` is the majority prize, so a step that overtakes nobody moves
+/// it by exactly zero, and the gradient — a one-step difference of `heuristic`
+/// — reads it as free. A player three steps below the top of yellow on day 16
+/// is on the only climb that pays at day 27 and the gradient cannot see it.
+/// That is not a bug in `eval`; it is the one axis where a plan holds strictly
+/// more information than a local derivative, which is why the whole experiment
+/// is confined to the temple axis and touches nothing else. The measurement
+/// then said the information is not worth anything — see [`PriceSource`].
+///
+/// # Where the cost is, measured
 ///
 /// The dot product is free and the **gradient is not**, and through this seam
-/// that is fatal. Over 2,608 `Take` nodes (mean width 18.6):
+/// that is fatal. Over 1,157 `Take` nodes (mean width 20.6, from `planlab
+/// priors --games 12`, on an otherwise idle machine — the same table taken
+/// under a load average of 200 is 10x slower across every row and the ordering
+/// is unchanged):
 ///
 /// ```text
-///   PricedBias::bias (gradient)          4.72 us/node   253.4 ns/edge
-///     of which: the 17 gradient probes   4.43 us/node   237.8 ns/edge
-///     of which: EffectPrice::choice      0.35 us/node    18.5 ns/edge
-///   OnePlyBias::bias (what it replaces)  4.96 us/node   266.2 ns/edge
-///   PlanBias::bias (the cheap prior)     0.35 us/node    19.0 ns/edge
+///   PricedBias::bias (gradient)          2.09 us/node   101.2 ns/edge
+///     of which: the 17 gradient probes   1.81 us/node    87.9 ns/edge
+///     of which: EffectPrice::choice      0.16 us/node     7.9 ns/edge
+///   OnePlyBias::bias (what it replaces)  2.55 us/node   123.8 ns/edge
+///   PlanBias::bias (the cheap prior)     0.12 us/node     5.6 ns/edge
+///   plan::temple_target (the naming)                      0.6 ns/edge
+///   tree::legal_steps, for scale         4.32 us/node   529.3 ns/edge
 /// ```
 ///
-/// `EffectPrice::choice` really is ~16 ns an edge as `options.rs` claims. But
-/// 94% of the cost here is *filling* the table, and `PriorBias::bias` is handed
-/// a **node**, not a turn — so unlike `movestats`'s `Gradient`, which pays the
-/// probe once and reuses it at every `Take` node of the turn, there is nowhere
-/// to amortise it. That drags a 19 ns/edge interface up to 253, which is the
-/// 266 of the one-ply probe it was supposed to undercut.
+/// The last row is the one that settles whether any of this is affordable:
+/// **generating** a node's edges costs 4.32 us, so [`PlanBias`] prices them for
+/// 2.8% of what it cost to produce them and [`PricedBias`] for 48%.
 ///
-/// The conclusion is not that the price is wrong; it is that the *seam* is. See
-/// [`PlanBias`], which reaches 19 ns/edge by reading the effect vocabulary
-/// directly and never building a gradient at all.
+/// 87% of the cost is *filling* the table, and `PriorBias::bias` is handed a
+/// **node**, not a turn — where `Mcts` caches its own gradient per mover per
+/// sub-decision (`Mcts::gradient`) and amortises the probes over every wide
+/// node in the chain, a bias has nowhere to put them. That drags a 7.9 ns/edge
+/// dot product up to 101, which is most of the 124 of the one-ply probe it was
+/// supposed to undercut.
+///
+/// So this arm is **18x the price of [`PlanBias`] and 5.40 points weaker**
+/// (+3.21 against +8.61, paired -5.40 over 240 blocks). It stays because it is
+/// the only arm that isolates the temple claim against the search's own key,
+/// and it is not a prior anyone should ship.
+///
+/// The conclusion is not that the price is wrong; it is that a plan reaching
+/// the search through `PriorBias` should not be rebuilding a gradient at all.
+/// See [`PlanBias`], which reaches 5.6 ns/edge by reading the effect vocabulary
+/// directly.
 ///
 /// `min_edges` is the partial mitigation: a three-edge node is resolved by
-/// three simulations whatever its prior says, and the median searched width
-/// is 3.
+/// three simulations whatever its prior says, and the median node width is 3.
 pub struct PricedBias {
     pub source: PriceSource,
-    /// Softmax temperature, in points — `eval::heuristic`'s own scale.
+    /// Softmax temperature, in points — `eval::heuristic`'s own scale, which is
+    /// what `Gradient::step` returns.
     pub temp: f32,
     /// Points per step of climb credited to the plan's temple. Zero reduces
     /// every arm to [`PriceSource::Gradient`], which is the identity test.
@@ -1330,63 +1787,38 @@ impl PricedBias {
         }
     }
 
-    /// `EffectPrice` filled from `eval::heuristic`'s local gradient: probe `+1`
-    /// of each axis against the position and take the difference.
+    /// What the plan adds to one step on each temple, in `heuristic` points,
+    /// zero where the arm declines to credit it.
     ///
-    /// The five card- and space-naming effects are constants rather than
-    /// probes, scaled by the probed price of one point so both halves of the
-    /// sum are in the same units. `movestats` measured probing them per card at
-    /// 0.005 points of regret in the first 32 edges for 26% more per edge.
-    pub fn gradient(g: &GameState, p: PlayerId) -> EffectPrice {
-        let base = eval::heuristic(g, p);
-        let pr = |e: Effect| {
-            let mut probe = *g;
-            crate::effect::Choice::one(e).apply(&mut probe, p);
-            eval::heuristic(&probe, p) - base
-        };
-        let points = pr(Effect::Points(1));
-        EffectPrice {
-            corn: pr(Effect::Corn(1)),
-            res: std::array::from_fn(|i| pr(Effect::Res(Resource::ALL[i], 1))),
-            points,
-            temple: std::array::from_fn(|i| pr(Effect::TempleStep(Temple::ALL[i], 1))),
-            science: std::array::from_fn(|i| pr(Effect::AdvanceResearch(Science::ALL[i]))),
-            unlock_worker: pr(Effect::UnlockWorker),
-            free_worker: pr(Effect::FreeWorker(1)),
-            worker_discount: pr(Effect::WorkerDiscount(1)),
-            // In points, times the probed price of a point. A building is ~3
-            // points on the pad, a monument ~6, a Chichen head 4-13.
-            palenque_tile: 1.5 * points,
-            burn_wood: 1.0 * points,
-            fill_chichen: 6.0 * points,
-            build: 3.0 * points,
-            monument: 6.0 * points,
-        }
-    }
-
-    /// The gradient, with the temple axis adjusted by the plan.
-    pub fn price(&self, g: &GameState, p: PlayerId) -> EffectPrice {
-        let mut e = PricedBias::gradient(g, p);
+    /// `None` means "add nothing at all", which is the `Gradient` arm and also
+    /// every position past the last payout — there a step buys nothing the plan
+    /// can spend, and the gradient's own reading is the only true one left.
+    ///
+    /// Computed once per node: an argmax over three closed-form shares, not a
+    /// per-edge cost. Measured at 0.6 ns/edge, against the 87.9 the gradient
+    /// underneath it costs.
+    pub fn temple_bonus(&self, g: &GameState, p: PlayerId) -> Option<[f32; 3]> {
         if self.w == 0.0 || self.source == PriceSource::Gradient {
-            return e;
+            return None;
         }
-        let Some(age) = next_scoring_age(g) else {
-            // Past the last payout a step buys nothing the plan can spend, and
-            // the gradient's resource-day reading is the only true one left.
-            return e;
-        };
+        let age = next_scoring_age(g)?;
         let target = temple_target(g, p);
-        for (i, &t) in Temple::ALL.iter().enumerate() {
+        if self.source == PriceSource::PlanNamed && target.is_none() {
+            return None;
+        }
+        Some(std::array::from_fn(|i| {
+            let t = Temple::ALL[i];
             let credit = match self.source {
-                PriceSource::Gradient => continue,
+                PriceSource::Gradient => false,
                 PriceSource::PlanFlat => true,
                 PriceSource::PlanNamed => target == Some(t),
             };
             if credit {
-                e.temple[i] += self.w * plan_temple_step(t, age);
+                self.w * plan_temple_step(t, age)
+            } else {
+                0.0
             }
-        }
-        e
+        }))
     }
 }
 
@@ -1402,18 +1834,27 @@ impl crate::mcts::PriorBias for PricedBias {
         if steps.len() < self.min_edges {
             return;
         }
-        // `Choice` is the only thing `EffectPrice` can read, and a node's edges
+        // `Choice` is the only thing a gradient can price, and a node's edges
         // are homogeneous by phase: a `Take` node is all `Take`, a `Placing`
         // node is `Place`s plus a commit edge. So this either prices every edge
         // or abstains, and never mixes a priced weight with an unpriced 1.0.
         if !steps.iter().all(|s| matches!(s, Step::Take(_))) {
             return;
         }
-        let price = self.price(state, mover);
+        let grad = crate::mcts::Gradient::new(state, mover);
+        let bonus = self.temple_bonus(state, mover);
         let mut best = f32::NEG_INFINITY;
         for (step, o) in steps.iter().zip(out.iter_mut()) {
-            let Step::Take(c) = step else { unreachable!() };
-            let v = price.choice(c);
+            let mut v = grad.step(step);
+            if let (Some(b), Step::Take(c)) = (bonus, step) {
+                for e in c.0.iter() {
+                    if let Effect::TempleStep(t, n) = *e {
+                        if n > 0 {
+                            v += n as f32 * b[t.idx()];
+                        }
+                    }
+                }
+            }
             best = best.max(v);
             *o = v;
         }
@@ -1746,6 +2187,46 @@ mod tests {
     }
 
 
+    /// The shuffled control must be the *same multiset* of weights on the same
+    /// nodes — same count promoted, same count demoted, same strength — and
+    /// must scramble which edge gets which. If it changed the distribution it
+    /// would be a different bias rather than a control, and if it changed
+    /// nothing it would answer nothing.
+    #[test]
+    fn the_shuffled_control_keeps_the_weights_and_moves_them() {
+        use crate::mcts::PriorBias;
+        let w = BiasWeights { k: 32.0, ..BiasWeights::OFF };
+        let plan = PlanBias { w };
+        let shuf = PlanBias { w: BiasWeights { shuffled: true, ..w } };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let (mut wide, mut moved) = (0usize, 0usize);
+        for (g, phase, mover, steps) in take_nodes(110..150) {
+            a.clear();
+            a.resize(steps.len(), 1.0);
+            b.clear();
+            b.resize(steps.len(), 1.0);
+            plan.bias(&g, phase, mover, &steps, &mut a);
+            shuf.bias(&g, phase, mover, &steps, &mut b);
+            let (mut x, mut y) = (a.clone(), b.clone());
+            x.sort_by(f32::total_cmp);
+            y.sort_by(f32::total_cmp);
+            assert_eq!(x, y, "day {}: the control changed the weights", g.day);
+            // Only a node with both a promoted and a demoted edge can show a
+            // permutation at all; the rest are constant vectors.
+            if steps.len() >= 8 && x.first() != x.last() {
+                wide += 1;
+                if a != b {
+                    moved += 1;
+                }
+            }
+        }
+        assert!(wide > 20, "only {wide} nodes had two distinct weights to permute");
+        assert!(
+            moved * 2 > wide,
+            "{moved} of {wide} nodes permuted: the control is barely moving anything"
+        );
+    }
+
     /// The plan's per-step temple price must carry the age inversion the
     /// prizes actually have, or naming the temple names the wrong one. Brown is
     /// the age-1 plan and yellow the age-2 plan; green is flat by construction.
@@ -1851,26 +2332,57 @@ mod tests {
         assert!(touched > 100, "only {touched} edges priced: the walk found nothing to test");
     }
 
-    /// With `w = 0` all three arms must be the identical price table, or the
-    /// sweep's low end is not a control. This is the `PricedBias` counterpart
-    /// of `zero_strength_is_the_identity`.
+    /// With `w = 0` all three arms must produce the identical weight vector,
+    /// or the sweep's low end is not a control. Asserted on the weights the
+    /// search actually sees rather than on the price table behind them: the
+    /// table is an implementation detail and the weights are the contract.
+    ///
+    /// And with the weight on, only edges carrying a temple step may move — 18
+    /// of the 21 prices are `mcts::Gradient`'s own, which is what makes the
+    /// arms comparable at all.
     #[test]
     fn zero_weight_leaves_the_gradient_alone() {
-        let mut g = Game::new(13).state;
-        g.day = 16;
-        let p = PlayerId(0);
-        g.temples[Temple::Yellow.idx()][p.idx()] = 4;
-        let grad = PricedBias::gradient(&g, p);
-        for src in [PriceSource::Gradient, PriceSource::PlanFlat, PriceSource::PlanNamed] {
-            assert_eq!(PricedBias::new(src, 0.0).price(&g, p), grad, "{src:?}");
+        use crate::mcts::PriorBias;
+        let arm = |src, w| PricedBias {
+            min_edges: 2,
+            ..PricedBias::new(src, w)
+        };
+        let (mut base, mut other) = (Vec::new(), Vec::new());
+        let (mut compared, mut differed) = (0usize, 0usize);
+        for (g, phase, mover, steps) in take_nodes(90..104) {
+            base.clear();
+            base.resize(steps.len(), 1.0);
+            arm(PriceSource::Gradient, 0.0).bias(&g, phase, mover, &steps, &mut base);
+            for src in [PriceSource::PlanFlat, PriceSource::PlanNamed] {
+                other.clear();
+                other.resize(steps.len(), 1.0);
+                arm(src, 0.0).bias(&g, phase, mover, &steps, &mut other);
+                assert_eq!(base, other, "{src:?} at w = 0 is not the gradient");
+            }
+            // Weight on: a step with no `TempleStep` in it must price
+            // identically, because nothing else was touched.
+            other.clear();
+            other.resize(steps.len(), 1.0);
+            arm(PriceSource::PlanNamed, 4.0).bias(&g, phase, mover, &steps, &mut other);
+            let any_temple = steps.iter().any(|s| match s {
+                Step::Take(c) => c
+                    .0
+                    .iter()
+                    .any(|e| matches!(e, Effect::TempleStep(_, n) if *n > 0)),
+                _ => false,
+            });
+            if !any_temple {
+                assert_eq!(base, other, "a node with no temple step was repriced");
+            } else if base != other {
+                differed += 1;
+            }
+            compared += 1;
         }
-        // And with weight on, only the temple axis may move: 18 of the 21
-        // prices are the gradient's, which is what makes the arms comparable.
-        let named = PricedBias::new(PriceSource::PlanNamed, 4.0).price(&g, p);
-        assert_eq!(named.corn, grad.corn);
-        assert_eq!(named.res, grad.res);
-        assert_eq!(named.science, grad.science);
-        assert_ne!(named.temple, grad.temple, "the target temple must be repriced");
+        assert!(compared > 100, "only {compared} nodes: the walk found nothing to test");
+        assert!(
+            differed > 0,
+            "naming the temple never changed a weight over {compared} nodes, so the axis is inert"
+        );
     }
 
     /// Reachability is arithmetic, not search: a worker one space below a

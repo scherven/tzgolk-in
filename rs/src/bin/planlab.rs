@@ -1108,6 +1108,13 @@ fn priors_probe(args: &Args) {
     };
     println!("\n=== cost of one expansion ===");
     let mut buf: Vec<f32> = Vec::new();
+    // Both value heads, because the number that matters is the *difference*:
+    // `node_for` calls one of these exactly once per expansion whichever arm is
+    // running, so the plan's value head costs what it costs over this line and
+    // not what it costs absolutely.
+    bench("HeuristicEvaluator::evaluate", &mut |(g, p, m, st)| {
+        std::hint::black_box(HeuristicEvaluator.evaluate(g, *p, *m, st.len()));
+    });
     bench("PlanEvaluator::evaluate (the value)", &mut |(g, p, m, st)| {
         std::hint::black_box(plan_ev.evaluate(g, *p, *m, st.len()));
     });
@@ -1181,6 +1188,15 @@ fn priors_probe(args: &Args) {
         named_bias.bias(g, *p, *m, st, &mut buf);
         std::hint::black_box(&buf);
     });
+    let shuf_bias = PlanBias {
+        w: BiasWeights { shuffled: true, ..plan_bias.w },
+    };
+    bench2("PlanBias::bias (+shuffled control)", &mut |(g, p, m, st)| {
+        buf.clear();
+        buf.resize(st.len(), 1.0);
+        shuf_bias.bias(g, *p, *m, st, &mut buf);
+        std::hint::black_box(&buf);
+    });
     bench2("PricedBias::bias (gradient)", &mut |(g, p, m, st)| {
         buf.clear();
         buf.resize(st.len(), 1.0);
@@ -1193,8 +1209,11 @@ fn priors_probe(args: &Args) {
         pnamed.bias(g, *p, *m, st, &mut buf);
         std::hint::black_box(&buf);
     });
+    // The same 17 `eval::heuristic` probes `EdgeOrder::Gradient` pays -- but
+    // the search caches them per mover per sub-decision and a `PriorBias` is
+    // handed a node, so through this seam they are paid again at every node.
     bench2("  of which: the 17 gradient probes", &mut |(g, _p, m, _st)| {
-        std::hint::black_box(tzolkin::plan::PricedBias::gradient(g, *m));
+        std::hint::black_box(tzolkin::mcts::Gradient::new(g, *m));
     });
     bench2("  of which: EffectPrice::choice", &mut |(_g, _p, _m, st)| {
         let price = tzolkin::options::EffectPrice::default();
@@ -1265,10 +1284,27 @@ struct Args {
     priced: String,
     /// Points per step of climb the plan adds to its temple in `PricedBias`.
     priced_w: f32,
+    /// `PricedBias` softmax temperature, in points. The strength knob for the
+    /// priced arms, and the counterpart of `--bias K` for `PlanBias`: without
+    /// sweeping it, "the gradient prior is worth less than the plan prior" is
+    /// as likely to be a statement about this number as about either prior.
+    priced_temp: f32,
+    /// `PricedBias::min_edges`. The priced arms abstain below it and `PlanBias`
+    /// has no such gate, so leaving it fixed while comparing the two would be
+    /// comparing the *set of nodes touched* as much as the prior.
+    priced_min: usize,
     /// Run the plan-blind control: same edges, same strength, no leader test.
     bias_blind: bool,
+    /// The harder control: same multipliers, attached to shuffled edges.
+    bias_shuffled: bool,
     /// Use `OnePlyBias` at this temperature instead of `PlanBias`. Negative
     /// leaves it off.
+    ///
+    /// **It probes with `--sched`, so pass `--sched identity` for the
+    /// baseline.** Only under `Schedule::IDENTITY` is this `mcts::Priors::OnePly`;
+    /// under the default `fitted` it is a one-ply probe over a value head that
+    /// is 25 points worse -- which measured *five points better as a prior*
+    /// (+6.55 against +1.40), so the difference is not a rounding error.
     bias_1ply: f32,
     /// Which value head the candidate carries under MCTS. The baseline is
     /// always `heuristic`.
@@ -1309,7 +1345,11 @@ impl Args {
                 "flat" => PriceSource::PlanFlat,
                 _ => PriceSource::PlanNamed,
             };
-            return Some(std::sync::Arc::new(PricedBias::new(source, self.priced_w)));
+            return Some(std::sync::Arc::new(PricedBias {
+                temp: self.priced_temp,
+                min_edges: self.priced_min,
+                ..PricedBias::new(source, self.priced_w)
+            }));
         }
         if self.bias_1ply >= 0.0 {
             return Some(std::sync::Arc::new(OnePlyBias {
@@ -1326,6 +1366,7 @@ impl Args {
                 place: self.bias_place,
                 name_temple: self.bias_named,
                 blind: self.bias_blind,
+                shuffled: self.bias_shuffled,
                 ..BiasWeights::OFF
             },
         }))
@@ -1476,7 +1517,11 @@ fn parse() -> Args {
                --bias K                  PlanBias strength, nats/lead    [0]\n\
                --bias-place              also steer Step::Place, by gear\n\
                --bias-blind              CONTROL: same edges, no leader test\n\
+               --bias-shuffled           CONTROL: same weights, shuffled edges\n\
                --bias-1ply T             OnePlyBias at temperature T instead\n\
+               --priced grad|flat|named  gradient prior, temple axis from the plan\n\
+               --priced-w W / --priced-temp T   plan weight / softmax temp  [4/4]\n\
+               --priced-min N            narrowest node the priced arms price [8]\n\
                --priors eval|1ply        MctsConfig::priors, both sides  [eval]\n\
                --k K                     sampled turns per side     [32]\n\
                --blocks N                rotation blocks (duel)     [200]\n\
@@ -1540,7 +1585,10 @@ fn parse() -> Args {
         bias_named: argv.iter().any(|a| a == "--bias-named"),
         priced: get("--priced").unwrap_or_default(),
         priced_w: get("--priced-w").and_then(|v| v.parse().ok()).unwrap_or(4.0),
+        priced_temp: get("--priced-temp").and_then(|v| v.parse().ok()).unwrap_or(4.0),
+        priced_min: num("--priced-min", 8),
         bias_blind,
+        bias_shuffled: argv.iter().any(|a| a == "--bias-shuffled"),
         bias_1ply,
         cand_ev,
         priors,
@@ -1559,8 +1607,9 @@ fn main() {
     let _ = record::reject_unknown_flags(&[
         "--sched", "--shrink", "--flat", "--engine", "--board", "--only", "--drop", "--focus", "--reach", "--draft", "--k", "--blocks",
         "--games", "--seed", "--out", "--resume", "--help",
-        "--sims", "--bias", "--bias-place", "--bias-blind", "--bias-1ply", "--cand-ev", "--priors",
-        "--bias-named", "--priced", "--priced-w",
+        "--sims", "--bias", "--bias-place", "--bias-blind", "--bias-shuffled", "--bias-1ply",
+        "--cand-ev", "--priors",
+        "--bias-named", "--priced", "--priced-w", "--priced-temp", "--priced-min",
     ]);
     match args.cmd.as_str() {
         "compare" => {
