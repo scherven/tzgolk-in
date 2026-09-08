@@ -65,7 +65,7 @@ use rand::Rng;
 use crate::eval::Ranking;
 use crate::ids::*;
 use crate::moves::{apply_move, sample_legal_move, Move};
-use crate::mcts::{EdgeOrder, Mcts, MctsConfig, Priors, SearchResult};
+use crate::mcts::{EdgeOrder, Mcts, MctsConfig, Priors, RootPick, SearchResult};
 use crate::phase::{Evaluation, Evaluator, HeuristicEvaluator, Phase, Step};
 use crate::tree;
 use crate::state::{Deck, GameState, GearState, Player, TileStack, WorkerLoc, MAX_GEAR_SPACES, N_DISPLAY};
@@ -2259,14 +2259,28 @@ pub fn mcts_label(sims: u32, evaluator: &str, cfg: &MctsConfig) -> String {
         f(match cfg.priors {
             Priors::Evaluator => ":pri=eval".into(),
             Priors::OnePly => ":pri=1ply".into(),
+            Priors::Gradient => ":pri=grad".into(),
+            Priors::Mixed => ":pri=mixed".into(),
         });
     }
-    if cfg.priors == Priors::OnePly {
-        // Only meaningful under a one-ply prior, but then always shown: they
-        // are the two knobs a sweep moves and an unlabelled sweep is a wasted
-        // one.
+    if cfg.priors != Priors::Evaluator {
+        // Meaningless when the evaluator supplies the prior, but shown for
+        // every prior that is softmaxed: they are the two knobs a sweep moves
+        // and an unlabelled sweep is a wasted one.
         f(format!(":pt={}", cfg.prior_temp));
         f(format!(":pmin={}", cfg.prior_min_edges));
+    }
+    if cfg.q_init != d.q_init {
+        f(format!(":q0={}", cfg.q_init));
+    }
+    if cfg.q_pseudo != d.q_pseudo {
+        f(format!(":qn={}", cfg.q_pseudo));
+    }
+    if cfg.prior_margin != d.prior_margin {
+        f(":pmarg".into());
+    }
+    if cfg.root_pick != d.root_pick {
+        f(":pick=q".into());
     }
     if cfg.c_puct_init != d.c_puct_init {
         f(format!(":cp={}", cfg.c_puct_init));
@@ -2981,11 +2995,14 @@ fn parse_mcts_flags(flags: &str) -> Result<MctsConfig, String> {
             // per simulation. Nothing else in `MctsConfig` earned a place
             // here: the simulation budget is flat from 128 to 2048 under the
             // uniform prior (all five rungs within +/-1.1 points), and `nocap`
-            // is +0.15 (CI -1.47..+1.77, 138 blocks). It does unflatten the
-            // budget -- `mcts:2048:quality` beats `mcts:256:quality` by +3.04
-            // (CI +1.46..+4.62, 150 blocks) where `mcts:2048` does not beat
-            // `mcts:128` at all -- so raise `sims` *after* setting this, never
-            // instead of it.
+            // is +0.15 (CI -1.47..+1.77, 138 blocks).
+            //
+            // It does **not** unflatten the budget, whatever this comment used
+            // to say. `mcts:2048:quality` against a `mcts:256:quality` baseline
+            // was read as +3.04; corrected by its own null (that baseline's
+            // null is -1.09, not zero) it is **+0.03, CI -1.84..+1.90, 43
+            // paired blocks**. What unflattens the budget is `cp` -- see
+            // `MctsConfig::c_puct_init` and the `deep` preset below.
             //
             // Sugar only. `mcts_label` prints the flags this expands to, never
             // the word, so a preset that drifts can never share a name with the
@@ -2994,14 +3011,76 @@ fn parse_mcts_flags(flags: &str) -> Result<MctsConfig, String> {
                 cfg.priors = Priors::OnePly;
                 cfg.prior_temp = 1.0;
             }
+            // The depth-first preset. `c_puct_init` shipped at 2.0, which stops
+            // a descent after ~8 sub-decisions -- one turn -- so a simulation
+            // budget bought width the one-ply prior had already decided. At
+            // 0.02 the mean descent is ~52 sub-decisions and the budget starts
+            // paying: `mcts:8192:heuristic:cp=0.02` is **+6.42 centred** against
+            // `mcts:2048:heuristic:quality` (95% CI +5.38..+7.47, 78 blocks),
+            // taking 43.8% of its games where an equal agent takes 25%, and it
+            // does that on *less* user CPU than `mcts:16384:quality`, which is
+            // +0.56. See `MctsConfig::c_puct_init`.
+            //
+            // **It is only right at a large budget**, which is why it is sugar
+            // and not a default: the best `c_puct` falls as `sims` rises (0.06
+            // at 2,048, 0.02 at 8,192), so `mcts:512:deep` is not a thing to
+            // want. Pair it with 8,192 or more.
+            //
+            // Sugar only -- `mcts_label` prints `:cp=0.02`, never the word, so a
+            // preset that drifts can never share a name with the config it used
+            // to mean (`examples/nametest.rs`).
+            "deep" => cfg.c_puct_init = 0.02,
+            // `deep` plus the knob that `deep` re-opened. `prior_min_edges`
+            // shipped at 3, so a node of width two -- the *median* searched
+            // width -- gets a uniform prior; at `cp = 2.0` a descent passes a
+            // handful of those and lowering it measured **-1.35**, and at
+            // `cp = 0.02` a descent is ~56 sub-decisions and passes about 28 of
+            // them, where the same change is **+4.73** (CI +3.22..+6.24, 50
+            // paired blocks, p = 4e-10) and **+3.06** (+1.43..+4.68, 46 paired
+            // blocks) re-measured on the post-`d7b4e42` evaluator.
+            //
+            // It is a separate word rather than a change to `deep` on purpose:
+            // other workstreams have binaries and run scripts pinned against
+            // what `deep` means today, and a preset that quietly gains a flag
+            // mid-run is the "two sides of a race printed the same name" bug in
+            // slow motion (`examples/nametest.rs`).
+            //
+            // Like `deep` it is **only right at a large budget** -- both halves
+            // are, for the same reason -- so pair it with 8,192 simulations or
+            // more. Sugar only; `mcts_label` prints `:pmin=2:cp=0.02`.
+            "deeper" => {
+                cfg.c_puct_init = 0.02;
+                cfg.prior_min_edges = 2;
+            }
             "priors" | "pri" => {
                 cfg.priors = match v {
                     "eval" | "evaluator" | "uniform" => Priors::Evaluator,
                     "1ply" | "oneply" | "heuristic" => Priors::OnePly,
-                    other => return Err(format!("mcts priors= is eval or 1ply, got {other:?}")),
+                    "grad" | "gradient" => Priors::Gradient,
+                    "mixed" | "mix" => Priors::Mixed,
+                    other => {
+                        return Err(format!(
+                            "mcts priors= is eval, 1ply, grad or mixed, got {other:?}"
+                        ))
+                    }
                 }
             }
             "ptemp" | "pt" => cfg.prior_temp = num("ptemp")?,
+            // The other half of what the one-ply probe already computed: see
+            // `MctsConfig::q_init`.
+            "qinit" | "q0" => cfg.q_init = num("qinit")?,
+            "qn" | "qpseudo" => cfg.q_pseudo = num("qn")?.max(0.0),
+            // Four `heuristic` calls an edge instead of one, to make the probe
+            // see denial. See `MctsConfig::prior_margin`.
+            "pick" => {
+                cfg.root_pick = match v {
+                    "visits" | "n" => RootPick::Visits,
+                    "q" | "value" => RootPick::Value,
+                    other => return Err(format!("mcts pick= is visits or q, got {other:?}")),
+                }
+            }
+            "pmarg" => cfg.prior_margin = true,
+            "nopmarg" => cfg.prior_margin = false,
             "pmin" => cfg.prior_min_edges = int("pmin")?.max(2),
             "cpuct" | "cp" => cfg.c_puct_init = num("cpuct")?,
             "cpbase" | "cpb" => cfg.c_puct_base = num("cpbase")?.max(1.0),
@@ -3152,7 +3231,17 @@ impl AgentSpec {
                         && f.split(',')
                             .all(|x| {
                                 x.contains('=')
-                                    || matches!(x, "noreuse" | "reuse" | "nocap" | "quality")
+                                    || matches!(
+                                        x,
+                                        "noreuse"
+                                            | "reuse"
+                                            | "nocap"
+                                            | "quality"
+                                            | "deep"
+                                            | "deeper"
+                                            | "pmarg"
+                                            | "nopmarg"
+                                    )
                             })
                 };
                 let (ev, flags) = match tail.rsplit_once(':') {

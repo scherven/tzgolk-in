@@ -921,7 +921,7 @@ fn a_prior_bias_steers_without_excluding() {
 /// cannot be attributed to either.
 #[test]
 fn mcts_flags_reach_the_config_and_the_label() {
-    use tzolkin::mcts::{EdgeOrder, MctsConfig, Priors};
+    use tzolkin::mcts::{EdgeOrder, MctsConfig, Priors, RootPick};
     use tzolkin::record::AgentSpec;
 
     let spec = |s: &str| AgentSpec::parse(s, false).unwrap_or_else(|e| panic!("{s}: {e}"));
@@ -951,6 +951,66 @@ fn mcts_flags_reach_the_config_and_the_label() {
     assert_eq!(cfg("mcts:64:wcap=512").widen_cap, 512);
     assert_eq!(cfg("mcts:64:ord=prior").ordering, EdgeOrder::Prior);
     assert_eq!(cfg("mcts:64:ord=grad").ordering, EdgeOrder::Gradient);
+
+    // The 2026-09-08 knobs. Each defaults to the behaviour that shipped, so a
+    // spec written before they existed still names the same search -- which is
+    // what makes results from the two binaries comparable at all.
+    assert_eq!(cfg("mcts:64:pri=grad").priors, Priors::Gradient);
+    assert_eq!(cfg("mcts:64:pri=mixed").priors, Priors::Mixed);
+    assert_eq!(cfg("mcts:64:q0=1.5").q_init, 1.5);
+    assert_eq!(cfg("mcts:64:qn=4").q_pseudo, 4.0);
+    assert!(cfg("mcts:64:pmarg").prior_margin);
+    assert_eq!(cfg("mcts:64:pick=q").root_pick, RootPick::Value);
+    assert_eq!(MctsConfig::default().q_init, 0.0, "off by default");
+    assert_eq!(MctsConfig::default().q_pseudo, 0.0, "off by default");
+    assert!(!MctsConfig::default().prior_margin, "off by default");
+    assert_eq!(
+        MctsConfig::default().root_pick,
+        RootPick::Visits,
+        "pick=q measured -2.34 (CI -3.85..-0.82, 47 blocks)"
+    );
+    // `pmarg` has no `=`, so `parse_agent`'s evaluator-or-flags shape test has
+    // to know it by name or `mcts:64:heuristic:pmarg` reads `heuristic:pmarg`
+    // as an evaluator. It did, for twenty minutes. Same for `deep`.
+    assert!(cfg("mcts:64:heuristic:pmarg").prior_margin);
+
+    // `deep` is sugar for the 2026-09-08 result: +6.42 centred at 8,192
+    // simulations (CI +5.38..+7.47, 78 blocks). Pin what it expands to, and
+    // that the label prints the flag rather than the word -- a preset that
+    // drifts must not keep the name of the config it used to mean.
+    assert_eq!(cfg("mcts:8192:deep").c_puct_init, 0.02);
+    assert_eq!(
+        spec("mcts:8192:heuristic:deep").name(),
+        spec("mcts:8192:heuristic:cp=0.02").name()
+    );
+    assert!(spec("mcts:8192:deep").name().contains(":cp=0.02"));
+
+    // `deeper` is `deep` plus the knob `deep` re-opened: `pmin=2` is -1.35 at
+    // the shipped `cp = 2.0` and **+4.73** (CI +3.22..+6.24, 50 paired blocks)
+    // at `cp = 0.02`, because the median searched node width is two and a
+    // 56-sub-decision descent passes ~28 of them. It is a *new* word rather
+    // than a change to `deep`, so pin that they are still different agents --
+    // silently widening a preset mid-run is how two sides of a race come to
+    // print the same name.
+    assert_eq!(cfg("mcts:8192:deeper").c_puct_init, 0.02);
+    assert_eq!(cfg("mcts:8192:deeper").prior_min_edges, 2);
+    assert_eq!(cfg("mcts:8192:deep").prior_min_edges, 3, "`deep` must not drift");
+    assert_ne!(
+        spec("mcts:8192:heuristic:deeper").name(),
+        spec("mcts:8192:heuristic:deep").name(),
+        "deeper and deep are different agents and must not share a label"
+    );
+    assert_eq!(
+        spec("mcts:8192:heuristic:deeper").name(),
+        spec("mcts:8192:heuristic:cp=0.02,pmin=2").name(),
+        "sugar and its expansion are the same agent"
+    );
+    assert_eq!(
+        MctsConfig::default().c_puct_init,
+        2.0,
+        "the default is deliberately NOT the deep value: the best c_puct falls \
+         as the budget rises, so 0.02 is only right at 8k simulations and up"
+    );
     assert_eq!(
         MctsConfig::default().ordering,
         EdgeOrder::Gradient,
@@ -1211,4 +1271,289 @@ fn the_edge_cap_deletes_nothing_the_search_can_reach() {
         "gradient order lost to generation order: missed {miss_grad}/{wide} \
          (regret {reg_grad:.3}) against {miss_gen}/{wide} ({reg_gen:.3})"
     );
+}
+
+/// `Priors::Mixed` routes by phase, and every prior source produces a legal
+/// step.
+///
+/// The routing is the whole point of the variant: the gradient can price a
+/// `Choice` and nothing else, so on `Take` it must be the gradient and
+/// everywhere else it must be the one-ply probe. A `sims = 1` search plays the
+/// argmax of the prior — one descent, one visit, one edge — so comparing the
+/// step three configurations play at the same node compares their priors
+/// without exposing them.
+#[test]
+fn the_mixed_prior_uses_the_gradient_only_where_the_gradient_can_price() {
+    use tzolkin::mcts::{Mcts, MctsConfig, Priors};
+    use tzolkin::phase::{HeuristicEvaluator, Phase};
+
+    let base = MctsConfig {
+        dirichlet_eps: 0.0,
+        temperature: 0.0,
+        ..MctsConfig::default()
+    };
+    let with = |p| Mcts::new(HeuristicEvaluator, MctsConfig { priors: p, ..base });
+    let ps = positions(30, &[8, 14]);
+
+    let (mut takes, mut placings) = (0usize, 0usize);
+    for g in &ps {
+        for &p in PlayerId::ALL.iter() {
+            let nodes: Vec<Phase> = std::iter::once(Phase::Placing { n: 0 })
+                .chain(g.on_board(p).map(|w| Phase::Take { worker: w }))
+                .collect();
+            for phase in nodes {
+                let steps = tzolkin::tree::legal_steps(g, phase, p, 0);
+                // One legal step means no decision and no prior to compare.
+                if steps.len() < base.prior_min_edges {
+                    continue;
+                }
+                let pick = |pr| with(pr).search_at(g, phase, p, 0, 1).step;
+                let (mixed, grad, one) = (
+                    pick(Priors::Mixed),
+                    pick(Priors::Gradient),
+                    pick(Priors::OnePly),
+                );
+                assert!(
+                    steps.contains(&mixed) && steps.contains(&grad) && steps.contains(&one),
+                    "{phase:?}: a prior produced a step outside the legal list"
+                );
+                match phase {
+                    Phase::Take { .. } => {
+                        takes += 1;
+                        assert_eq!(mixed, grad, "{phase:?}: Mixed should be the gradient here");
+                    }
+                    _ => {
+                        placings += 1;
+                        assert_eq!(mixed, one, "{phase:?}: Mixed should be one-ply here");
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        takes >= 20 && placings >= 10,
+        "sample too thin to test the routing: {takes} Take, {placings} other"
+    );
+}
+
+/// The 2026-09-08 knobs are off by default, and "off" means byte-identical
+/// search.
+///
+/// Every arena number in `docs/FINDINGS-mcts.md` is pooled across binaries built
+/// on different days, which is only legitimate because a spec that does not name
+/// a new knob searches exactly as it did before the knob existed. That is a
+/// property worth a test rather than a comment: `q_init`, `q_pseudo`,
+/// `prior_margin` and `root_pick` all reach `select`, and a default-valued one
+/// must reach it as a no-op.
+#[test]
+fn the_new_knobs_are_no_ops_at_their_defaults() {
+    use tzolkin::mcts::{Mcts, MctsConfig, Priors, RootPick};
+    use tzolkin::phase::{HeuristicEvaluator, Phase};
+
+    let d = MctsConfig::default();
+    assert_eq!((d.q_init, d.q_pseudo), (0.0, 0.0));
+    assert!(!d.prior_margin);
+    assert_eq!(d.root_pick, RootPick::Visits);
+    assert_eq!(d.priors, Priors::OnePly);
+
+    let base = MctsConfig {
+        dirichlet_eps: 0.0,
+        temperature: 0.0,
+        ..d
+    };
+    // Spelling the defaults out explicitly is the same config by construction;
+    // what this checks is that naming them does not take a different code path
+    // -- `q_pseudo > 0.0` gates a whole branch of `select`.
+    let spelled = MctsConfig {
+        q_init: 0.0,
+        q_pseudo: 0.0,
+        prior_margin: false,
+        root_pick: RootPick::Visits,
+        ..base
+    };
+
+    let mut n = 0usize;
+    for g in &positions(20, &[9, 16]) {
+        for &p in PlayerId::ALL.iter() {
+            for phase in [Phase::Beg, Phase::Mode, Phase::Placing { n: 0 }] {
+                if tzolkin::tree::legal_steps(g, phase, p, 0).len() < 2 {
+                    continue;
+                }
+                let a = Mcts::new(HeuristicEvaluator, base).search_at(g, phase, p, 0, 96);
+                let b = Mcts::new(HeuristicEvaluator, spelled).search_at(g, phase, p, 0, 96);
+                assert_eq!(a.step, b.step, "{phase:?}: default knobs changed the move");
+                assert_eq!(a.visits, b.visits, "{phase:?}: default knobs changed the tree");
+                n += 1;
+            }
+        }
+    }
+    assert!(n >= 30, "sample too thin: {n} nodes");
+}
+
+/// Lowering `c_puct_init` buys descent depth, which is the mechanism behind the
+/// only `MctsConfig` knob that beat the shipped default.
+///
+/// A turn is ~8 sub-decisions, so a mean descent of 8 is "this search has looked
+/// at its own turn and nothing else". The 2026-09-08 sweep found `cp = 0.06`
+/// worth about a point at 2,048 simulations and much more at 8,192, and
+/// `bin/sprobe budget` attributes it entirely to depth: 64x the *budget* buys
+/// 1.9x the mean depth at the default `c_puct`, where dividing `c_puct` by 33
+/// buys 2.7x at a fixed budget. If a future change to selection or to the value
+/// scale breaks that relationship, the tuning stops meaning what it means.
+#[test]
+fn a_lower_c_puct_descends_deeper() {
+    use tzolkin::mcts::{Mcts, MctsConfig};
+    use tzolkin::phase::{HeuristicEvaluator, Phase};
+
+    let cfg = |cp| MctsConfig {
+        dirichlet_eps: 0.0,
+        temperature: 0.0,
+        c_puct_init: cp,
+        ..MctsConfig::default()
+    };
+    let (mut deep_default, mut deep_low, mut n) = (0.0f64, 0.0f64, 0usize);
+    for g in &positions(12, &[10, 16]) {
+        for &p in PlayerId::ALL.iter() {
+            let phase = Phase::Placing { n: 0 };
+            if tzolkin::tree::legal_steps(g, phase, p, 0).len() < 3 {
+                continue;
+            }
+            for (cp, acc) in [(2.0f32, &mut deep_default), (0.06f32, &mut deep_low)] {
+                let mut m = Mcts::new(HeuristicEvaluator, cfg(cp));
+                let _ = m.search_at(g, phase, p, 0, 512);
+                let (deepest, mean) = m.depth_stats();
+                assert!(
+                    mean > 0.0 && deepest as f64 >= mean,
+                    "cp={cp}: depth counters incoherent ({deepest}, {mean})"
+                );
+                *acc += mean;
+            }
+            n += 1;
+        }
+    }
+    assert!(n >= 12, "sample too thin: {n} nodes");
+    let (d, l) = (deep_default / n as f64, deep_low / n as f64);
+    // Measured at 2,048 simulations as 8.0 against 21.8 -- a factor of 2.7. The
+    // assertion is deliberately loose (this runs at 512 and on a different
+    // sample); what must not happen is the ordering reversing.
+    assert!(
+        l > d * 1.5,
+        "cp=0.06 should descend much deeper than cp=2.0: {l:.2} against {d:.2}"
+    );
+}
+
+/// The spec the arena measured and the spec the TUI plays are the same search.
+///
+/// `bin/tui` builds its agent through `record::parse_analysis_agent`, which
+/// parses with `record = true` and then forces `Exploration::Off` — a different
+/// path from the `AgentSpec::instance()` the arena uses. A flag that survived
+/// one and not the other would mean the strongest measured spec is not the one
+/// a human watches, which is the failure `examples/nametest.rs` exists to catch
+/// between two arena seats and this catches between the arena and the viewer.
+#[test]
+fn the_viewer_and_the_arena_build_the_same_agent() {
+    use tzolkin::record::{parse_agent, parse_analysis_agent};
+
+    for spec in [
+        "mcts:8192:heuristic:cp=0.02",
+        "mcts:2048:heuristic:quality",
+        "mcts:2048:heuristic:priors=mixed,pt=0.5,q0=1,qn=4,pmarg",
+    ] {
+        let viewer = parse_analysis_agent(spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+        let arena = parse_agent(spec, false).unwrap_or_else(|e| panic!("{spec}: {e}"));
+        assert_eq!(
+            viewer.name(),
+            arena.name(),
+            "{spec} names differently in the viewer than in the arena"
+        );
+    }
+    // And the flag that carries the 2026-09-08 result actually reaches the name,
+    // rather than being silently dropped into a label that reads like the
+    // default it beats.
+    assert!(parse_analysis_agent("mcts:8192:heuristic:cp=0.02")
+        .unwrap()
+        .name()
+        .contains(":cp=0.02"));
+}
+
+/// `prior_min_edges` must actually reach a two-edge node, because that is the
+/// whole of the 2026-09-08 `pmin=2` result.
+///
+/// The median *searched* node width is 2, so `prior_min_edges = 3` leaves about
+/// half of every descent with a uniform prior — roughly 28 blind nodes in a
+/// 56-sub-decision descent at `cp = 0.02`. That is why `pmin=2` measures
+/// **+4.73** there (CI +3.22..+6.24, 50 paired blocks) against **-1.35** at the
+/// shipped `cp = 2.0`. If this seam ever stops firing, the flag becomes a
+/// no-op that still prints into the label, which is the failure mode
+/// `examples/nametest.rs` exists to catch one level up.
+#[test]
+fn pmin_reaches_a_two_edge_node() {
+    use tzolkin::mcts::{Mcts, MctsConfig};
+    use tzolkin::phase::{HeuristicEvaluator, Phase};
+    use tzolkin::tree;
+
+    let mut checked = 0usize;
+    let mut moved = 0usize;
+    for g in positions(4, &[0, 5, 10, 15, 20]) {
+        // A node of width exactly two: below the shipped threshold of three,
+        // at or above the lowered one.
+        let Some((st, phase, turn, done)) = wide_node(&g, g.current, 2) else {
+            continue;
+        };
+        if tree::legal_steps(&st, phase, turn, done).len() != 2 {
+            continue;
+        }
+        let _ = Phase::Beg;
+        let run = |pmin: usize| {
+            let cfg = MctsConfig {
+                prior_min_edges: pmin,
+                c_puct_init: 0.02,
+                dirichlet_eps: 0.0,
+                temperature: 0.0,
+                ..MctsConfig::default()
+            };
+            let mut m = Mcts::new(HeuristicEvaluator, cfg);
+            m.search_at(&st, phase, turn, done, 256).visits
+        };
+        let blind = run(3);
+        let probed = run(2);
+        assert_eq!(blind.len(), 2, "fixture is not a two-edge node");
+        assert_eq!(probed.len(), blind.len());
+        checked += 1;
+        if blind != probed {
+            moved += 1;
+        }
+    }
+    assert!(checked > 0, "no position produced a two-edge searchable node");
+    assert!(
+        moved > 0,
+        "pmin=2 left every visit count identical on {checked} two-edge nodes, \
+         so the one-ply probe is not reaching them and the flag is a no-op"
+    );
+}
+
+/// The champion spec of 2026-09-08 parses, and every flag reaches the config.
+///
+/// `mcts:32768:heuristic:cp=0.02,pmin=2` is the strongest agent measured, and
+/// `mcts:8192:heuristic:cp=0.02,pmin=2` is the same shape at a tenth of the
+/// CPU. Both are three edits away from the shipped defaults, and a spec that
+/// silently dropped one of them would race as something else entirely -- which
+/// has happened on this project before (`examples/nametest.rs`).
+#[test]
+fn the_champion_spec_reaches_the_config() {
+    use tzolkin::record::parse_analysis_agent;
+
+    for sims in ["8192", "32768"] {
+        let spec = format!("mcts:{sims}:heuristic:cp=0.02,pmin=2");
+        let a = parse_analysis_agent(&spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+        let name = a.name();
+        assert!(name.contains(":cp=0.02"), "{spec} lost cp= from {name}");
+        assert!(name.contains(":pmin=2"), "{spec} lost pmin= from {name}");
+        assert!(name.contains(sims), "{spec} lost the budget from {name}");
+        // `pt=1` is the shipped default and must still be in there: the prior
+        // is worth more than everything else measured, and a spec that turned
+        // it off while keeping cp/pmin would look like the champion and play
+        // like the thing the champion beats by eleven points.
+        assert!(name.contains(":pt=1"), "{spec} lost the one-ply prior: {name}");
+    }
 }

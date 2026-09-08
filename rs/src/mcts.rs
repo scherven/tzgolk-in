@@ -1,5 +1,25 @@
 //! MCTS over the factored tree.
 //!
+//! # The spec to run, if you read nothing else
+//!
+//! ```text
+//! mcts:8192:heuristic:deeper        # == mcts:8192:heuristic:cp=0.02,pmin=2
+//! ```
+//!
+//! Two constants away from the shipped defaults, and both of them were shipped
+//! one to two orders of magnitude wrong for a search factored into
+//! sub-decisions. Against `mcts:8192:heuristic:cp=0.02` it is **+3.06** (CI
+//! +1.43..+4.68, 46 paired blocks) on the current evaluator and **+4.73** (CI
+//! +3.22..+6.24, 50 paired blocks, p = 4e-10) on the one before it; against the
+//! shipped `c_puct` at the same budget, `cp=0.02` alone is **+10.39** (CI
+//! +7.68..+13.10, 13 paired blocks) on the current evaluator. Cost is 158 ms of
+//! user CPU per turn against `mcts:2048:heuristic:quality`'s 14.7.
+//!
+//! **More budget is worth more, and costs a lot**: `mcts:32768:heuristic:deeper`
+//! is the strongest thing measured — the budget rung alone is +2.45 (99 paired
+//! blocks) — at **775 ms/turn, 52x**. The ladder flattens above it: 65,536 is
+//! +0.70 over 32,768 with an interval covering zero, for 2.1x the CPU again.
+//!
 //! `docs/SEARCH.md` §3 and §4. The three things that make this not a textbook
 //! AlphaZero search:
 //!
@@ -41,9 +61,26 @@
 //!
 //! With the `quality` preset ([`Priors::OnePly`] at `prior_temp = 1`) the gap
 //! is **+7.73** (CI +6.09..+9.36, 142 blocks / 568 games) and it takes **40.8%
-//! of its games** against three alpha-betas. That is the ceiling this search
-//! currently has against `search.rs`, and it is a prior away rather than a
-//! budget away.
+//! of its games** against three alpha-betas.
+//!
+//! This comment used to call that "the ceiling this search currently has
+//! against `search.rs`, and it is a prior away rather than a budget away".
+//! **It was neither: it was a `c_puct` away.** `mcts:8192:heuristic:cp=0.02`
+//! against the same alpha-beta is **+8.50** (CI +6.62..+10.39, 27 blocks) and
+//! takes 47.7% of its games. There was no ceiling; there was a constant set
+//! two orders of magnitude too high, which meant no amount of extra budget
+//! could turn into extra lookahead. See [`MctsConfig::c_puct_init`].
+//!
+//! **And with `pmin=2` on top, on the post-`d7b4e42` evaluator, there is not
+//! much of a contest.** `mcts:8192:heuristic:deeper` against the same
+//! alpha-beta is **+13.65** (CI +11.90..+15.40, 26 blocks) and takes **77.4%
+//! of its games** against three of them. Against a stateless `heuristic:full`
+//! — whose null control returns **exactly +0.00 with a win rate of exactly
+//! 0.250 over 90 blocks**, so no null correction is needed at all — it is
+//! **+13.63** (CI +12.11..+15.15, 44 blocks, **77.8%** of games) where
+//! `mcts:2048:heuristic:quality` is **+3.41** (183 blocks, 35.8%). Paired on
+//! seed against that common opponent the difference is **+10.34** (CI
+//! +8.50..+12.17, 44 paired blocks, p = 2e-29).
 //!
 //! The number this comment used to carry was **+9.32** from 39 blocks, then
 //! **+3.27** from 150. Neither survived. The first was measured on a machine
@@ -55,56 +92,188 @@
 //! size has not: quote the interval, quote the block count, and re-measure
 //! before quoting the number.
 //!
-//! # The simulation budget does nothing — until the prior is real
+//! # The simulation budget, and why it looked dead
 //!
-//! Six head-to-heads, solo mode, `mcts:S` against `mcts:S/2` and one across
-//! the whole span, all at temperature zero so nothing is sampled:
+//! Six head-to-heads under a **uniform** prior once put every rung from 128 to
+//! 2048 within +/-1.1 points of every other, with the widest span (`mcts:2048`
+//! against `mcts:128`) at -1.08, CI -2.79..+0.64. A note here then claimed a
+//! real prior revived the axis: `mcts:2048:quality` over `mcts:256:quality` at
+//! +3.04 (CI +1.46..+4.62, 150 blocks).
 //!
-//! | candidate | baseline | centred | 95% CI | blocks |
-//! |---|---|---|---|---|
-//! | `mcts:256`  | `mcts:128`  | -0.68 | -2.18..+0.82 | 150 |
-//! | `mcts:512`  | `mcts:256`  | -0.74 | -2.19..+0.71 | 150 |
-//! | `mcts:1024` | `mcts:512`  | +0.22 | -1.36..+1.80 | 150 |
-//! | `mcts:2048` | `mcts:1024` | +0.22 | -1.46..+1.90 | 145 |
-//! | `mcts:4096` | `mcts:2048` | +0.80 | -0.92..+2.52 | 100 |
-//! | `mcts:2048` | `mcts:128`  | -1.08 | -2.79..+0.64 | 150 |
+//! **That claim does not reproduce.** Re-run on 2026-09-08 against the champion
+//! at `--seed 3000000`, with `null-self` (candidate spec == baseline spec) at
+//! **-0.10, CI -0.61..+0.40 over 374 blocks** as the zero:
 //!
-//! **Sixteen times the budget is worth nothing.** Not "a gain too small to
-//! resolve" — the wide-span interval excludes anything above +0.64. Every
-//! `sims` number this project has chosen, `run.sh`'s included, was chosen on an
-//! axis that has been measured flat.
+//! | candidate | centred vs `mcts:2048:quality` | 95% CI | blocks |
+//! |---|---|---|---|
+//! | `mcts:1` | **-32.10** | -33.10..-31.10 | 84 |
+//! | `mcts:32` | -2.28 | -3.57..-0.99 | 77 |
+//! | `mcts:128` | -0.69 | -1.71..+0.33 | 98 |
+//! | `mcts:256` | -0.24 | -1.24..+0.76 | 110 |
+//! | `mcts:512` | +0.34 | -0.71..+1.39 | 110 |
+//! | `mcts:1024` | -0.26 | -1.29..+0.77 | 102 |
+//! | `mcts:4096` | +0.50 | -0.83..+1.82 | 62 |
+//! | `mcts:8192` | +0.62 | -0.13..+1.36 | 158 |
+//! | `mcts:16384` | +0.56 | -0.94..+2.05 | 47 |
+//! | `mcts:32768` | +0.14 | -1.75..+2.03 | 24 |
 //!
-//! It is flat because of what a simulation carries, not because search does not
-//! help. `HeuristicEvaluator` fills `Evaluation::priors` with `1.0 / n_edges`,
-//! so PUCT's exploration term does the entire job of a policy head and the
-//! thousandth simulation is spread as thinly as the first. Give the edges a
-//! real prior — [`Priors::OnePly`] at `prior_temp = 1`, the `quality` preset —
-//! and the same axis comes back to life:
+//! So the axis is not dead — it is **saturated**. `mcts:1` is the prior's argmax
+//! with no search at all and it is not a player: -32 points and a **0% win
+//! rate**. The knee is between 32 and 256 simulations, and above 256 a
+//! 128-fold span is worth nothing anybody can measure.
 //!
-//! | candidate | baseline | centred | 95% CI | blocks |
-//! |---|---|---|---|---|
-//! | `mcts:2048` | `mcts:128` | -1.08 | -2.79..+0.64 | 150 |
-//! | `mcts:2048:quality` | `mcts:256:quality` | +3.04 | +1.46..+4.62 | 150 |
+//! # It saturates because the search cannot afford to look at a reply
 //!
-//! Same search, same budget ratio to within a factor of two, opposite answer.
-//! The prior is also worth a great deal on its own: at equal simulations
-//! `quality` is **+8.84** centred against `mcts:2048` (CI +7.24..+10.44, 202
-//! blocks), and at 1360 simulations — **0.83x the CPU** of the 2048-simulation
-//! default — still **+7.68** (CI +5.90..+9.46, 119 blocks, p = 2.4e-17).
+//! `Mcts::depth_stats` counts descent depth in **sub-decisions**, and a turn is
+//! ~8 of them. At the shipped `c_puct` (`bin/sprobe budget`):
 //!
-//! So the order to tune things in is: the prior first, then the budget, and
-//! `max_edges` / `widen_cap` / `widen_c` never — all three are measured inert
-//! at their own fields below.
+//! | sims | mean descent | that is | arena nodes |
+//! |---|---|---|---|
+//! | 256 | 5.6 | less than its own turn | 342 |
+//! | 2048 | 8.1 | its own turn, exactly | 2756 |
+//! | 16384 | 10.8 | its turn plus a third of the next | 21715 |
+//!
+//! Sixty-four times the budget buys 1.9x the depth, and the tree grows at ~1.4
+//! nodes per simulation at every rung — the budget is buying **width inside the
+//! current turn**, where a one-ply prior has already decided nearly everything.
+//! That is the whole of it: the simulations were not wasted on a bad prior, they
+//! were spent re-deciding what the prior had decided, because they could not
+//! reach anything new.
+//!
+//! # Buy depth instead, and then the budget pays
+//!
+//! [`MctsConfig::c_puct_init`] is the knob that converts budget into depth, and
+//! at 2.0 it was set one to two orders of magnitude too high.
+//!
+//! Two arena runs sharing a baseline and a seed sequence are a matched pair, and
+//! the matched form is the number to quote. Holding the budget at **8,192
+//! simulations** and changing nothing but `c_puct`:
+//!
+//! **`cp=0.02` - `cp=2.0` = +5.93 centred (95% CI +4.27..+7.59, 47 paired
+//! blocks, p = 9e-13).**
+//!
+//! Neither half is worth much alone — the same `c_puct` cut at 2,048
+//! simulations is +0.82 (127 paired blocks) and 4x the budget at `cp=2.0` is
+//! +0.62 — which is why every 1-D sweep this project ran found "about a point":
+//!
+//! | | `cp = 2.0` (shipped) | `cp = 0.06` | `cp = 0.02` |
+//! |---|---|---|---|
+//! | 2,048 sims | 0 by construction | **+1.04** (+0.41..+1.66, 264 blk) | +0.45 (75 blk) |
+//! | 8,192 sims | +0.62 (158 blk) | +1.94 (69 blk) | **+6.27** (+5.28..+7.26, 88 blk) |
+//! | 16,384 sims | +0.56 (47 blk) | — | +7.94 (+6.35..+9.53, 45 blk) |
+//! | 32,768 sims | +0.14 (24 blk) | — | +9.36 (+7.99..+10.73, 33 blk) |
+//!
+//! `mcts:8192:heuristic:cp=0.02` takes **42.9% of its games** against three
+//! copies of the old champion, where an equal agent takes 25%, and scores 38.9
+//! against their 30.4. Its descent runs a mean of **~50 sub-decisions — about
+//! six turns** — against the old champion's 8.5.
+//!
+//! **And it is cheaper than the width it beats.** User CPU per turn, one spec
+//! per process: the old champion 14.77 ms, `mcts:8192:cp=0.02` 146.04 ms —
+//! **10x** — and `mcts:16384:quality` **187.12 ms**. The CPU-matched comparison
+//! is tilted 1.28x *against* the deep spec and it still wins by six points.
+//! Memory is the other price: 412 MB max RSS against 186 MB.
+//!
+//! **Four opponents, four designs, one direction.** Against a stateless
+//! `heuristic:full` the old champion is +3.53 (108 blk) and this is **+11.28**
+//! (+9.75..+12.80, 38 blk); against `minimax:8:600000::greedy:capw=25` it is
+//! **+8.50** (+6.62..+10.39, 27 blk) where the old champion is +7.73; and in
+//! `--mode pairs`, where both sides share an agent instance across two seats and
+//! `bin/arena.rs`'s one-instance-for-three-seats asymmetry cannot apply, it is
+//! **+3.46** (+2.38..+4.55, 18 blk) against a pairs null of +0.27. It is not an
+//! artefact of racing a shallow search of its own family.
+//!
+//! See [`MctsConfig::c_puct_init`] for the full sweep and
+//! `docs/FINDINGS-mcts.md` for the run files and block counts.
+//!
+//! # Lowering `c_puct` re-opened every knob that had been measured inert
+//!
+//! A knob swept at `cp = 2.0` was swept on a search that could not look ahead,
+//! and "inert" was a statement about that search, not about this one. Paired on
+//! seed at 8,192 simulations, changing one flag against `cp = 0.02`:
+//!
+//! | flag | at `cp = 2.0` | at `cp = 0.02` | paired blk |
+//! |---|---|---|---|
+//! | **`pmin=2`** | -1.35 (settled *negative*) | **+4.73** (+3.22..+6.24) | 50 |
+//! | `fpu=0.6` | +0.21 (inert) | **-4.75** (-5.58..-3.92) | 195 |
+//! | `fpu=0.0` | +0.31 (inert) | **-2.90** (-4.64..-1.15) | 61 |
+//! | `q0=1,qn=16` | +0.42 (inert) | **-4.18** (-6.00..-2.35) | 38 |
+//! | `noreuse` | -0.03 (inert) | **-2.00** (-3.26..-0.73) | 76 |
+//! | `priors=mixed` | +0.38 (inert) | **-4.26** (-7.31..-1.21) | 13 |
+//! | `pt=0.5` | +0.00 (inert) | **-1.19** (-1.82..-0.55) | 261 |
+//! | `nocap` | +0.72 (inert) | +0.19 (-0.51..+0.89) | 44 |
+//! | `k=8` | +0.74 (inert) | +0.06 (-1.53..+1.64) | 19 |
+//! | `pick=q` | -2.41 | -1.60 (-3.27..+0.08) | 30 |
+//!
+//! **One mechanism explains the whole column.** A descent is ~56 sub-decisions
+//! at `cp = 0.02` against ~8 at `cp = 2.0`, so anything that prices a *narrow
+//! or barely-visited node* went from touching a handful of nodes per descent to
+//! touching most of them: `pmin` (median searched width is **2**, so
+//! `prior_min_edges = 3` left about 28 nodes per descent with a uniform prior),
+//! `fpu` and `q_pseudo` (the frontier is no longer a transient), `tree_reuse`
+//! (the previous sub-decision built far more of the tree the next one needs),
+//! and the prior source (consulted at every node of a much longer descent).
+//! What did **not** move is the width family — `max_edges`, `widen_cap`,
+//! `widen_c` — because those act on the few wide nodes, and the wide nodes are
+//! not where a deep descent lives.
+//!
+//! `pmin=2` reproduces on the post-`d7b4e42` evaluator at **+3.06** (+1.43..+4.68,
+//! 46 paired blocks), so it is not an artefact of the platform it was found on.
+//!
+//! **The order to tune things in** is therefore: the prior first, then
+//! `c_puct` and `sims` **jointly**, then re-sweep everything that touches a
+//! narrow node (`pmin`, `fpu`, `q_pseudo`, `tree_reuse`) **at the `c_puct` you
+//! settled on** — and `max_edges` / `widen_cap` / `widen_c` never.
 //!
 //! # Threading
 //!
 //! Still single-threaded. Virtual loss is applied and removed for real, on the
 //! mover's component only, so the mechanism is exercised and the shape is
 //! right, but the statistics are plain `u32`/`f32` rather than §3.1's atomics
-//! and there is no batching. Swapping in `AtomicU32` and signed fixed-point
-//! `AtomicI32` is mechanical; the descent logic does not change. It would buy
-//! latency rather than throughput, though: self-play and the arena already fill
-//! every core by running whole games in parallel.
+//! and there is no batching.
+//!
+//! **The exchange rate is now measured**: +2.45 centred per 4x simulations
+//! (`32768:cp=0.02` - `8192:cp=0.02`, 99 paired blocks, p = 5e-6) at 4.85x the
+//! user CPU, so **+1.22 per doubling of the budget for 2.2x the CPU**.
+//!
+//! **That makes threading worth zero, and the sentence this comment used to
+//! carry — "threading buys simulations, so it is worth exactly what
+//! simulations are worth" — is a wall-clock claim wearing a strength claim's
+//! clothes.** K threads do not create simulations; they spend K cores to
+//! finish the same ones sooner. Every number in this file is strength *per
+//! CPU*, the constraint the user lifted was the clock rather than the cycles,
+//! and virtual-loss tree parallelism is a slightly *worse* use of N
+//! simulations than one thread's N. No arena measurement here could show a
+//! threading win. What it buys is **latency for the shipped agent** — a TUI
+//! turn uses one of fourteen cores, so at a fixed 0.8 s/turn eight threads
+//! would be worth about `1.22 * log2(8) = +3.7`. That is a
+//! deliverable-comfort case, and it is the honest one.
+//!
+//! **And the swap is not mechanical.** `Edge::w` and `Node::w` are
+//! `[f32; N_PLAYERS]`, and both encodings cost something: §3.4's signed
+//! fixed-point `AtomicI32` changes the arithmetic, so the search plays
+//! differently *at one thread* and every row in `docs/FINDINGS-mcts.md` would
+//! need re-measuring; an `AtomicU32` of `f32::to_bits` with a compare-exchange
+//! add is bit-identical at one thread but backup does `4 * depth` of them and
+//! depth is now ~56, which is ~7M CAS per sub-decision at 32,768 simulations —
+//! buying threads by making the single-threaded search slower.
+//!
+//! `docs/SEARCH.md` §3.5 also calls batching "the real reason for
+//! parallelism", sized against a **network** call of 0.1-1 ms. There is no
+//! network: the leaf is `eval::heuristic`, and a `sample` profile of a live
+//! `mcts:32768:cp=0.02` puts the whole `eval::*` family at ~1,850 samples
+//! against `simulate`'s 11,367. **The search is descent-bound, not
+//! evaluation-bound** — the opposite of the regime §3.5 was written for — so
+//! there is nothing to batch. The hot loop is `select`, and `logf` for the
+//! `c_puct_base` term is on its own ~6% of the non-idle profile.
+//!
+//! Two caveats stand whatever the curve does. Root- or leaf-parallel MCTS is
+//! *weaker* than the same total simulations in one tree, so the sims curve is an
+//! upper bound and not an estimate. And it buys latency rather than measurement
+//! throughput: self-play and the arena already fill every core by running whole
+//! games in parallel, so a threaded search makes one turn faster without making
+//! an experiment faster. At 8,192 simulations and `cp=0.02` a turn is ~180 ms of
+//! user CPU, which no interface needs help with.
 //!
 //! Where a single descent's time goes, from `sample` over a 20-second window of
 //! a running arena (91,387 running samples, 28% of threads parked):
@@ -142,10 +311,135 @@ use rustc_hash::FxHashMap;
 /// The knobs of §6.3, with §2.6 and §3.3's recommended values.
 #[derive(Clone, Copy, Debug)]
 pub struct MctsConfig {
-    /// §4.5: calibrated for a value in (-1, 1), not AlphaZero's win/loss scale.
+    /// §4.5 says this is calibrated for a value in (-1, 1) rather than
+    /// AlphaZero's win/loss scale. **It is not calibrated for anything, and 2.0
+    /// is one to two orders of magnitude too high.**
+    ///
+    /// # What it actually buys, which is depth
+    ///
+    /// `c` enters selection as `u = c * prior * sqrt(N) / (1 + n)`, so lowering
+    /// it makes the descent commit to the best-looking child sooner and go
+    /// further before it comes back to explore. In a search factored into
+    /// sub-decisions that is the *only* way to buy lookahead, because a turn is
+    /// ~8 sub-decisions and simulations alone do not deepen a tree fast enough
+    /// to reach one. At 2,048 simulations (`bin/sprobe budget`, 147
+    /// sub-decisions, mean descent depth in sub-decisions):
+    ///
+    /// | `c_puct_init` | mean descent | top edge's visit share | user CPU |
+    /// |---|---|---|---|
+    /// | 2.0 (shipped) | 8.0 | 83.5% | 14.9 ms/turn |
+    /// | 0.25 | 11.3 | 90.6% | — |
+    /// | 0.06 | **21.8** | 93.3% | 19.3 ms (1.29x) |
+    /// | 0.02 | 48.3 | 93.8% | 31.8 ms (2.13x) |
+    /// | 0.005 | 83.0 | 93.8% | 50.7 ms (3.39x) |
+    ///
+    /// For comparison, sixty-four times the *budget* at `c_puct = 2.0` moves the
+    /// mean descent from 5.6 to 10.8 — so dividing this constant by 33 buys more
+    /// lookahead than a 64x budget does, at 1.3x the CPU instead of 64x.
+    ///
+    /// # And the best value depends on the budget
+    ///
+    /// A deep descent needs enough simulations to support the tree it is
+    /// digging, so the two knobs are one knob. Centred against
+    /// `mcts:2048:heuristic:quality`:
+    ///
+    /// | | `cp = 2.0` | `cp = 0.06` | `cp = 0.02` | `cp = 0.01` |
+    /// |---|---|---|---|---|
+    /// | 2,048 sims | 0 by construction | **+1.04** (264 blk) | +0.70 (114 blk) | -0.13 (39) |
+    /// | 4,096 sims | — | — | **+4.64** (72 blk) | — |
+    /// | 8,192 sims | +0.42 (352 blk) | +1.94 (69 blk) | **+5.99** (+5.53..+6.45, 353 blk) | +3.74 (24) |
+    /// | 16,384 sims | +0.56 (47 blk) | — | +7.94 (45 blk) | — |
+    /// | 32,768 sims | +0.14 (24 blk) | — | **+9.29** (+8.50..+10.08, 120 blk) | +9.02 (24) |
+    /// | 65,536 sims | — | — | +11.75 (14 blk) | — |
+    ///
+    /// **The optimum falls with the budget and then stops falling.** 0.06 at
+    /// 2,048, 0.02 at 8,192, and at 32,768 the 0.01 and 0.02 cells are
+    /// indistinguishable (paired +0.25, CI -3.51..+4.01, 15 blocks). `cp` sets
+    /// the descent length — 56 sub-decisions at 0.02, 78 at 0.01, 95 at 0.005,
+    /// and *within 9% independent of the budget* — so once the length is right
+    /// more simulations only support it. **Depth is the axis; the budget is the
+    /// support.** Paired against `8192:cp=0.02`: 2,048 is -4.79, 4,096 is
+    /// -1.90, 32,768 is **+2.45** (99 paired blk) and 65,536 is +3.15 (14 blk),
+    /// i.e. **+0.70 for the last 2.1x of CPU with an interval covering zero.**
+    /// The ridge stops paying at about 32,768.
+    ///
+    /// The matched form, two runs sharing a baseline and a seed sequence with
+    /// only `c_puct` between them: at 8,192 simulations **+5.93 (CI
+    /// +4.27..+7.59, 47 paired blocks, p = 9e-13)**.
+    ///
+    /// At 2,048 simulations `cp = 0.02` descends a mean of 48 sub-decisions on a
+    /// tree with 2,048 simulations to spread over them, which is
+    /// over-commitment; at 8,192 the same depth is four times better supported.
+    /// **Sweep the two together or you will find "about a point" whichever one
+    /// you move**, which is what the 1-D sweeps before 2026-09-08 found.
+    ///
+    /// The full 1-D curve at 2,048 simulations is single-peaked at 0.06-0.12
+    /// with a trough at 0.25-1.0 and the shipped 2.0 on the far shoulder:
+    /// -2.71, -1.34, -0.13, +0.45, **+1.07**, +1.08, -0.69, -0.91, -0.58, 0,
+    /// +0.23 at cp = 0.002, 0.005, 0.01, 0.02, 0.06, 0.12, 0.25, 0.5, 1.0, 2.0,
+    /// 4.0.
     pub c_puct_init: f32,
+    /// `c = c_puct_init + ln((1 + N + base) / base)`, so this is how much *more*
+    /// a well-visited node explores.
+    ///
+    /// At 19652 it does almost nothing here — `ln(21701/19652) = 0.099` at
+    /// N = 2048 — which is why [`MctsConfig::c_puct_init`] is effectively the
+    /// whole constant. It is the natural place to put "breadth at the root,
+    /// exploitation below": the root of a turn carries every simulation and a
+    /// node eight levels down carries a handful. `cp=0.005, cpb=1000` gives
+    /// `c(N=20) = 0.026` and `c(N=2048) = 1.12`, which reaches `cp=0.06`'s mean
+    /// descent of 21.8 while keeping the root's top-edge share at 86% instead of
+    /// 93%. Measured only as `cpb=1000` alone (+0.56, -0.50..+1.61, 99 blocks).
+    ///
+    /// # "It does almost nothing" is only true at 2,048 simulations
+    ///
+    /// `ln((1 + N + 19652) / 19652)` grows with the budget, and at `cp = 0.02`
+    /// it is not a correction, it is the constant:
+    ///
+    /// | sims at the root | 2048 | 8192 | 32768 | 65536 |
+    /// |---|---|---|---|---|
+    /// | `c` with `cp = 0.02` | 0.119 | 0.368 | **1.001** | **1.487** |
+    ///
+    /// So `mcts:8192:cp=0.02` and `mcts:32768:cp=0.02` differ in *two* things:
+    /// the budget, and a root that explores four times as hard. **Raising the
+    /// budget at a fixed `(init, base)` raises root breadth as a side effect**,
+    /// which is a second reason the budget axis came alive when `init` came
+    /// down.
+    ///
+    /// Separating them does not pay. Giving 8,192 simulations 32,768's root
+    /// breadth (`cp=0.02,cpb=4913`, so `c(N=8192) = 1.00`) is **-0.83** (CI
+    /// -2.44..+0.79, 54 paired blocks); the reverse pairing `cp=0.005,cpb=3000`
+    /// matched `cp=0.02` to within its interval. Read that as good news about
+    /// the shape of the optimum: anything reaching a mean descent of 35-60
+    /// sub-decisions scores the same, so the result is about **depth**, not
+    /// about which pair of constants buys it. `cp` alone is the simpler
+    /// spelling.
     pub c_puct_base: f32,
     /// First-play urgency, subtracted from the parent's Q.
+    ///
+    /// # Measured inert at `c_puct = 2.0`, and worth five points at 0.02
+    ///
+    /// The 1-D sweep against the shipped `cp = 2.0` put 0.0, 0.6 and 1.2 at
+    /// +0.31, +0.21 and +0.22, every interval straddling zero, and
+    /// [`MctsConfig::q_init`] explains why: an unvisited edge is a state that
+    /// lasts two descents when nodes are p50 3 edges wide and the budget is
+    /// thousands.
+    ///
+    /// **At `cp = 0.02` the same flag is worth five points across its range**,
+    /// paired on seed at 8,192 simulations against the `fpu = 0.2` default:
+    ///
+    /// | `fpu` | centred | 95% CI | paired blk | p |
+    /// |---|---|---|---|---|
+    /// | 0.0 | **-2.90** | -4.64..-1.15 | 61 | 9e-4 |
+    /// | 0.2 (default) | 0 by construction | — | — | — |
+    /// | 0.6 | **-4.75** | -5.58..-3.92 | 195 | 3e-29 |
+    ///
+    /// A 56-sub-decision descent creates fresh nodes for most of its depth, so
+    /// "unvisited edge" is not a transient at the frontier — it *is* the
+    /// frontier, and what FPU charges it decides where the search goes. The
+    /// shipped 0.2 sits at an interior optimum: the knob went from inert to
+    /// decisive **without its best value moving**, so nothing needs changing —
+    /// but do not re-derive "inert" from the old sweep and delete it.
     pub fpu_reduction: f32,
     /// Carry the subtree over between the sub-decisions of a turn.
     ///
@@ -157,7 +451,39 @@ pub struct MctsConfig {
     /// on wall-clock (0.77 vs 0.79 games/s): retaining costs a sweep of the
     /// arena and a rebuild of the index, which roughly cancels the expansions
     /// it saves.
+    ///
+    /// **Re-measured on the real prior, 2026-09-08: it is a wash on strength
+    /// too.** `noreuse` against the default is **+0.07** (CI -0.89..+1.03, 129
+    /// blocks). So the paragraph above is right that this is a search-quality
+    /// knob and wrong to imply the quality moves: the larger effective budget at
+    /// reused nodes buys nothing, which is what the flat budget curve in the
+    /// module header would predict.
+    ///
+    /// **And that is a `c_puct = 2.0` fact.** At `cp = 0.02` and 8,192
+    /// simulations, `noreuse` is **-2.00** (CI -3.26..-0.73, 76 paired blocks,
+    /// p = 0.002) — reuse is worth two points, not zero. The sentence above is
+    /// still the right explanation and now has the opposite sign: the effective
+    /// budget at reused nodes *does* buy something once a descent is 56
+    /// sub-decisions instead of 8, because the previous sub-decision built far
+    /// more of the tree the next one needs.
+    ///
+    /// Keep it on for the strength *and* the memory: `record::SearchAgent` shares
+    /// one `Mcts` across every seat it is asked to play (`bin/selfplay.rs:449`
+    /// hands one instance all four), so the arena it retains is shared too.
     pub tree_reuse: bool,
+    /// §3.7's root exploration noise: `prior = (1-eps) * prior + eps * Dir`,
+    /// applied at every `in_root_turn` node rather than only the literal root.
+    ///
+    /// **It has no `mcts:` flag on purpose, and adding one is a mistake.**
+    /// `record::SearchAgent::with_config` zeroes this field whenever
+    /// `Exploration::Off`, which is every caller that is not generating
+    /// training data — the arena included — so a flag would parse, be
+    /// overwritten, and print `:eps=` into a label that did not describe the
+    /// search. This was tried on 2026-09-08 and reverted within the hour.
+    ///
+    /// The thing worth checking is the gate, not the value: noise at tau = 0 is
+    /// a search playing something other than its best move, and the only
+    /// defence against that is `Exploration`.
     pub dirichlet_eps: f32,
     /// Dirichlet `alpha` is `scale / n_edges`, set per node: widths here run
     /// from 2 to 32 and a fixed alpha would be negligible at one end and
@@ -220,8 +546,27 @@ pub struct MctsConfig {
     /// How a node wider than `max_edges` decides which edges survive. See
     /// [`EdgeOrder`].
     pub ordering: EdgeOrder,
-    /// `tau` in §3.8. Zero picks the most-visited edge.
+    /// `tau` in §3.8. Zero picks by [`MctsConfig::root_pick`]; above zero the
+    /// step is always sampled from the visit counts, because that is the
+    /// distribution §3.8's training target is defined on.
     pub temperature: f32,
+    /// What a temperature-zero search plays: the most-visited edge, or the
+    /// best-valued one.
+    ///
+    /// # Visits are nearly the prior here, and Q is what the search added
+    ///
+    /// Most-visited is the standard answer and it is the robust one when visits
+    /// are earned — a single lucky rollout cannot make an edge the most
+    /// visited. That argument assumes the visit distribution is *about* the
+    /// search. `bin/sprobe budget` says it is mostly about the prior: 85% of a
+    /// 2,048-simulation root's visits sit on one edge, and `mcts:1` — the
+    /// prior's argmax with no search whatever — plays the same move as
+    /// `mcts:2048` on 81% of sub-decisions. Whatever the simulations learned is
+    /// in the *values* they backed up, not in a count that was already decided.
+    ///
+    /// See [`RootPick`] for how the value variant guards against the fluke the
+    /// visit rule exists to prevent.
+    pub root_pick: RootPick,
     pub virtual_loss: u32,
     /// Guard against a descent that never terminates. A whole game from day 0
     /// is ~900 sub-decisions.
@@ -241,6 +586,91 @@ pub struct MctsConfig {
     /// nearly flat again, which is the state [`Priors::Evaluator`] is already
     /// in. `quality` is the name for 1.0.
     pub prior_temp: f32,
+    /// Score the one-ply probe with `eval::margin` rather than `eval::heuristic`.
+    ///
+    /// # The sibling-common argument is wrong for exactly the moves that matter
+    ///
+    /// [`Priors::OnePly`] scores a child with the mover's own estimate and
+    /// [`one_ply`](Mcts::one_ply) justifies that by saying the best-opponent
+    /// term is common to a node's siblings. It is common to siblings that
+    /// differ only in what the mover *gains*. It is not common to siblings that
+    /// differ in what an opponent is *denied* — taking the gear space they
+    /// needed, the monument they were saving for, the last skull — and denial
+    /// is a large part of how this game is won. `eval::margin`'s own doc comment
+    /// calls it "the quantity the search maximises".
+    ///
+    /// It costs four `heuristic` calls an edge instead of one. That is
+    /// affordable here and nowhere else in this project: the probe is ~12% of a
+    /// search at `sims = 2048`, and the simulations it would be competing for
+    /// are worth +0.35 per eightfold (see the module header), so trading
+    /// simulations for a better prior is the trade this search wants.
+    ///
+    /// The spread of a margin is wider than the spread of a raw estimate, so
+    /// `prior_temp` does not carry over — sweep the two together.
+    pub prior_margin: bool,
+    /// How much of the one-ply score to spend as an unvisited edge's Q, on top
+    /// of first-play urgency.
+    ///
+    /// # The prior was throwing away half of what it computed
+    ///
+    /// [`Priors::OnePly`] applies `eval::heuristic` to every child and then
+    /// keeps only the *softmax* of the result. A softmax is a statement about
+    /// which edge to try; the scores it was built from are also a statement
+    /// about what each edge is worth, and PUCT was being told the first and not
+    /// the second. Every unvisited sibling therefore entered `select` with the
+    /// identical Q — `parent_q - fpu_reduction * sqrt(expanded)` — and the
+    /// prior had to carry the whole difference through `u`, where it decays as
+    /// `sqrt(N)/(1+n)` and is gone by the time a node is resolved.
+    ///
+    /// This adds `q_init * tanh((h_i - mean_h) / 25)` to that edge's FPU. The
+    /// squash and the 25 are `phase::HeuristicEvaluator`'s own points-to-value
+    /// map, so `q_init = 1` means "trust the one-ply score exactly as far as
+    /// the evaluator's value head is trusted"; linearising the four-player
+    /// centring puts the self-consistent value nearer 0.75.
+    ///
+    /// **Default 0, which is the behaviour this shipped with**, so a spec that
+    /// does not name it searches identically to one from before the field
+    /// existed — `tests/search.rs` checks that byte for byte. `Edge::q0` fits
+    /// in the padding `Edge` already had, so `edge_bytes()` is still 88 and the
+    /// knob costs nothing at all when it is off.
+    ///
+    /// # On its own it is inert, and the reason is the shape of the tree
+    ///
+    /// `q0=1` and `q0=4` both change **0.0%** of played turns against the
+    /// default (`bin/sprobe mcts`, 405 turns) — even at `cp=0.06`, where the
+    /// exploration term is small enough that the offset should dominate. An
+    /// unvisited edge is a transient state here: nodes are p50 3 edges wide and
+    /// the budget is thousands of simulations, so every edge is visited within
+    /// the first few descents and an FPU term is never consulted again. FPU is
+    /// a knob for searches whose nodes are wider than their budgets.
+    ///
+    /// It becomes live through [`MctsConfig::q_pseudo`], which keeps the same
+    /// offset in Q *after* the edge has been visited.
+    pub q_init: f32,
+    /// Pseudo-visits carrying [`MctsConfig::q_init`]'s estimate, so that it
+    /// decays with real evidence instead of vanishing at the first visit.
+    ///
+    /// `Q = (w + k * (parent_q + q0)) / (n + k)`. At `k = 0` the edge is scored
+    /// exactly as before. At `k = 4` an edge's first four simulations are half
+    /// discounted toward what the one-ply probe said about it, and by fifty
+    /// visits the probe is worth 8% of the estimate.
+    ///
+    /// This is the form in which "the prior computed a value and the search
+    /// threw it away" is actually testable: `q_init` alone is consulted once
+    /// per edge and then never again.
+    ///
+    /// **Testable, and the answer is no.** At `cp = 2.0`, `q0=1,qn=16` changed
+    /// 2.2% of turns and measured +0.42, inert. At `cp = 0.02` and 8,192
+    /// simulations it is **-4.18 (CI -6.00..-2.35, 38 paired blocks, p = 4e-6)**.
+    ///
+    /// Same shape as [`MctsConfig::fpu_reduction`]: anything that prices an
+    /// *unvisited or barely visited* edge is inert when the descent is 8
+    /// sub-decisions deep and decisive when it is 56, because at 56 the
+    /// barely-visited edges are the descent. Here the sign is bad — pulling a
+    /// young edge's Q toward the one-ply probe overrides the values the deeper
+    /// search is actually returning, and those are worth more than the probe
+    /// precisely because the search can now see further than one ply.
+    pub q_pseudo: f32,
     /// Do not spend a one-ply pass on a node narrower than this.
     ///
     /// The pass costs an `apply_step` and an `eval::heuristic` per edge, so its
@@ -249,10 +679,38 @@ pub struct MctsConfig {
     /// 2..2293 with a median searched width of 3 (`phase.rs`), so the threshold
     /// is where most of the saving is.
     ///
-    /// Set it low. At 3 the prior is worth +8.84 against `mcts:2048`; at 8 it
-    /// is worth **+3.46** (CI +2.06..+4.85, 200 blocks). Skipping the probe on
-    /// 3-to-7-edge nodes skips it on most of the tree, and most of the tree is
-    /// where the strength was.
+    /// Set it low, but not to 2. At 3 the prior is worth +8.84 against
+    /// `mcts:2048`; at 8 it is worth **+3.46** (CI +2.06..+4.85, 200 blocks).
+    /// Skipping the probe on 3-to-7-edge nodes skips it on most of the tree,
+    /// and most of the tree is where the strength was.
+    ///
+    /// Downward it stops paying and starts costing — **at `c_puct = 2.0`.**
+    /// `pmin=2` measures -1.35 against the `pmin=3` default (CI -2.37..-0.34,
+    /// 96 blocks, 2026-09-08), and the explanation was that a two-edge node is
+    /// resolved by three simulations whatever its prior says, so the probe buys
+    /// nothing there while softmaxing two scores at `pt=1` produces a *sharper*
+    /// prior than the uniform it replaces.
+    ///
+    /// # That verdict inverts in the deep regime, and this is the second-largest
+    /// constant in the file
+    ///
+    /// At `cp = 0.02` and 8,192 simulations, `pmin=2` is **+4.73** (CI
+    /// +3.22..+6.24, 50 paired blocks, p = 4e-10) — and **+2.92** (CI
+    /// +1.06..+4.77, 28 paired blocks) re-measured on the post-`d7b4e42`
+    /// evaluator, so it is not an artefact of the platform it was found on.
+    ///
+    /// The mechanism is the descent length. A node's *median* searched width is
+    /// **2**, so `prior_min_edges = 3` means roughly half of all nodes get a
+    /// uniform prior. At `cp = 2.0` a descent is ~8 sub-decisions and passes
+    /// through a handful of them; at `cp = 0.02` it is ~56 and passes through
+    /// about **28 blind nodes per descent**. "A two-edge node is resolved by
+    /// three simulations" is true of a node the search will return to; it is
+    /// false of a node the search visits once on its way sixty levels down,
+    /// where the choice of edge *is* the descent.
+    ///
+    /// 2 is the floor (`record.rs` clamps with `.max(2)`), so this knob is now
+    /// pinned at its most aggressive setting and there is nothing further to
+    /// win on this axis.
     pub prior_min_edges: usize,
 }
 
@@ -292,6 +750,74 @@ pub enum Priors {
     /// budget-vs-strength curve in the module header makes free: buy it by
     /// lowering `sims`, an axis that has been measured worth nothing.
     OnePly,
+    /// [`Gradient`]'s linear price list, softmaxed at the same `prior_temp`.
+    ///
+    /// The units line up with [`Priors::OnePly`] by construction — both are
+    /// `eval::heuristic` points — so the temperature means the same thing, but
+    /// the *spread* does not, and `prior_temp` has to be swept again rather
+    /// than carried over.
+    ///
+    /// **It is blind wherever `Gradient::step` is.** Only `Step::Take` carries
+    /// a `Choice`, so `Placing`, `PickWorker`, `Mode` and `Beg` all price to
+    /// zero and softmax back to uniform. `Placing` is not a narrow phase — it
+    /// runs to a few hundred edges — so this is not a small blind spot, and it
+    /// is why [`Priors::Mixed`] exists.
+    ///
+    /// # Is `OnePly` worth 7.7x per edge? At equal simulations, by 0.77 points
+    ///
+    /// Against `mcts:2048:heuristic:quality` at the same 2,048 simulations this
+    /// is **-0.77 (CI -1.49..-0.04, 191 blocks)** — a real loss, but a small
+    /// one for a prior that is blind on every phase but `Take`. It costs
+    /// **0.79x** the user CPU of the one-ply probe (11.55 ms/turn against
+    /// 14.62) and only **1.05x** the uniform prior's 11.02, so as a prior it is
+    /// very nearly free.
+    ///
+    /// Spend the saving and the loss goes away: `mcts:2450:heuristic:priors=grad`
+    /// is measured at **0.98x** the champion's user CPU and scores **+0.47 (CI
+    /// -0.48..+1.42, 96 blocks)**. **At matched CPU the two priors are
+    /// indistinguishable.** Which of them to prefer is therefore a question
+    /// about what a simulation is worth — see the module header, where the
+    /// answer turns out to depend entirely on `c_puct`.
+    ///
+    /// # And in the deep regime it is not close: -4.04
+    ///
+    /// Everything above is measured at `c_puct = 2.0`, where a descent is ~8
+    /// sub-decisions. At `cp = 0.02` and 8,192 simulations this prior is
+    /// **-4.04 (CI -4.72..-3.36, 321 paired blocks, p = 1e-31)** — five times
+    /// the loss, and no longer recoverable by spending the saving.
+    ///
+    /// The direction follows from where the blind spot is. **The prior is
+    /// consulted at every node of a descent**, and a 56-sub-decision descent
+    /// consults it seven times as often as an 8-sub-decision one, so a prior
+    /// that softmaxes to uniform on `Placing`, `PickWorker`, `Mode` and `Beg`
+    /// commits a blind step seven times as often. `OnePly`'s 7.7x per-edge
+    /// cost is a wash at `cp = 2.0` and clearly worth paying at `cp = 0.02` —
+    /// which is the answer to "is `OnePly` worth it", and it is
+    /// budget-dependent in the same way everything else in this file turned
+    /// out to be.
+    Gradient,
+    /// [`Priors::Gradient`] on `Take` nodes, [`Priors::OnePly`] everywhere else.
+    ///
+    /// The two costs and the two blind spots line up the right way round: the
+    /// wide phase is the one the gradient can price at 16 ns an edge, and the
+    /// phases it cannot price are the ones where a 123 ns one-ply probe is
+    /// affordable because there are few edges to spend it on.
+    ///
+    /// It behaves like the compromise it is: **+0.48 (CI -0.25..+1.20, 190
+    /// blocks)** against the one-ply default at equal simulations, for 0.97x the
+    /// user CPU, and it changes only 0.7% of played turns (`bin/sprobe mcts`).
+    /// Nothing to choose between it and `OnePly` on the evidence; it is here
+    /// because it is the shape a trained policy head would want if the head
+    /// covered only some phases.
+    ///
+    /// **In the deep regime the compromise is not one: -4.26** (CI
+    /// -7.31..-1.21, 13 paired blocks) at `cp = 0.02` and 8,192 simulations,
+    /// which is [`Priors::Gradient`]'s -4.04 essentially undiminished. The
+    /// reason is that the phase it hands to the gradient — `Take` — is exactly
+    /// where a long descent spends its length, so half a blind prior is most of
+    /// a blind prior. Do not read the +0.48 above as "free"; it is a
+    /// `c_puct = 2.0` number.
+    Mixed,
 }
 
 /// How a node too wide for `max_edges` decides which edges are opened first,
@@ -341,6 +867,23 @@ pub enum EdgeOrder {
     /// Price every edge against `eval`'s own local gradient ([`Gradient`]),
     /// keep the best `widen_cap`, and spend the one-ply probe only on those.
     Gradient,
+}
+
+/// What a temperature-zero search plays. See [`MctsConfig::root_pick`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RootPick {
+    /// §3.8's rule: the most-visited edge.
+    Visits,
+    /// The best mean value for the mover, among edges carrying at least a
+    /// hundredth of the node's visits.
+    ///
+    /// The floor is the whole difference between this and a rule that would
+    /// hand the turn to any edge a single fortunate simulation ran through. At
+    /// 2,048 simulations it asks for 20 visits before an edge may be played,
+    /// which is enough that its mean is a mean; at 8 it degenerates to
+    /// "anything visited", which is the right answer when there is nothing to
+    /// be robust about.
+    Value,
 }
 
 /// `eval::heuristic`'s local gradient: a price per unit of everything an
@@ -441,20 +984,31 @@ impl Default for MctsConfig {
             widen_cap: 128,
             ordering: EdgeOrder::Gradient,
             temperature: 1.0,
+            root_pick: RootPick::Visits,
             virtual_loss: 1,
             max_depth: 2048,
             seed: 0,
             // `Priors::OnePly` at `prior_temp = 1` -- what the `quality` preset
             // spelled -- is the default because it is worth +8.84 centred
             // against this same search with the old defaults (95% CI
-            // +7.24..+10.44, 202 blocks), and because the simulation budget is
-            // a dead axis without it: 16x the budget measures -1.08 under a
-            // flat prior and 8x is worth +3.04 once the prior is real. The
-            // `prior_temp` sweep against `mcts:2048` reads 0.5 -> +6.42,
-            // 1.0 -> +8.84, 2.0 -> +5.56, 4.0 -> +1.01, so the 4.0 this
-            // shipped with was throwing away seven of the eight points.
+            // +7.24..+10.44, 202 blocks). The `prior_temp` sweep against
+            // `mcts:2048` reads 0.5 -> +6.42, 1.0 -> +8.84, 2.0 -> +5.56,
+            // 4.0 -> +1.01, so the 4.0 this shipped with was throwing away
+            // seven of the eight points; re-swept at 1.0 on 2026-09-08,
+            // 0.5 -> +0.00 (98 blk) and 1.5 -> -0.18 (88 blk), so 1.0 is a
+            // genuine optimum and a flat one.
+            //
+            // The reason this comment used to give -- "the simulation budget is
+            // a dead axis without it, and 8x is worth +3.04 once the prior is
+            // real" -- **did not replicate**: that exact pair, corrected by its
+            // own null, is +0.03 (CI -1.84..+1.90, 43 paired blocks). The
+            // budget is unlocked by `c_puct_init`, not by the prior. See the
+            // module header.
             priors: Priors::OnePly,
             prior_temp: 1.0,
+            prior_margin: false,
+            q_init: 0.0,
+            q_pseudo: 0.0,
             prior_min_edges: 3,
         }
     }
@@ -494,6 +1048,10 @@ pub trait PriorBias: Send + Sync {
 struct Edge {
     step: Step,
     prior: f32,
+    /// What an *unvisited* edge's Q is worth relative to its siblings, from the
+    /// same one-ply scores the prior was softmaxed from. Zero unless
+    /// [`MctsConfig::q_init`] is set. See [`MctsConfig::q_init`].
+    q0: f32,
     child: Option<u32>,
     n: u32,
     w: [f32; N_PLAYERS],
@@ -640,6 +1198,11 @@ pub struct Mcts<E: Evaluator> {
     /// stays at zero across a turn the retention is not firing.
     reused: usize,
     discarded: usize,
+    /// Descent depth in sub-decisions, for the last `search_at`. Counters, read
+    /// by [`Mcts::depth_stats`]; nothing in selection or backup looks at them.
+    deepest: u32,
+    depth_sum: u64,
+    depth_n: u64,
     /// From `MctsConfig::tree_reuse`, or `TZOLKIN_NO_TREE_REUSE` in the
     /// environment. Reuse is **not** behaviour-neutral -- see `MctsConfig` --
     /// so being able to switch it off is how the two are compared.
@@ -677,6 +1240,9 @@ impl<E: Evaluator> Mcts<E> {
             index: FxHashMap::default(),
             reused: 0,
             discarded: 0,
+            deepest: 0,
+            depth_sum: 0,
+            depth_n: 0,
             reuse_disabled,
             bias: None,
             scratch: Vec::new(),
@@ -745,6 +1311,11 @@ impl<E: Evaluator> Mcts<E> {
             !legal.is_empty(),
             "no legal step at {phase:?} for {turn:?}; the pity rule should have made this impossible"
         );
+        // Per sub-decision, so `depth_stats` describes this search and not the
+        // whole turn.
+        self.deepest = 0;
+        self.depth_sum = 0;
+        self.depth_n = 0;
 
         // A forced move is not worth an evaluation, let alone a search.
         if legal.len() == 1 {
@@ -960,6 +1531,20 @@ impl<E: Evaluator> Mcts<E> {
         self.nodes.len()
     }
 
+    /// How deep the deepest descent of the last `search_at` went, and the mean
+    /// descent depth, both counted in **sub-decisions**.
+    ///
+    /// The unit is the point. A turn is ~8 sub-decisions, so a tree 7 deep has
+    /// not finished looking at its own turn and has certainly not seen a reply.
+    /// That is the number that says whether a budget increase bought lookahead
+    /// or only width. Counters only; they do not enter selection.
+    pub fn depth_stats(&self) -> (u32, f64) {
+        (
+            self.deepest,
+            self.depth_sum as f64 / self.depth_n.max(1) as f64,
+        )
+    }
+
     /// What one edge and one node cost in bytes.
     ///
     /// The whole argument for `widen_cap` is that an uncapped node is
@@ -1017,6 +1602,7 @@ impl<E: Evaluator> Mcts<E> {
     fn simulate(&mut self, root: u32) {
         let mut path = std::mem::take(&mut self.path);
         path.clear();
+        let mut reached = 0u32;
         let mut value = [0.0f32; N_PLAYERS];
         let vl = self.cfg.virtual_loss;
 
@@ -1025,6 +1611,7 @@ impl<E: Evaluator> Mcts<E> {
             // A descent can run to the end of the game through transpositions
             // and collapsed nodes; the guard is against a graph cycle, which
             // the state advancing on every edge should already rule out.
+            reached = depth;
             if depth >= self.cfg.max_depth || self.nodes[cur as usize].terminal {
                 value = self.nodes[cur as usize].value.unwrap_or([0.0; N_PLAYERS]);
                 break;
@@ -1064,6 +1651,9 @@ impl<E: Evaluator> Mcts<E> {
         let leaf = self.cursor(&path, root);
         self.backup(&path, leaf, value);
         self.path = path;
+        self.deepest = self.deepest.max(reached);
+        self.depth_sum += reached as u64;
+        self.depth_n += 1;
     }
 
     /// The node the descent currently sits on: the child of the last edge
@@ -1120,14 +1710,23 @@ impl<E: Evaluator> Mcts<E> {
         };
         let expanded: f32 = open.iter().filter(|e| e.n > 0).map(|e| e.prior).sum();
         let fpu = parent_q - self.cfg.fpu_reduction * expanded.max(0.0).sqrt();
+        let k_pseudo = self.cfg.q_pseudo;
 
         let mut best = 0usize;
         let mut best_score = f32::NEG_INFINITY;
         for (i, edge) in open.iter().enumerate() {
-            let q = if edge.n > 0 {
+            // An unvisited edge is worth the parent, less urgency, plus what
+            // the one-ply probe already said about *this* edge. With `q_init`
+            // and `q_pseudo` both at 0 neither term is present and every
+            // unvisited sibling shares one Q, which is the behaviour every
+            // measurement before 2026-09-08 was made on.
+            let q = if k_pseudo > 0.0 {
+                (edge.w[mover] + k_pseudo * (parent_q + edge.q0))
+                    / (edge.n as f32 + k_pseudo)
+            } else if edge.n > 0 {
                 edge.w[mover] / edge.n as f32
             } else {
-                fpu
+                fpu + edge.q0
             };
             let u = c * edge.prior * sqrt_total / (1.0 + edge.n as f32);
             let score = q + u;
@@ -1171,6 +1770,11 @@ impl<E: Evaluator> Mcts<E> {
             node.edges[..node.active].iter().map(|e| e.n as f32).collect()
         };
         if tau <= 1e-3 {
+            if self.cfg.root_pick == RootPick::Value {
+                if let Some(i) = self.best_by_value(idx) {
+                    return i;
+                }
+            }
             return counts
                 .iter()
                 .enumerate()
@@ -1191,6 +1795,24 @@ impl<E: Evaluator> Mcts<E> {
             }
         }
         weights.len() - 1
+    }
+
+    /// The best-valued open edge, or `None` if nothing cleared the visit floor
+    /// and the caller should fall back to visits.
+    fn best_by_value(&self, idx: u32) -> Option<usize> {
+        let node = &self.nodes[idx as usize];
+        let mover = node.mover;
+        let open = &node.edges[..node.active];
+        let total: u32 = open.iter().map(|e| e.n).sum();
+        let floor = (total / 100).max(1);
+        open.iter()
+            .enumerate()
+            .filter(|(_, e)| e.n >= floor)
+            .max_by(|a, b| {
+                let q = |e: &Edge| e.w[mover] / e.n as f32;
+                q(a.1).total_cmp(&q(b.1))
+            })
+            .map(|(i, _)| i)
     }
 
     // ---- expansion ------------------------------------------------------
@@ -1329,7 +1951,7 @@ impl<E: Evaluator> Mcts<E> {
             // Collapsed: one edge means no decision, so no evaluation. The
             // descent walks straight through and the network call is saved.
             let step = steps.into_iter().next().unwrap();
-            (vec![new_edge(step, 1.0)], None)
+            (vec![new_edge(step, 1.0, 0.0)], None)
         } else {
             // Hand over the edges, not just a count. Passing a count forced
             // the evaluator to re-derive the list from the engine and match it
@@ -1354,11 +1976,17 @@ impl<E: Evaluator> Mcts<E> {
             // -- 34.1 us against 53.3 at the wide nodes, for the same top 32.
             let (steps, from_eval) =
                 self.select_edges(&state, phase, turn, steps, eval.priors);
-            let priors = self.priors_for(&state, phase, turn, done, &steps, from_eval);
+            let (priors, q0) = self.priors_for(&state, phase, turn, done, &steps, from_eval);
             let mut edges: Vec<Edge> = steps
                 .into_iter()
                 .enumerate()
-                .map(|(i, step)| new_edge(step, priors.get(i).copied().unwrap_or(0.0)))
+                .map(|(i, step)| {
+                    new_edge(
+                        step,
+                        priors.get(i).copied().unwrap_or(0.0),
+                        q0.get(i).copied().unwrap_or(0.0),
+                    )
+                })
                 .collect();
 
             // Only a node wide enough to have been selected gets reordered;
@@ -1521,13 +2149,32 @@ impl<E: Evaluator> Mcts<E> {
         done: u8,
         steps: &[Step],
         from_eval: Vec<f32>,
-    ) -> Vec<f32> {
+    ) -> (Vec<f32>, Vec<f32>) {
         let mover = phase.mover(turn);
-        let mut p = match self.cfg.priors {
-            Priors::OnePly if steps.len() >= self.cfg.prior_min_edges => {
-                self.one_ply(state, phase, turn, done, steps, mover)
-            }
-            _ => from_eval,
+        let wide = steps.len() >= self.cfg.prior_min_edges;
+        let is_take = matches!(phase, Phase::Take { .. });
+        // The raw one-ply scores, in `heuristic` points, before the softmax
+        // collapses them. Empty means "no scores here": the evaluator's own
+        // prior, or a node too narrow to probe.
+        let raw: Vec<f32> = match self.cfg.priors {
+            _ if !wide => Vec::new(),
+            Priors::OnePly => self.one_ply(state, phase, turn, done, steps, mover),
+            Priors::Gradient => self.grad_scores(state, steps, mover),
+            // `Gradient::step` prices a `Choice` and nothing else, so on any
+            // other phase the gradient softmax is uniform and the one-ply probe
+            // is the only one of the two that says anything.
+            Priors::Mixed if is_take => self.grad_scores(state, steps, mover),
+            Priors::Mixed => self.one_ply(state, phase, turn, done, steps, mover),
+            Priors::Evaluator => Vec::new(),
+        };
+        let q0 = self.q_init_from(&raw);
+        let mut p = if raw.is_empty() {
+            from_eval
+        } else {
+            let mut p = raw;
+            let best = p.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            self.softmax(&mut p, best);
+            p
         };
         if let Some(bias) = self.bias.clone() {
             self.scratch.clear();
@@ -1541,7 +2188,24 @@ impl<E: Evaluator> Mcts<E> {
                 *x *= w.max(0.0);
             }
         }
-        p
+        (p, q0)
+    }
+
+    /// The unvisited-edge Q offset for each edge, from the raw one-ply scores.
+    ///
+    /// Centred on the sibling mean rather than the max: FPU already decides how
+    /// pessimistic an unvisited edge is in absolute terms, and this only has to
+    /// say which of them is better than which. Squashed through
+    /// `HeuristicEvaluator`'s own `tanh(pts / 25)` so the offset is on the same
+    /// scale as the Q it is added to, and bounded by `q_init` however wild the
+    /// point spread gets.
+    fn q_init_from(&self, raw: &[f32]) -> Vec<f32> {
+        let k = self.cfg.q_init;
+        if k == 0.0 || raw.is_empty() {
+            return Vec::new();
+        }
+        let mean = raw.iter().sum::<f32>() / raw.len() as f32;
+        raw.iter().map(|h| k * ((h - mean) / 25.0).tanh()).collect()
     }
 
     /// One `apply_step` and one `eval::heuristic` per edge, softmaxed at
@@ -1562,7 +2226,6 @@ impl<E: Evaluator> Mcts<E> {
         mover: PlayerId,
     ) -> Vec<f32> {
         let mut out: Vec<f32> = Vec::with_capacity(steps.len());
-        let mut best = f32::NEG_INFINITY;
         for step in steps {
             let mut next = *state;
             let _ = tree::apply_step(&mut next, phase, turn, done, step);
@@ -1570,14 +2233,33 @@ impl<E: Evaluator> Mcts<E> {
             // node differ almost only in what the mover did, so the
             // best-opponent term is common to them and subtracting it would
             // cost three more `heuristic` calls an edge to change nothing.
-            let s = crate::eval::heuristic(&next, mover);
-            if s > best {
-                best = s;
-            }
-            out.push(s);
+            out.push(if self.cfg.prior_margin {
+                crate::eval::margin(&next, mover)
+            } else {
+                crate::eval::heuristic(&next, mover)
+            });
         }
-        // Shifted by the max before exponentiating: `heuristic` runs to ~200
-        // points late in a game and `exp(200/4)` is not a number.
+        out
+    }
+
+    /// [`Gradient`]'s price list as a prior: one dot product per edge instead of
+    /// an `apply_step` and a `heuristic` call.
+    ///
+    /// 16 ns an edge against the one-ply probe's 123 (see [`Gradient`]), and the
+    /// probe itself is amortised — `gradient` builds one price list per mover
+    /// per sub-decision and caches it. The scores are in the same `heuristic`
+    /// points [`one_ply`](Mcts::one_ply) returns, so `prior_temp` carries over
+    /// unchanged as a *unit*; the spread does not, so it does not carry over as
+    /// a *value*.
+    fn grad_scores(&mut self, state: &GameState, steps: &[Step], mover: PlayerId) -> Vec<f32> {
+        let g = self.gradient(state, mover);
+        steps.iter().map(|s| g.step(s)).collect()
+    }
+
+    /// Softmax in place at `prior_temp`, shifted by `best` before exponentiating:
+    /// `heuristic` runs to ~200 points late in a game and `exp(200/4)` is not a
+    /// number.
+    fn softmax(&self, out: &mut [f32], best: f32) {
         let t = self.cfg.prior_temp.max(1e-3);
         let mut sum = 0.0;
         for x in out.iter_mut() {
@@ -1589,7 +2271,6 @@ impl<E: Evaluator> Mcts<E> {
                 *x /= sum;
             }
         }
-        out
     }
 
     /// §3.7: noise on every node of the root player's turn, not only the literal
@@ -1795,10 +2476,11 @@ fn add(acc: &mut [f32; N_PLAYERS], v: &[f32; N_PLAYERS]) {
     }
 }
 
-fn new_edge(step: Step, prior: f32) -> Edge {
+fn new_edge(step: Step, prior: f32, q0: f32) -> Edge {
     Edge {
         step,
         prior,
+        q0,
         child: None,
         n: 0,
         w: [0.0; N_PLAYERS],
