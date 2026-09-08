@@ -57,7 +57,20 @@ Updated whenever something beats it. Always give the spec, not a description.
 | when | spec | beats | by |
 | --- | --- | --- | --- |
 | start | `mcts:2048:heuristic:quality` | `mcts:2048` (old defaults) | +8.84 [+7.24, +10.44], 202 blk |
-| 00:10 | `mcts:2048` — quality prior is now the *default*, `41e9d70` | `heuristic:full` | see below |
+| 00:25 | **`mcts:2048`** — quality prior shipped as the default in `41e9d70`, so the bare spec *is* the champion | `heuristic:full` | **+11.12** [+8.88, +13.36], 100 blk, win 0.403 |
+
+### The prior is worth more than everything else measured so far
+
+Same race, same 100 blocks, same baseline — only the prior differs:
+
+| MCTS prior | vs `heuristic:full` | 95% CI | win rate (null 0.250) |
+| --- | --- | --- | --- |
+| uniform (the old default) | +4.15 | [+2.22, +6.08] | 0.279 |
+| one-ply at `prior_temp = 1` | **+11.12** | [+8.88, +13.36] | **0.403** |
+
+Nearly tripling the margin over greedy, from one default. It also corroborates
+the +8.84 measured internally against a different baseline, by a different
+route, which is the kind of agreement worth more than either number alone.
 
 ## Known, measured, not yet landed
 
