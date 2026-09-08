@@ -677,8 +677,8 @@ const GEAR_SCALE: [f32; 5] = [1.5, 1.0, 1.0, 1.0, 0.7];
 /// jagged, because a gate's effect is discontinuous in how often it flips a
 /// max-over-the-gear comparison, and off a cliff by 0.5. `mcts:256` is monotone
 /// *increasing* over the same range (+0.06 / +0.33 / +1.02 / +1.06), and
-/// `mcts:1024:cp=0.05`, the deep search, reads **+1.62 [+0.66, +2.59] at 0.20**
-/// where `mcts:256` reads +0.06. 0.25 is the largest value that is positive on
+/// `mcts:1024:cp=0.05`, the deep search, reads **+0.70 [+0.21, +1.19] at 0.20**
+/// where `mcts:256` reads +0.14. 0.25 is the largest value that is positive on
 /// every agent measured; past 0.33 the one-ply agent that every screening
 /// measurement in this file uses loses two points, and an evaluator nobody can
 /// screen against is not worth the extra tenth.

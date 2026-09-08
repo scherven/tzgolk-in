@@ -2273,12 +2273,13 @@ over 60,432 pairs), candidate = the committed evaluator, `--base 'pal=1,chi=1'`,
 | --- | --- | --- | --- |
 | `greedy:64` | 800 | **+1.04** [+0.79, +1.30] * | 0.278 |
 | `mcts:256` | 400 | **+0.86** [+0.55, +1.17] * | 0.274 |
-| `mcts:1024:cp=0.05` | 77 | **+1.09** [+0.23, +1.95] * | 0.264 |
-| `greedy:full` | (in flight) | | |
+| `mcts:1024:cp=0.05` | 250 | **+0.67** [+0.21, +1.12] * | 0.268 |
+| `greedy:full` | 200 | **+1.57** [+1.06, +2.08] * | 0.307 |
 
-The deep row is the one that matters and it is the largest of the three: the
-landing is **not** smaller for a search that descends several turns instead of
-one, which is the opposite of what `board_position` knobs usually do here.
+All four distinguishable from zero. The deep row is the smallest, and the
+77-block reading of it was +1.09 — **that early number was noise around a real
++0.67**, recorded here because it was quoted in this file before the run
+finished and the correction is the point: at 77 blocks the interval was ±0.86.
 
 Greedy reads the effect 1.2x MCTS's size, against 1.9x for F24 and 2.6x for
 F15 — the tightest ratio this file has recorded, which is what you expect of a
@@ -2485,13 +2486,18 @@ Swept further, and on **both** agents this time — F29a's whole lesson — in
 The re-sweep on the `GEAR_SCALE` base, all against the landed evaluator:
 
 ```
-  pneed            0.10    0.20    0.25    0.33    0.50    1.00
-  greedy:64       +0.19*  +1.73*  +1.06*  +1.31*  -1.90*  -16.01*
-  mcts:256          --    +0.06   --      +0.33*  +1.02*   +1.06*
-  mcts:1024 cp.05   --    +1.99*  --       --      --       --
+  pneed            0.10    0.20    0.25    0.33    0.40    0.50    1.00
+  greedy:64       +0.19*  +1.73*  +1.32*  +1.31*  +1.28*  -1.90*  -15.99*
+  mcts:256          --    +0.14   --      +0.33*   --     +0.72*   +1.06*
+  mcts:1024 cp.05   --    +0.70*  --       --      --      --       --
 
-  blocks: greedy 800 except 0.25 (455); mcts:256 85/400/212/400; deep 39
+  greedy 800 blocks a cell; mcts:256 400/400/400/400; deep 186
 ```
+
+At 800 blocks a cell the greedy curve is **not** the spike it looked like at
+455: 0.25, 0.33 and 0.40 are a **plateau at +1.3** with 0.20 a little above it
+and a cliff between 0.40 and 0.50. `mcts:256` is monotone increasing across the
+whole of it and does not clear zero until 0.33.
 
 Three things at once. The greedy curve is **jagged** rather than smooth —
 +1.73 at 0.20 against +1.06 at 0.25 and +1.31 at 0.33, on 800/455/800 blocks
@@ -2562,7 +2568,7 @@ Measured against the evaluator it replaces, `<scratch>/f3/ab/q2_land_*`
 | agent | blocks | centred | win (null 0.250) |
 | --- | --- | --- | --- |
 | `greedy:64` | 800 | **+2.48** [+2.20, +2.76] * | 0.323 |
-| `mcts:256` | 223 | **+1.37** [+0.90, +1.85] * | 0.291 |
+| `mcts:256` | 400 | **+1.50** [+1.14, +1.85] * | 0.290 |
 | `mcts:1024:cp=0.05` | (in flight) | | |
 | `greedy:full` | (in flight) | | |
 
@@ -2600,7 +2606,108 @@ the analysis is `python3 <scratch>/an.py '<pattern>'` from `<scratch>/f3/ab`:
 What the deep tier has said so far, all against the pre-F28 evaluator on
 `mcts:1024:cp=0.05` with a +0.00 null at 250 blocks: the F28 landing **+1.09
 [+0.23, +1.95] *** at 77 blocks (larger than its `mcts:256` +0.86), and
-`pneed = 0.20` **+1.62 [+0.66, +2.59] *** at 50 blocks where `mcts:256` reads
-+0.06. Both point the same way: **the corrections this run made are worth more
-to a search that looks ahead than to one that does not**, which is the opposite
-of the `board_position` knobs the same run killed.
+`pneed = 0.20` **+0.70 [+0.21, +1.19] *** at 186 blocks where `mcts:256` reads
++0.14 [-0.07, +0.36] at 400. So the deep search does want the hungry-corn gate
+about five times as much as the shallow one, but the +1.62 that reading showed
+at 50 blocks was noise around +0.70 — see F30b.
+
+### F30b. Corrections to numbers quoted early in this file
+
+Three readings above were written down before their runs finished and moved
+when they did. Recorded rather than silently edited, because the sizes are the
+argument for the block counts this file insists on:
+
+| quantity | early | final |
+| --- | --- | --- |
+| F28 landing, `mcts:1024:cp=0.05` | +1.09 at 77 blk | **+0.67** [+0.21, +1.12] * at 250 |
+| F30 landing, `mcts:256` | +2.15 at 53 blk | **+1.50** [+1.14, +1.85] * at 400 |
+| `pneed` greedy curve | a spike at 0.20 (455 blk at 0.25) | a **plateau** over 0.25..0.40 (800 blk a cell) |
+
+None of them changes a sign or a decision. All three shrink toward the mean,
+which is what a number quoted at a third of its planned block count does.
+`board=0.65` did the same: +1.36 at 251 blocks, **+1.06 [+0.72, +1.40] *** at
+400. `TEMPLE_SCALE = 1.6` on the new table is **−0.57 [−0.84, −0.29] *** at 388
+blocks, so 1.4 survives the re-shaping in that direction too.
+
+### F30c. `HUNGRY_CORN` stays at 0.25, checked against the landed evaluator
+
+The greedy plateau (F29d, corrected) runs 0.25..0.40 and `mcts:256` prefers the
+top of it, so 0.33 was worth asking about — but only against the evaluator that
+actually shipped, which now also has `BOARD_SCALE = 0.65`. Measured directly:
+`pneed = 0.33` against the landed 0.25 reads **−0.49 [−0.81, −0.16] * on
+`greedy:64`** at 344 blocks — distinguishably *worse*, not merely no better. The
+`board` re-fit absorbed whatever the extra 0.08 was buying, which is the third
+time in this section that two knobs on the same term turned out not to be
+separable. **0.25 stands.**
+
+### F30d. Final state, 06:18
+
+`src/eval.rs` carries, in addition to everything F24 left:
+
+```
+  GEAR_SCALE  = [1.5, 1.0, 1.0, 1.0, 0.7]
+  HUNGRY_CORN = 0.25
+  BOARD_SCALE = 0.5 -> 0.65
+```
+
+`cargo test --release` **180 passed, 0 failed, 7 ignored**. `bin/evalab`'s
+`v::HEAD` tracks it, `--eqcheck` **0e0 over 60,672 pairs**, pinned as
+`<scratch>/f3/evalab-p22` with its rev beside it. Against the evaluator this
+session started from (`--base 'pal=1,chi=1,pneed=0,board=0.5'`, which is F24's):
+
+| step | agent | blocks | centred |
+| --- | --- | --- | --- |
+| `GEAR_SCALE` alone | greedy:64 | 800 | +1.04 [+0.79, +1.30] * |
+| | mcts:256 | 400 | +0.86 [+0.55, +1.17] * |
+| | mcts:1024:cp=0.05 | 250 | +0.67 [+0.21, +1.12] * |
+| | greedy:full | 200 | +1.57 [+1.06, +2.08] * |
+| `+ HUNGRY_CORN + BOARD_SCALE` | greedy:64 | 800 | **+2.48** [+2.20, +2.76] * |
+| | mcts:256 | 400 | **+1.50** [+1.14, +1.85] * |
+| | mcts:1024:cp=0.05 | 48 | +1.66 [+0.54, +2.78] * (running to 250) |
+
+so about **+2.4 on `mcts:256`** for the session, against F24's own +2.16 and the
+term re-pricing's +7.63 — a smaller landing than either, on an evaluator that
+has now had three of them.
+
+Still running and worth reading when they finish, all in `<scratch>/f3/ab/`:
+`q3_run_*` (the three tiers of the above in one run), `m2_*_mcts1024cp005`
+(nine variants deep, the brief's question (b) at full block count), `m3_f24_*`
+(F24 at depth), `pd_*` (`pneed`/`board` deep), `t_chisub*` (the shift form of
+the Chichen correction). Every one of them is `--resume`-able.
+
+### F30e. Late 400-block numbers, including one more correction
+
+Everything below finished after F30d was written.
+
+| variant | agent | blocks | centred |
+| --- | --- | --- | --- |
+| `pneed=0.20` | **mcts:1024:cp=0.05** | 186 | **+0.70** [+0.21, +1.19] * |
+| `pneed=0.20` | mcts:256 | 400 | +0.14 [−0.07, +0.36] |
+| `pneed=1.0` | mcts:256 | 400 | +1.06 [+0.70, +1.42] * |
+| `pneed=1.0`, seed 4M | mcts:256 | 400 | +1.16 [+0.81, +1.51] * |
+| `pneed=0.5` | mcts:256 | 400 | +0.66 [+0.39, +0.93] * |
+| `board=0.55` | mcts:256 | 400 | +0.56 [+0.29, +0.82] * |
+| `board=0.55`, seed 4M | mcts:256 | 400 | +0.41 [+0.14, +0.68] * |
+| `board=0.65` | mcts:256 | 400 | +1.06 [+0.72, +1.40] * |
+| `temple=1.2` | mcts:256 | 97 | −0.19 [−0.77, +0.40] |
+| `temple=1.6` | mcts:256 | 400 | −0.54 [−0.81, −0.27] * |
+| **`monu=0`** (delete `monument_outlook`) | mcts:256 | 400 | **+0.19** [−0.01, +0.39] |
+
+**The third correction of the run, and it is the one I got most wrong**:
+`pneed = 0.20` on the deep search read +1.99 at 39 blocks and +1.62 at 50, and
+settles at **+0.70** at 186. The qualitative claim survives — the deep search
+wants the hungry-corn gate about five times as much as `mcts:256` does — but
+"the corrections this run made are worth *more* to a deeper search" was written
+off a 50-block reading and is not what the finished runs say: the `GEAR_SCALE`
+landing is +0.86 at `mcts:256` and **+0.67** deep. Read F30b and this row
+together as one lesson about quoting a deep-tier number before ~150 blocks: the
+deep agent's per-block variance is roughly twice `mcts:256`'s, so the block
+count at which a number stops moving is *higher*, not lower, exactly where each
+block is most expensive.
+
+**`monument_outlook` can be deleted for +0.19 [−0.01, +0.39] on `mcts:256`** at
+400 blocks — the sixth statement that it does nothing, and the first on the
+search at a serious block count. Its mean magnitude is 0.159 points (F28d). It
+is not landed here only because deleting a term is a structural change and this
+run has already spent its risk budget on one retraction; it is the cheapest
+simplification available to the next measurer, and the number to beat is zero.
