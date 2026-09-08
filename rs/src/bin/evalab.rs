@@ -90,6 +90,13 @@ pub mod v {
         /// ungated number at every space. Isolates what the gates are worth
         /// from what the numbers are worth.
         TableFlat,
+        /// The hand table with **only the deferred-payoff spaces** repriced to
+        /// what the derived table says they are worth: Tikal 1 and 3
+        /// (research), Tikal 5 (two temple steps) and Uxmal 1 (corn to a temple
+        /// step). Every other space keeps its hand price. If the derived
+        /// table's regression is about *shape* rather than gating or scale,
+        /// this alone reproduces most of it.
+        TableDefer,
         /// The corpus mean of `Space::Derived`, frozen into a constant table.
         /// The derived table's *shape and scale* at the hand table's cost, so
         /// the comparison can be run at MCTS scale at all — `Derived` itself
@@ -147,6 +154,15 @@ pub mod v {
         /// Rounds of tempo an in-hand worker is charged for not being on the
         /// board yet, when `hand_worker` is on.
         pub hand_lag: f32,
+        /// Post-multipliers on the `Components` terms, applied where
+        /// `plan::Schedule` applies its weights, so "this term is over-priced
+        /// by k" is a single number rather than a rewrite of the term.
+        pub board_scale: f32,
+        pub engine_scale: f32,
+        pub temple_scale: f32,
+        pub held_scale: f32,
+        pub monument_scale: f32,
+        pub starve_scale: f32,
         /// The three gates the hand table is missing: a Palenque space whose
         /// tiles are gone, a research space with no blocks to pay the advance,
         /// and the corn exchange with nothing to trade.
@@ -167,6 +183,12 @@ pub mod v {
         contend_monument: false,
         charge_placed: false,
         hand_lag: 1.0,
+        board_scale: 1.0,
+        engine_scale: 1.0,
+        temple_scale: 1.0,
+        held_scale: 1.0,
+        monument_scale: 1.0,
+        starve_scale: 1.0,
         gates: false,
     };
 
@@ -220,12 +242,12 @@ pub mod v {
         c.liquidation = liquidation(g, p);
         let rounds_left = (LAST_DAY.saturating_sub(g.day)) as f32;
         let horizon = rounds_left / LAST_DAY as f32;
-        c.held = held_premium(vr, g, p, rounds_left);
-        c.temple = temple_outlook(vr, g, p);
-        c.engine = engine_value(vr, g, p, rounds_left, horizon);
-        c.board = board_position(vr, g, p, rounds_left);
-        c.monument = monument_outlook(vr, g, p, horizon);
-        c.starvation = starvation_risk(g, p);
+        c.held = held_premium(vr, g, p, rounds_left) * vr.held_scale;
+        c.temple = temple_outlook(vr, g, p) * vr.temple_scale;
+        c.engine = engine_value(vr, g, p, rounds_left, horizon) * vr.engine_scale;
+        c.board = board_position(vr, g, p, rounds_left) * vr.board_scale;
+        c.monument = monument_outlook(vr, g, p, horizon) * vr.monument_scale;
+        c.starvation = starvation_risk(g, p) * vr.starve_scale;
         c
     }
 
@@ -481,7 +503,12 @@ pub mod v {
             return 0.0;
         }
         let price = match vr.space {
-            Space::Table => Pricer::None,
+            // The tabulated variants never consult a `Pricer`, and building one
+            // eagerly would put `derived_price`'s cost on every call for
+            // nothing.
+            Space::Table | Space::TableFlat | Space::TableDefer | Space::DerivedStatic => {
+                Pricer::None
+            }
             Space::Probed => Pricer::Probe(tzolkin::mcts::Gradient::new(g, p)),
             _ => Pricer::List(derived_price(g, p)),
         };
@@ -627,6 +654,15 @@ pub mod v {
             (Space::DerivedStatic, _) => {
                 DERIVED_STATIC[gear as usize][(pos as usize).min(10)] * vr.space_scale
             }
+            // The four spaces whose payoff is entirely deferred, at the
+            // derived table's conditional mean for them (`--spacetab`).
+            (Space::TableDefer, _) => match (gear, pos) {
+                (Gear::Tikal, 1) => 0.08,
+                (Gear::Tikal, 3) => 0.23,
+                (Gear::Tikal, 5) => 2.27,
+                (Gear::Uxmal, 1) => 0.91,
+                _ => table_space_value(g, p, gear, pos),
+            },
             (Space::Table, _) | (_, Pricer::None) => {
                 let base = table_space_value(g, p, gear, pos);
                 if vr.gates {
@@ -982,6 +1018,7 @@ fn variant(name: &str) -> Option<v::V> {
         "derived" => v::V { space: Space::Derived, ..h },
         "derived-probed" => v::V { space: Space::Probed, ..h },
         "flat" => v::V { space: Space::TableFlat, ..h },
+        "defer" => v::V { space: Space::TableDefer, ..h },
         "derived-static" => v::V { space: Space::DerivedStatic, ..h },
         "derived-static-scaled" => v::V { space: Space::DerivedStatic, space_scale: 0.62, ..h },
         "charge" => v::V { charge_placed: true, ..h },
@@ -1027,6 +1064,12 @@ fn variant(name: &str) -> Option<v::V> {
                             "bv" => out.building_value = f,
                             "scale" => out.space_scale = f,
                             "lag" => out.hand_lag = f,
+                            "board" => out.board_scale = f,
+                            "engine" => out.engine_scale = f,
+                            "temple" => out.temple_scale = f,
+                            "held" => out.held_scale = f,
+                            "monu" => out.monument_scale = f,
+                            "starve" => out.starve_scale = f,
                             _ => return None,
                         }
                     }
@@ -1323,6 +1366,102 @@ fn cmd_spacetab(pos: &[(GameState, PlayerId)]) {
         100.0 * same as f64 / tot as f64,
         100.0 * same_static as f64 / tot as f64,
     );
+}
+
+
+/// The size of each term, and how each term moves *within* a turn.
+///
+/// `--midturn` says HEAD's estimate climbs +2.70 above the turn it will finish
+/// in by depth 5. This says which of the eight terms does the climbing, which
+/// is what turns "the evaluator drifts mid-turn" into a line to change.
+fn cmd_terms(pos: &[(GameState, PlayerId)], take: usize) {
+    use tzolkin::phase::Phase;
+    let names = v::Components::NAMES;
+
+    println!("\n-- term size over {} turn roots x 4 seats --", pos.len().min(take));
+    println!("{:>12} {:>9} {:>9} {:>9}", "term", "mean", "sd", "mean|x|");
+    let mut cols: Vec<Vec<f64>> = vec![Vec::new(); 8];
+    for (g, _) in pos.iter().take(take) {
+        for q in PlayerId::ALL {
+            let t = v::components(&v::HEAD, g, q).terms();
+            for i in 0..8 {
+                cols[i].push(t[i] as f64);
+            }
+        }
+    }
+    for i in 0..8 {
+        let n = cols[i].len() as f64;
+        let m = cols[i].iter().sum::<f64>() / n;
+        let sd = (cols[i].iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+        let ma = cols[i].iter().map(|x| x.abs()).sum::<f64>() / n;
+        println!("{:>12} {m:>9.3} {sd:>9.3} {ma:>9.3}", names[i]);
+    }
+
+    // The same greedy descent `--midturn` walks, but recording every term.
+    println!("\n-- term at depth k, less the same term of the completed turn --");
+    let rows: Vec<Vec<[f32; 8]>> = pos
+        .par_iter()
+        .take(take)
+        .filter_map(|(g0, p)| {
+            let mut g = *g0;
+            let mut ph = Phase::Beg;
+            let mut done = 0u8;
+            let mut out = vec![v::components(&v::HEAD, &g, *p).terms()];
+            for _ in 0..64 {
+                let steps = tzolkin::tree::legal_steps(&g, ph, *p, done);
+                if steps.is_empty() {
+                    return None;
+                }
+                let mut best = (f32::NEG_INFINITY, 0usize);
+                for (i, s) in steps.iter().enumerate() {
+                    let mut probe = g;
+                    tzolkin::tree::apply_step(&mut probe, ph, *p, done, s);
+                    let sc = v::heuristic(&v::HEAD, &probe, *p);
+                    if sc > best.0 {
+                        best = (sc, i);
+                    }
+                }
+                let mut next = g;
+                match tzolkin::tree::step_within_turn(&mut next, ph, *p, done, &steps[best.1]) {
+                    Some((p2, d2)) => {
+                        g = next;
+                        ph = p2;
+                        done = d2;
+                        out.push(v::components(&v::HEAD, &g, *p).terms());
+                    }
+                    None => {
+                        out.push(v::components(&v::HEAD, &next, *p).terms());
+                        return Some(out);
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+    print!("{:>6} {:>7}", "depth", "n");
+    for n in names {
+        print!(" {n:>9}");
+    }
+    println!(" {:>9}", "total");
+    let maxd = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    for d in 0..maxd.min(11) {
+        let sel: Vec<&Vec<[f32; 8]>> = rows.iter().filter(|r| r.len() > d + 1).collect();
+        if sel.len() < 20 {
+            continue;
+        }
+        print!("{d:>6} {:>7}", sel.len());
+        let mut tot = 0.0f64;
+        for i in 0..8 {
+            let m = sel
+                .iter()
+                .map(|r| (r[d][i] - r.last().unwrap()[i]) as f64)
+                .sum::<f64>()
+                / sel.len() as f64;
+            tot += m;
+            print!(" {m:>+9.3}");
+        }
+        println!(" {tot:>+9.3}");
+    }
 }
 
 // =======================================================================
@@ -1841,7 +1980,8 @@ fn main() {
     let has = |n: &str| argv.iter().any(|a| a == n);
 
     let n_pos: u64 = get("--corpus").and_then(|v| v.parse().ok()).unwrap_or(40);
-    let need_corpus = has("--eqcheck") || has("--cost") || has("--midturn") || has("--spacetab");
+    let need_corpus =
+        has("--eqcheck") || has("--cost") || has("--midturn") || has("--spacetab") || has("--terms");
     let pos = if need_corpus {
         let t = Instant::now();
         let c = corpus(n_pos, 8);
@@ -1863,6 +2003,10 @@ fn main() {
     }
     if has("--spacetab") {
         cmd_spacetab(&pos);
+    }
+    if has("--terms") {
+        let take: usize = get("--take").and_then(|v| v.parse().ok()).unwrap_or(4000);
+        cmd_terms(&pos, take);
     }
     if has("--midturn") {
         let budget: i64 = get("--budget").and_then(|v| v.parse().ok()).unwrap_or(60_000);
