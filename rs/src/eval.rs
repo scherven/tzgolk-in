@@ -123,14 +123,27 @@ const ACTION_VALUE: f32 = 0.2;
 /// the table is not answered by a 30% rise in its scale. What changed is the
 /// *shape*: Chichen's entries came down 30% and Palenque's went up 50%, and a
 /// term whose value is a max over a gear responds to the mix, not the mean.
-/// 0.65 rather than 0.70 because they are indistinguishable and 0.65 is the
-/// interior one. `docs/FINDINGS-eval.md` F5a, F7, F29c.
+/// **And it depends on how deep the search is.** On the two shallow agents 0.65
+/// is the optimum and 0.80 is free: `greedy:64` reads −0.03 [−0.44, +0.38] and
+/// `mcts:256` −0.03 [−0.39, +0.33] at 400 blocks each, with greedy falling to
+/// −0.96 * by 1.0. On `mcts:1024:cp=0.05` — the agent that descends about six
+/// turns rather than one — 0.80 is **+1.42 [+0.92, +1.93] * at 227 blocks**,
+/// win rate 0.317, and 0.90 is +2.45 [+1.74, +3.17] * at 122.
+///
+/// So this is not one optimum measured badly, it is a different optimum per
+/// depth, monotone in depth. `board_position` prices what is on the board
+/// *now*; a search that plays the ride out verifies it instead of taking it on
+/// trust, and can afford to hear it louder. 0.80 is taken because it costs
+/// nothing distinguishable on any agent and gains a point and a half on the one
+/// closest to the deliverable's `mcts:8192:heuristic:cp=0.02`; 0.90 looks better
+/// still on that agent and is left to whoever has its 250-block number.
+/// `docs/FINDINGS-eval.md` F5a, F7, F29c, F34, F35.
 ///
 /// Do **not** also subtract the placed worker from `engine_value`'s action
 /// count. That corrects the same double count a second time and measures
 /// −12.09 / −9.95 with a 0.028 win rate, the worst configuration in the log
 /// after ungating the space table entirely (F5b).
-const BOARD_SCALE: f32 = 0.65;
+const BOARD_SCALE: f32 = 0.8;
 
 /// [`temple_outlook`] is *under*-priced, which is the one thing nobody
 /// expected: scaling it alone is monotone improving from 0.5 to 1.4 on both

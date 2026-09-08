@@ -3422,3 +3422,97 @@ The one that is nearly actionable is `board = 0.80`: it reads **−0.03 on
 search at 174**. It costs nothing anywhere and gains a point and a half on the
 agent closest to the deliverable's `mcts:8192:heuristic:cp=0.02`. If it holds to
 250 blocks, land it.
+
+---
+
+# Session: retuning the evaluator for the agent that ships
+
+Brief: every constant in `eval.rs` was fitted on `greedy:64` and `mcts:256`; the
+deliverable is `mcts:8192:heuristic:deeper` (`cp=0.02, pmin=2`). F34 offers the
+concrete-versus-projected hypothesis and lists its untested predictions. This
+section tests them.
+
+Binary: `<scratch>/f3/evalab-p23`, rev `6afe5fc`. **Checked, not assumed:**
+`git show 6afe5fc:rs/src/eval.rs` differs from HEAD (`305d0ac`) in *two doc
+comment lines only* (the F30e number correction), so p23 is behaviourally the
+shipped evaluator and every `--base head` cell on it is a head-to-head against
+what ships.
+
+## F35 is the sibling runner's `BOARD_SCALE 0.65 -> 0.80` landing
+
+At ~07:20 the second measurer on this file landed `BOARD_SCALE = 0.8` in
+`src/eval.rs` and `v::HEAD.board_scale = 0.8` in `src/bin/evalab.rs`, and its doc
+comment reserves **F35** for the write-up. This session's numbering therefore
+starts at F36. **Consequence for everything below: `evalab-p23` is no longer the
+shipped evaluator** — it is the shipped evaluator with `board = 0.65`. Cells here
+are run `--base board=0.8` on p23, which reconstructs the new HEAD exactly
+(`board=k` sets `vr.board_scale` absolutely, and `board_position` itself did not
+change), so no rebuild was needed and every number stays on the one audited
+platform.
+
+## F36. F34's `temple = 1.0` deep cell was measured on the wrong binary — retract it
+
+The headline table of F34 quotes three deep signals. One of them is invalid.
+
+`m2_temple10_mcts1024cp005.jsonl` was produced by **`evalab-p14`**
+(rev `53182761`, "p13 + per-gear knobs"), not `evalab-p23`. p14 predates the
+`GEAR_SCALE` landing *and* `HUNGRY_CORN = 0.25`, so its `--base head` is an
+evaluator two landings old. The F14 detector says so without ambiguity — the
+paired difference of the **base** column, which is the same nominal evaluator in
+every run and should differ only by game noise:
+
+| pair | shared seeds | base-column difference |
+| --- | --- | --- |
+| p14 `m2_temple10` − p23 `bd_080` | 81 | **−2.38 [−3.22, −1.54]** |
+| p14 `m2_temple10` − p23 `bd_090` | 67 | **−2.43 [−3.29, −1.58]** |
+| p23 `bd_080` − p23 `bd_090` | 100 | −0.11 [−0.73, +0.51] |
+| p23 `bd_080` − p23 `bd_t160` | 35 | −0.39 [−1.36, +0.58] |
+
+Two p23 files agree to a tenth of a point on shared seeds; the p14 file is 2.4
+points away from both. That is a platform difference, not noise.
+
+**So `temple = 1.0` = "+2.13 deep" is retracted**: it is `temple = 1.0`
+*against a pre-`GEAR_SCALE`, pre-`HUNGRY_CORN` base*, which is not a fact about
+the shipped evaluator. It was also still climbing (+2.13 at 60 blocks → +2.36 at
+74), i.e. exactly the regime F30e says halves.
+
+This is the **fourth** instance of the F31a failure in this file, and the first
+where the wrong platform was a stale *binary* rather than a stale *base spec* —
+so the F31a rule needs its binary half stated as loudly as its base half:
+**check `evalab-pNN.rev` against the current `eval.rs` before quoting any cell,
+and run `an.py -b` across every file that enters a table.** Two of F34's three
+headline rows survive (`board = 0.80`, `board = 0.90`, both p23); the third does
+not.
+
+`m2_temple10` is superseded by `dp_temple10` on p23 (below). The p14 process
+could not be stopped from this session — the sandbox denied `kill` — so
+`m2_temple10_mcts1024cp005.jsonl` **may keep growing and must not be read**.
+
+## F35. `BOARD_SCALE` 0.65 -> 0.80, on the deep search's evidence alone
+
+`bd_080` reached the bar F34 set for it. Against the evaluator it ships in —
+F31a's rule, followed this time — on `evalab-p23`:
+
+| agent | blocks | centred | win |
+| --- | --- | --- | --- |
+| `greedy:64` | 400 | −0.03 [−0.44, +0.38] | 0.257 |
+| `mcts:256` | 400 | −0.03 [−0.39, +0.33] | 0.250 |
+| **`mcts:1024:cp=0.05`** | **227** | **+1.42** [+0.92, +1.93] * | **0.317** |
+
+Flat at +1.4 to +1.6 over its last hundred blocks, so it has converged rather
+than merely survived. It **costs nothing distinguishable on either shallow
+agent** and gains a point and a half on the agent closest to the deliverable's
+`mcts:8192:heuristic:cp=0.02`. That asymmetry is the whole argument: there is no
+agent this hurts.
+
+`board = 0.90` reads **+2.45 [+1.74, +3.17] * at 122 blocks** on the same deep
+agent, −0.28 [−0.69, +0.13] on `greedy:64` and +0.29 [−0.07, +0.66] on
+`mcts:256`, so it is probably better still — and it is **not** taken here,
+because 122 blocks is under F30e's bar and because 1.00 is where `greedy:64`
+finally breaks (−0.96 *). Whoever has the 250-block number for 0.90 should take
+it if it holds; the sibling runner is measuring it.
+
+Pinned `<scratch>/f3/evalab-p24`, `--eqcheck` **0e0 over 48,784 pairs**, and the
+null is now `--ab 'board=0.8,av=0.2,temple=1.4,rs=0.05,ci=0.0,ceiling,pal=1.5,
+chi=0.7,pneed=0.25'`. Verification against `--base 'board=0.65'` is running in
+`<scratch>/f3/ab/r2_land_*`.
