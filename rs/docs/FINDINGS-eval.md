@@ -2942,3 +2942,87 @@ remaining four deep cells (`temple=1.0/1.8`, `board=0.4/0.6`) were relaunched in
 `<scratch>/f3/wave51.log`. `--resume` plus one-writer-per-file is what made that
 recoverable rather than a lost afternoon; the `.claim` sentinel is what stops
 the relaunch from double-writing.
+
+### F33b. `TEMPO_PER_ROUND`'s peak has moved from 0.52 to ~0.60 on `greedy:64`
+
+The first scalp. `TEMPO_PER_ROUND` is the damping *inside* `board_position` —
+the per-space charge that stops a worker being priced at whatever the top of its
+gear pays. Its doc comment carries a 3,000-rotation-block sweep, unimodal, with
+a quadratic vertex at 0.512 — **taken against the frozen cbb61a2 evaluator with
+`heuristic:32`**, which is before the term re-pricing, before `RESEARCH_SCALE`,
+before `GEAR_SCALE` reshaped the table it damps, and before `BOARD_SCALE` went
+to 0.65. It has not been re-swept since. It is the single stalest constant in
+the file.
+
+Full curve, `greedy:64`, 400 blocks a cell, `--base head` on `evalab-p23`
+(`<scratch>/f3/ab/n_tempo*_greedy64.jsonl`, `k_tempo0*`):
+
+```
+  tempo    0.40    0.44    0.48   0.52    0.56    0.60    0.62    0.70    0.80
+  greedy  -1.52*  -1.40*  -0.74*  null   +0.41*  +0.83*  +0.70*  -0.92*  -2.74*
+```
+
+Unimodal, every cell outside 0.56..0.62 distinguishable from zero, and the
+committed 0.52 is **on the losing side of the peak**: 0.60 is **+0.83 [+0.45,
++1.21] \*** and 0.40 — a value a ±20% check either side of 0.52 would have
+reached — is −1.52. The curve is steep on both sides, which is why a
+2-point check at 0.42/0.62 in the old sweep found a peak at 0.52 and this one
+does not: the *table* under the damping is not the table it was swept on.
+
+**But the agents split.** `mcts:256` at 0.62 reads **−0.31 [−0.62, −0.01] \*** at
+400 blocks — the wrong sign, and outside its interval. 0.56 and 0.60 are running
+on `mcts:256` now; nothing lands on the greedy reading alone.
+
+---
+
+**Numbering note.** A second writer appended `## F32. The deep tier` and
+`### F32a. greedy:full reads the landing` to this file at 06:41-06:50, while
+this run was appending `F33`, `F33a` and `F33b` — so there are two `F32`
+sections and an `F32a` sitting inside `F33`. Nothing is lost and nothing is
+rewritten (append-only on both sides); the ordering is just interleaved. To
+avoid a third collision, **everything from this run below this line is numbered
+`F34`**, and `F33`/`F33a`/`F33b` above are the same run's.
+
+## F34. The F31a audit, results
+
+Everything below is `--base head` on `evalab-p23` — the **shipped** evaluator
+(`GEAR_SCALE = [1.5,1,1,1,0.7]`, `HUNGRY_CORN = 0.25`, `BOARD_SCALE = 0.65`),
+which is the only framing F32 lets a constant land on. Files
+`<scratch>/f3/ab/n_*`, driver `<scratch>/f4/drive.sh`.
+
+## F33. The session in one number
+
+Candidate = the committed evaluator, `--base 'pal=1,chi=1,pneed=0,board=0.5'`
+— which is exactly the evaluator F24 landed and this session started from.
+Binary `evalab-p23`, `<scratch>/f3/ab/q3_run_*`.
+
+| agent | blocks | centred | win (null 0.250) |
+| --- | --- | --- | --- |
+| `greedy:64` | 800 | **+3.23** [+2.92, +3.53] * | 0.340 |
+| `mcts:256` | 400 | **+1.89** [+1.48, +2.30] * | 0.303 |
+| `mcts:1024:cp=0.05` | (running) | | |
+
+**+1.89 on `mcts:256`** for the session, against F24's own +2.16 and the term
+re-pricing's +7.63. Three landings deep into this evaluator, each one is
+smaller than the last, which is what convergence looks like.
+
+### F33b. Two deep-tier readings that are *not* conclusions yet
+
+Both are under 80 blocks and F30e is the reason to say so out loud rather than
+quote them:
+
+* `board = 0.80` against the landed 0.65 reads **+1.92 [+1.05, +2.78] at 78
+  blocks on `mcts:1024:cp=0.05`**, where `greedy:64` and `mcts:256` both read
+  **−0.03 at 400 blocks**. If it survives to 250 blocks it is a genuine
+  agent-dependent optimum and F31a's "0.65 is at the optimum" needs qualifying
+  to "on the two shallow agents".
+* `TEMPLE_SCALE = 1.0` reads **+2.25 at 26 blocks** on the deep search, where
+  `mcts:256` reads +0.11 [−0.28, +0.50] at 400. That is the shape F28d predicted
+  — `temple_outlook` is 18.5 of a 33-point estimate and is the evaluator's
+  loudest claim about the *future*, so a search that can see six turns of that
+  future should want it quieter — but 26 blocks is an interval of ±1.6 and the
+  last three deep numbers this run quoted early all halved.
+
+Both are running to 250 blocks in `<scratch>/f3/ab/bd_080_mcts1024cp005.jsonl`
+and `m2_temple10_mcts1024cp005.jsonl`. **Do not act on either until they get
+there**; that is the whole content of F30e.
