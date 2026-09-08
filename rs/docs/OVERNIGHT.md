@@ -34,6 +34,18 @@ scratchpad is gone.
 * **User CPU, never wall clock**, for any cost claim: the same pair measured
   1.52x and 1.03x on consecutive wall-clock runs under load, while
   `/usr/bin/time` user CPU repeated to 3%.
+* **Measure from a private pinned copy of the binary, never `target/release/`.**
+  This is not a nicety. `cargo test` or a build by *any* other agent replaces
+  the shared binary underneath a running sweep and silently moves the platform
+  for both arms. It produced an impossible alternating pattern
+  (av 0.0 -> +7.5, 0.2 -> +14.4, 0.3 -> +7.2, 0.4 -> +14.0) and a conclusion
+  that had already reached a doc comment before it was caught and retracted
+  (`FINDINGS-eval.md` F13/F14). `cp target/release/arena <mine>/arena` first,
+  record the git rev beside it, and fingerprint the platform in the results so
+  a mixed run is detectable rather than merely wrong.
+* **One writer per output file.** Two runners appending to one JSONL produced
+  deterministic duplicate rows: the mean stayed right and the interval narrowed
+  by sqrt(2), which is the failure mode that looks like success (F6).
 * The block is the independent unit, not the game; null win rate is 25%; never
   call an effect smaller than its interval an improvement.
 
@@ -58,6 +70,7 @@ Updated whenever something beats it. Always give the spec, not a description.
 | --- | --- | --- | --- |
 | start | `mcts:2048:heuristic:quality` | `mcts:2048` (old defaults) | +8.84 [+7.24, +10.44], 202 blk |
 | 00:25 | **`mcts:2048`** — quality prior shipped as the default in `41e9d70`, so the bare spec *is* the champion | `heuristic:full` | **+11.12** [+8.88, +13.36], 100 blk, win 0.403 |
+| 01:10 | same spec, but `94d85f3` re-priced the evaluator under *both* sides (+21.09 greedy / +7.63 mcts:1024 against the evaluator it replaced) | — | **the +11.12 is now stale; re-race before the deliverable** |
 
 ### The prior is worth more than everything else measured so far
 
@@ -87,6 +100,20 @@ route, which is the kind of agreement worth more than either number alone.
   runtime. Biggest throughput lever; no owner.
 * `docs/TRAINING.md:552-554` describes truncation behaviour that is now wrong
   twice over.
+
+## Coupling worth knowing
+
+`src/mcts.rs:1573` calls `eval::heuristic` **directly** to order edges, so the
+evaluator is not only MCTS's leaf value -- it is also its prior. An `eval.rs`
+change therefore moves MCTS on two axes at once, and any measurement of one
+that rebuilds the binary is measuring the other too.
+
+`plan::PlanEvaluator::raw` weights `eval::components`, so the evaluator
+rescales compose *multiplicatively* with its fit. After `94d85f3` its board
+weight is effectively shrunk ~4x, past the far edge of the measured plateau.
+**`plan.rs` needs refitting before its numbers mean anything again**, and F8
+makes the falsifiable prediction that its refitted temple weight comes back
+positive.
 
 ## Open
 
