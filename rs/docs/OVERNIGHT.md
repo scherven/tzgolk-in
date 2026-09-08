@@ -56,7 +56,8 @@ Updated whenever something beats it. Always give the spec, not a description.
 
 | when | spec | beats | by |
 | --- | --- | --- | --- |
-| start | `mcts:2048:heuristic:quality` | `mcts:2048` | +8.84 [+7.24, +10.44], 202 blk |
+| start | `mcts:2048:heuristic:quality` | `mcts:2048` (old defaults) | +8.84 [+7.24, +10.44], 202 blk |
+| 00:10 | `mcts:2048` — quality prior is now the *default*, `41e9d70` | `heuristic:full` | see below |
 
 ## Known, measured, not yet landed
 
@@ -76,6 +77,9 @@ Updated whenever something beats it. Always give the spec, not a description.
 
 ## Open
 
-* Is MCTS actually stronger than `heuristic:full`? **Never measured directly.**
-  Race running at `<scratch>/vs_greedy/`.
+* ~~Is MCTS actually stronger than `heuristic:full`?~~ **Answered.** With the
+  *old* uniform-prior default, `mcts:2048` beats `heuristic:full` by **+4.15**
+  [+2.22, +6.08], 100 blocks, p < 0.0001, win rate 0.279 against a null of
+  0.250. Real but not a landslide -- and that is the version whose prior was
+  flat. The quality-prior rerun is at `<scratch>/vs_greedy/quality.jsonl`.
 * Is `temple_outlook` negative because of a weight or a bug?
