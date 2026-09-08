@@ -2864,3 +2864,81 @@ Two more from the same wave:
   [+0.18, +0.62] * and 2.0 reads +0.45 [+0.22, +0.69] * on `mcts:256` at 400
   blocks, against `chi = 0.7`'s +0.38. Indistinguishable from the multiplier, so
   the simpler form stays.
+
+## F33. The F31a audit: every constant that exists to cancel another, re-swept against the *shipped* evaluator
+
+F31a's rule stated mechanically — *before landing constant X, re-measure X
+against the exact evaluator it will ship in* — is a rule about the past as much
+as the future. Every constant in `src/eval.rs` was fitted against whatever
+`eval.rs` looked like on the day it was fitted, and four landings have moved the
+file since. This section re-sweeps, as **full curves against `--base head` on
+`evalab-p23`** (the shipped evaluator, `--eqcheck` 0e0), every constant whose
+doc comment justifies it as correcting, damping, offsetting or gating something
+else. Runs are in `<scratch>/f3/ab/n_*`, driver `<scratch>/f4/drive.sh`
+(one writer per file, `.nlock` dir per output).
+
+The audit list, with what each was last fitted against:
+
+| constant | knob | it exists to cancel | last fitted against |
+| --- | --- | --- | --- |
+| `ACTION_VALUE` 0.2 | `av` | `BOARD_SCALE`'s term already pays the placed worker's action | F7/F10 — `board=0.5`, no `GEAR_SCALE`, `rs=0.5`, `ci=1.9` |
+| `TEMPO_PER_ROUND` 0.52 | `tempo` | the max-over-the-gear in `board_position` | **cbb61a2**, `heuristic:32` — before every landing in this file |
+| `GEAR_SCALE[Pal]` 1.5 | `pal` | the corn gear's level | F26c/F27 — before `HUNGRY_CORN`, which multiplies the same gear again |
+| `GEAR_SCALE[Chi]` 0.7 | `chi` | Chichen's `dead` column | F26/F27 — before `board=0.65` |
+| `SKULL_PREMIUM` 2.2 | `sp` | — it is the *cause* of Chichen's `dead` column | never, since `chi` landed |
+| `TEMPLE_NEAR/FAR` 0.85/0.55 | `tnear`/`tfar` | confidence in a projected payout | before `TEMPLE_SCALE = 1.4`, which multiplies them to **1.19 / 0.77** |
+| `action_cap` 6.0 | `acap` | the live half of `ROUNDS_PER_ACTION` | never swept |
+| `TEMPLE_CLIMB` 0.10 | `climb` | "kept because the rule says so, not because it pays" | F18/F21a |
+| `RESEARCH_SCALE` 0.05 | `rs` + `tik1`/`tik` | the other half of `engine_value`'s over-pricing | F19b/F20 — before `GEAR_SCALE` |
+
+### F33a. A correction to the brief I was handed: `monu=0`'s +0.19 was against the old base
+
+The `mcts:256` reading of **+0.19 [−0.01, +0.39] at 400 blocks** for deleting
+`monument_outlook` (F30e) came from `<scratch>/f3/ab/zz_monu0_mcts256.jsonl`,
+which the `zz_` wave ran at 05:48-06:15 on **`evalab-p21`** — whose `v::HEAD`
+has `board_scale = 0.5` and `pal_need = 0.0`. It is an old-base number, exactly
+the class F31a and F32 are about, and it is the number that was quoted to me as
+the reason to land the deletion.
+
+Re-measured against the shipped evaluator (`evalab-p23`, `--base head`):
+
+| variant | agent | blocks | centred | win |
+| --- | --- | --- | --- | --- |
+| `monu=0` | greedy:64 | **800** | **+0.10** [−0.03, +0.23] | 0.255 |
+| `monu=0` | mcts:256 | (running) | | |
+
+So on the agent that has the number, the effect against the *shipped* evaluator
+is +0.10 with an interval that covers zero, not +0.19. The sign is the same and
+the size is smaller — which is what F32 predicts for any term measured against a
+field that weights it differently.
+
+### F32a. `greedy:full` reads the landing at 4.6 points, and a note on the wave
+
+`greedy:full` — one ply over *every* legal move rather than 64 samples — final
+at **200 blocks: +4.57 [+3.97, +5.16] *, win rate 0.426** against a null of
+0.250. Four times the `mcts:256` reading and two and a half times `greedy:64`'s.
+
+The ordering across the four agents is the cleanest statement in this file of
+what a space-table correction is *for*:
+
+```
+  greedy:full        +4.57    scores every completed turn, picks the best
+  greedy:64          +2.48    scores 64 of them
+  mcts:1024 cp=0.05  +1.78    descends ~6 turns and finds out
+  mcts:256           +1.50    descends ~1 turn
+```
+
+Monotone in how much of the answer the agent computes for itself. The evaluator
+matters most to the agent that does the least search — which is exactly why an
+`eval.rs` result screened only on greedy is not a result, and why the same
+result is still worth landing: `mcts:1024:cp=0.05` is the deliverable's agent
+and +1.78 [+1.31, +2.24] * is a real margin on it.
+
+**Wave hygiene note.** Two cells of the F32 wave (`m2_pc`, `m2_tempo` at depth)
+were killed at 59 and 5 blocks by one of this run's own `pkill` patterns — the
+hazard of managing eighteen concurrent runners by process name. Both were
+resumed from their partial JSONL onto a lock nothing else holds, and the
+remaining four deep cells (`temple=1.0/1.8`, `board=0.4/0.6`) were relaunched in
+`<scratch>/f3/wave51.log`. `--resume` plus one-writer-per-file is what made that
+recoverable rather than a lost afternoon; the `.claim` sentinel is what stops
+the relaunch from double-writing.

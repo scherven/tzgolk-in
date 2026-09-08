@@ -151,6 +151,20 @@ fix in phase E:
 * Scores run 55.7 then 5.5, 4.7 — a 10x gap to the runner-up. Worth checking
   the units are what the panel claims before the user reads them.
 
+## Freeze schedule — set 06:50
+
+The final numbers must be measured on the code that ships, so changes stop
+before the races that produce them.
+
+| time | gate |
+| --- | --- |
+| **13:30** | **feature freeze.** No further `eval.rs` / `mcts.rs` landings. Agents finish what is measuring and report. |
+| 13:30-15:30 | the headline races on the frozen build: champion vs `heuristic:full`, champion vs the old champion, and the ladder. One pinned binary, high block count. |
+| 15:30-17:50 | TUI, verification, write-up. Reserved; do not spend. |
+
+A landing after 13:30 invalidates every race started before it, and there is
+not time to re-run them.
+
 ## Coupling worth knowing
 
 `src/mcts.rs:1573` calls `eval::heuristic` **directly** to order edges, so the
