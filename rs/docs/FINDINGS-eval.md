@@ -2823,3 +2823,44 @@ constant is landed on the head-to-head against the evaluator it would replace,
 never on a subtraction between two runs against an older field.** The
 subtraction is what produced "a point and a half"; there is no point and a half.
 `BOARD_SCALE` stays at **0.65**.
+
+## F32. The deep tier, at full block count — question (b) answered
+
+`mcts:1024:cp=0.05`, **250 blocks (1,000 games) a cell**, the same variants and
+the same seeds already measured on `mcts:256`, null +0.00 exactly.
+
+| variant | greedy:64 | mcts:256 | **mcts:1024:cp=0.05** |
+| --- | --- | --- | --- |
+| `pal=1.5` | +0.64 [+0.42, +0.86] * | +0.11 [−0.09, +0.30] | +0.17 [−0.29, +0.64] |
+| `chi=0.7` | +0.36 [+0.15, +0.56] * | **+0.38** [+0.13, +0.64] * | **+0.06** [−0.38, +0.49] |
+| `pal=1.5,chi=0.7` | +1.04 * | +0.56 * | +0.79 [−0.27, +1.84] (49 blk) |
+| `GEAR_SCALE` (the landing) | +1.04 * | +0.86 * | **+0.67** [+0.21, +1.12] * |
+| the whole F30 landing | +2.48 * | +1.50 * | **+1.78** [+1.31, +2.24] * |
+
+**`chi = 0.7` is the one verdict that flips the *other* way.** It is the only
+gear knob that survived `mcts:256` and it is **+0.06 [−0.38, +0.49] on the deep
+search** — indistinguishable from nothing. The reading that follows from F27's
+own mechanism: Chichen's table entry is a price for an action the evaluator
+declines about half the time, and a search that descends six turns *plays that
+action out and finds out*, so it needs the table's opinion about it less than a
+search that descends one. The correction is real for a shallow search and
+inert for a deep one, and it costs nothing either way.
+
+The composite still clears zero comfortably at depth (+1.78 [+1.31, +2.24] *,
+win 0.319), so the landing as a whole is right on the agent the deliverable
+uses — it is the *attribution* between its three constants that depends on
+which agent you ask.
+
+Two more from the same wave:
+
+* **`greedy:full`, the exhaustive one-ply agent: the landing is +4.72 [+4.02,
+  +5.42] * at 146 blocks, win rate 0.429** against a null of 0.250 — by far its
+  largest reading on any agent. An agent that scores every legal completed turn
+  and picks the best is exactly the one that reads a space-table correction at
+  full size, which is the F27 story again from the other end.
+* **The *shift* form of the Chichen correction is not better than the scale.**
+  `chisub` subtracts a flat number of points from every Chichen entry instead of
+  multiplying, which is the shape the skull's cost argues for: 1.0 reads +0.40
+  [+0.18, +0.62] * and 2.0 reads +0.45 [+0.22, +0.69] * on `mcts:256` at 400
+  blocks, against `chi = 0.7`'s +0.38. Indistinguishable from the multiplier, so
+  the simpler form stays.
