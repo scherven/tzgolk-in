@@ -2711,3 +2711,39 @@ search at a serious block count. Its mean magnitude is 0.159 points (F28d). It
 is not landed here only because deleting a term is a structural change and this
 run has already spent its risk budget on one retraction; it is the cheapest
 simplification available to the next measurer, and the number to beat is zero.
+
+## F31. `BOARD_SCALE` has not turned over — the halving was never about the table
+
+The sweep continued past what F29c landed. 400 blocks a cell, both agents,
+against the evaluator **before** the board re-fit (`board = 0.5`):
+
+```
+  board     0.40    0.50    0.55    0.65    0.70    0.80
+  greedy:64   --     null     --    +1.72*  +2.35*  +2.68*
+  mcts:256  -0.99*   null   +0.56*  +1.06*  +1.46*  +2.17*
+```
+
+**Monotone increasing on both agents all the way to 0.8, and still climbing.**
+0.80 is +2.17 [+1.81, +2.53] * on `mcts:256` with a win rate of 0.316 — twice
+what the landed 0.65 buys, and this run landed 0.65 because the sweep had only
+reached 0.65 when the decision was made. **That is a point and a half left on
+the table**, and it is being swept out now against the *landed* evaluator in
+`<scratch>/f3/ab/bh_*` (0.8 / 0.9 / 1.0 / 1.2, greedy:64 and mcts:256) and
+`bd_*` (0.8 / 1.0, `mcts:1024:cp=0.05`).
+
+The mechanism, and why nobody should have been surprised: `BOARD_SCALE = 0.5`
+was **never a statement about the space table**. Its doc comment says so — it
+corrects a *double count*, because `board_position` prices the action a placed
+worker is about to take and `engine_value` was separately paying every unlocked
+worker `ACTION_VALUE` per `ROUNDS_PER_ACTION` rounds for the same action. F11
+then cut `ACTION_VALUE` from **1.2 to 0.2**, a factor of six, which removed
+almost all of the thing `BOARD_SCALE` was there to cancel — and nobody re-swept
+`BOARD_SCALE` afterwards. F22 checked 0.4 and 0.6 and found both worse, which
+looked like confirmation, but 0.6 is +0.34 and the curve does not turn until
+somewhere past 0.8; a two-point sweep either side of a constant cannot see a
+monotone climb.
+
+**The general rule this run keeps re-learning: when a constant exists to cancel
+another constant, moving either one invalidates the other, and a ±20% check
+around the old value will not tell you.** It cost F29a a retraction and it has
+now cost this landing a point and a half.
