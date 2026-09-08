@@ -204,19 +204,186 @@ fn main() {
                 })
                 .collect();
             let mut specs = specs;
+            let mut agree = vec![0usize; specs.len()];
+            let mut turns = 0usize;
             let mut rng = rand::rngs::StdRng::seed_from_u64(7);
             for _ in 0..3 {
                 for g in &ps {
+                    // Agreement with the *first* spec, on the same position.
+                    // A knob that changes no move cannot change a result, and
+                    // finding that out here costs seconds where the arena costs
+                    // an hour to say the same thing with an interval round zero.
+                    let mut played: Vec<Option<tzolkin::moves::Move>> = Vec::new();
                     for (_, inst, secs, n) in specs.iter_mut() {
                         let t = Instant::now();
-                        let _ = inst.play_turn(g, g.current, 0.0, &mut rng);
+                        let out = inst.play_turn(g, g.current, 0.0, &mut rng);
                         *secs += t.elapsed().as_secs_f64();
                         *n += 1;
+                        played.push(out.map(|o| o.mv));
                     }
+                    for i in 0..specs.len() {
+                        if played[i] == played[0] {
+                            agree[i] += 1;
+                        }
+                    }
+                    turns += 1;
                 }
             }
-            for (name, _, secs, n) in &specs {
-                println!("{name:<46} {:>8.2} ms/turn  ({n} turns)", secs * 1e3 / *n as f64);
+            let base = specs[0].2 / specs[0].3.max(1) as f64;
+            for (i, (name, _, secs, n)) in specs.iter().enumerate() {
+                let ms = secs * 1e3 / *n as f64;
+                println!(
+                    "{name:<46} {ms:>8.2} ms/turn  {:>5.2}x  agrees {:>5.1}%  ({n} turns)",
+                    ms / (base * 1e3),
+                    100.0 * agree[i] as f64 / turns.max(1) as f64,
+                );
+            }
+        }
+        "values" => {
+            // Is `phase::HeuristicEvaluator`'s points-to-value map — `tanh((h -
+            // mean) / 25)` — using its range, or is every leaf pinned at +/-1?
+            // A saturated value function cannot order two leaves, which would
+            // explain a search whose extra simulations change nothing.
+            let mut vals: Vec<f32> = Vec::new();
+            let mut dels: Vec<f32> = Vec::new();
+            for g in &ps {
+                let raw: Vec<f32> = PlayerId::ALL
+                    .iter()
+                    .map(|&q| tzolkin::eval::heuristic(g, q))
+                    .collect();
+                let mean = raw.iter().sum::<f32>() / raw.len() as f32;
+                for r in &raw {
+                    dels.push(r - mean);
+                    vals.push(((r - mean) / 25.0).tanh());
+                }
+            }
+            let q = |v: &mut Vec<f32>, f: f64| {
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[((v.len() - 1) as f64 * f) as usize]
+            };
+            let sat = vals.iter().filter(|v| v.abs() > 0.9).count();
+            let sat99 = vals.iter().filter(|v| v.abs() > 0.99).count();
+            let n = vals.len();
+            let mut d2 = dels.clone();
+            let mut v2 = vals.clone();
+            println!("{n} (position, player) leaf values from {} positions\n", ps.len());
+            println!(
+                "h - mean, points:  p05 {:+6.1}  p25 {:+6.1}  p50 {:+6.1}  p75 {:+6.1}  p95 {:+6.1}",
+                q(&mut d2, 0.05), q(&mut d2, 0.25), q(&mut d2, 0.50), q(&mut d2, 0.75), q(&mut d2, 0.95)
+            );
+            println!(
+                "tanh(d/25):        p05 {:+6.3}  p25 {:+6.3}  p50 {:+6.3}  p75 {:+6.3}  p95 {:+6.3}",
+                q(&mut v2, 0.05), q(&mut v2, 0.25), q(&mut v2, 0.50), q(&mut v2, 0.75), q(&mut v2, 0.95)
+            );
+            println!(
+                "|value| > 0.9 on {:.1}% of leaves, > 0.99 on {:.1}%",
+                100.0 * sat as f64 / n as f64,
+                100.0 * sat99 as f64 / n as f64
+            );
+        }
+        "budget" => {
+            // Why is strength flat in `sims`? The cheapest possible answer:
+            // ask whether the search is even changing its mind. Every rung is
+            // driven along the *top* rung's path, so all of them are choosing
+            // at identical nodes and "agreement" is a statement about the
+            // choice rather than about two games drifting apart.
+            //
+            //     SPROBE_GAMES=8 SPROBE_EVERY=5 sprobe budget 256 1024 4096 16384
+            use tzolkin::mcts::{Mcts, MctsConfig};
+            use tzolkin::phase::{HeuristicEvaluator, Phase};
+            let rungs: Vec<u32> = argv[2..].iter().filter_map(|v| v.parse().ok()).collect();
+            let rungs = if rungs.is_empty() { vec![256, 1024, 4096, 16384] } else { rungs };
+            // `SPROBE_CP` in thousandths, so the same table can be produced at
+            // a different exploration constant: the question this probe exists
+            // to answer is whether a budget buys depth, and `c_puct` is the
+            // other knob that moves it.
+            let cp = env("SPROBE_CP", 2000) as f32 / 1000.0;
+            // `c_puct` here is `init + ln((1 + N + base) / base)`, so `base`
+            // sets how much *more* exploring a node does once it is well
+            // visited. The root of a turn carries every simulation and a node
+            // eight levels down carries a handful, which is why a small `base`
+            // plus a small `init` is breadth at the root and exploitation
+            // below -- the shape this search actually wants.
+            let cpb = env("SPROBE_CPB", 19652) as f32;
+            let cfg = MctsConfig {
+                dirichlet_eps: 0.0,
+                temperature: 0.0,
+                c_puct_init: cp,
+                c_puct_base: cpb,
+                ..MctsConfig::default()
+            };
+            let c_at = |n: f32| cp + ((1.0 + n + cpb) / cpb).ln();
+            println!(
+                "c_puct_init = {cp}, base = {cpb}  ->  c(N=20) = {:.3}, c(N=200) = {:.3}, c(N=2048) = {:.3}",
+                c_at(20.0), c_at(200.0), c_at(2048.0)
+            );
+            let mut eng: Vec<Mcts<HeuristicEvaluator>> =
+                rungs.iter().map(|_| Mcts::new(HeuristicEvaluator, cfg)).collect();
+            let top = rungs.len() - 1;
+            let mut agree = vec![0usize; rungs.len()];
+            let mut conc = vec![0f64; rungs.len()];
+            let mut arena = vec![0f64; rungs.len()];
+            let mut secs = vec![0f64; rungs.len()];
+            let mut dmax = vec![0f64; rungs.len()];
+            let mut dmean = vec![0f64; rungs.len()];
+            let mut decisions = 0usize;
+            let want = env("SPROBE_NODES", 40).max(1);
+            let stride = (ps.len() / want).max(1);
+            for g in ps.iter().step_by(stride).take(want) {
+                let mut st = *g;
+                let mut at = (Phase::Beg, st.current, 0u8);
+                for _ in 0..32 {
+                    let (phase, turn, done) = at;
+                    let mut chose: Vec<tzolkin::phase::Step> = Vec::new();
+                    for (i, m) in eng.iter_mut().enumerate() {
+                        let t = Instant::now();
+                        let r = m.search_at(&st, phase, turn, done, rungs[i]);
+                        secs[i] += t.elapsed().as_secs_f64();
+                        arena[i] += r.nodes as f64;
+                        let (deep, mean) = m.depth_stats();
+                        dmax[i] += deep as f64;
+                        dmean[i] += mean;
+                        let tot: u32 = r.visits.iter().map(|(_, n)| n).sum();
+                        if tot > 0 {
+                            let best = r.visits.iter().map(|(_, n)| *n).max().unwrap_or(0);
+                            conc[i] += best as f64 / tot as f64;
+                        } else {
+                            // A one-edge node: nothing was searched and every
+                            // rung "agrees" trivially. Counted as fully
+                            // concentrated, which is what it is.
+                            conc[i] += 1.0;
+                        }
+                        chose.push(r.step.clone());
+                    }
+                    decisions += 1;
+                    for i in 0..rungs.len() {
+                        if chose[i] == chose[top] {
+                            agree[i] += 1;
+                        }
+                    }
+                    let tr = tzolkin::tree::apply_step(&mut st, phase, turn, done, &chose[top]);
+                    let committed = tr.committed();
+                    match tr.next() { None => break, Some(nx) => at = nx }
+                    if committed { break; }
+                }
+            }
+            let d = decisions.max(1) as f64;
+            println!("{decisions} sub-decisions, driven along the {} rung's path\n", rungs[top]);
+            println!(
+                "{:>8}  {:>9}  {:>9}  {:>9}  {:>7}  {:>7}  {:>9}",
+                "sims", "agree/top", "top-visit", "arena", "deepest", "mean-d", "ms/dec"
+            );
+            for i in 0..rungs.len() {
+                println!(
+                    "{:>8}  {:>8.1}%  {:>8.1}%  {:>9.0}  {:>7.1}  {:>7.2}  {:>9.2}",
+                    rungs[i],
+                    100.0 * agree[i] as f64 / d,
+                    100.0 * conc[i] / d,
+                    arena[i] / d,
+                    dmax[i] / d,
+                    dmean[i] / d,
+                    1e3 * secs[i] / d,
+                );
             }
         }
         "nodes" => {

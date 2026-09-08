@@ -1582,3 +1582,34 @@ leaf value makes deeper lookahead worth more.
 `cargo test --release`: **181 passed, 0 failed** (including two new pins in
 `tests/search.rs` — that `prior_min_edges` actually reaches a two-edge node, and
 that the champion spec's flags all reach the config).
+
+### 2026-09-08 07:00 — a memory-light proxy for the open `pmin` x budget question
+
+The arena cell above 8,192 is unreachable, but `bin/sprobe mcts` needs one
+short-lived process and answers a weaker question cheaply: **does `pmin=2` keep
+changing moves as the budget rises, or does the extra budget wash it out?**
+81 turns per rung, `cp=0.02` on both sides.
+
+| sims | turns `pmin=2` plays differently | its cost ratio |
+|---|---|---|
+| 2,048 | **55.6%** | 1.25x |
+| 8,192 | **63.0%** | 1.08x |
+| 16,384 | **55.6%** | 1.05x |
+
+**It does not wash out.** The flag still redirects more than half of all turns
+at 16,384 simulations, so the mechanism — narrow nodes getting a real prior
+instead of a uniform one — is not something a larger budget discovers on its
+own. And it gets *cheaper* with the budget (1.25x -> 1.05x): the extra one-ply
+probes are per-node and amortise over more simulations.
+
+**What this does not show.** Changing a move is not improving it. At 2,048
+simulations `cp=0.02` is already over-committed (mean descent 48 on a
+2,048-simulation tree) and `pmin=2` there is unraced. So this rules out one
+explanation for the effect fading — it does not establish that it stacks. The
+arena cell at 32,768 remains the honest way to settle it, and it needs a
+machine with ~2 GB free.
+
+(The ms/turn printed by `sprobe` here is wall clock on a loaded machine — 1157
+against the 366 that `mc/cost.sh` measures in user CPU for the same spec. Quote
+the ratio from this table, never the milliseconds; user CPU is in the 06:23
+entry.)
