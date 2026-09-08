@@ -70,7 +70,23 @@ Updated whenever something beats it. Always give the spec, not a description.
 | --- | --- | --- | --- |
 | start | `mcts:2048:heuristic:quality` | `mcts:2048` (old defaults) | +8.84 [+7.24, +10.44], 202 blk |
 | 00:25 | **`mcts:2048`** — quality prior shipped as the default in `41e9d70`, so the bare spec *is* the champion | `heuristic:full` | **+11.12** [+8.88, +13.36], 100 blk, win 0.403 |
-| 01:10 | same spec, but `94d85f3` re-priced the evaluator under *both* sides (+21.09 greedy / +7.63 mcts:1024 against the evaluator it replaced) | — | **the +11.12 is now stale; re-race before the deliverable** |
+| 01:10 | same spec, but `94d85f3` re-priced the evaluator under *both* sides (+21.09 greedy / +7.63 mcts:1024 against the evaluator it replaced) | — | the +11.12 went stale exactly as predicted: the same spec now measures **+3.5** against `heuristic:full` |
+| 04:30 | **`mcts:8192:heuristic:cp=0.02`** | `mcts:2048:heuristic:quality` | **+6.5** centred, 44% of games against three copies (null 25%); **+11.9** against `heuristic:full` |
+
+### `c_puct` was pinning the search to one turn of lookahead
+
+`c_puct_init` shipped at 2.0 and wants ~0.02 at 8,192 simulations. At 2.0 the
+descent stopped after ~8 sub-decisions — **one turn** — so every extra
+simulation was re-deciding what the one-ply prior had already decided. At 0.02
+the mean descent is ~52 sub-decisions, about six turns, and the budget starts
+paying: 8,192 sims are worth +0.62 at `cp=2.0` and **+6.5** at `cp=0.02`.
+
+**This is why the simulation axis kept measuring flat.** It was not that
+lookahead is worthless in this game; it was that the search could not perform
+any. The two knobs are one knob — the best `c_puct` falls as the budget rises
+(0.06 at 2,048, 0.02 at 8,192) — which is why every 1-D sweep before this found
+"about a point" whichever constant it moved. It is also *cheaper* than the width
+it beats: 146 ms/turn against `mcts:16384:quality`'s 187 ms.
 
 ### The prior is worth more than everything else measured so far
 
