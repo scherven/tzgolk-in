@@ -425,21 +425,35 @@ pub fn draw(f: &mut Frame, app: &App) {
     let lh = body[0].height;
     // Five rings in five rows are no taller than the five flat rows they
     // replace, so the panel asks for its ring height at every size and only
-    // *width* sends it back to rows.
-    let bh = (lh / 2).clamp(7, 13).min(lh);
+    // *width* sends it back to rows. The floor is eight, not seven: seven left
+    // five interior rows, the rings took all five, and at 80x24 — the size the
+    // panel is hardest to fit and most needed at — it drew the wheels and not
+    // one word about what any space on them does. The ceiling is fourteen, the
+    // height at which the rings, all three lines under them and a whole
+    // two-column space table are on screen together.
+    let bh = (lh / 2 + 1).clamp(8, 14).min(lh);
     let rest = lh - bh;
-    // Players is a five-row table plus its border and never wants more; the
-    // remainder falls through to Cards.
-    let ph = if rest >= 12 { 8 } else { (rest * 2 / 3).clamp(4, 8).min(rest) };
+    // Players is a heading, four rows and a footnote inside a border: eight,
+    // and six once `players` drops the heading. Below six it draws a box with
+    // a heading in it and **not one player** — three rows spent stating
+    // nothing, next to a board panel that was cut for want of one. Cards below
+    // four is a border and half a title. Rows a panel cannot use go back to
+    // the board, which at every size still has something to put in them.
+    let ph = if rest >= 6 { rest.min(8) } else { 0 };
+    let ch = if rest - ph >= 4 { rest - ph } else { 0 };
     let left = Layout::vertical([
-        Constraint::Length(bh),
+        Constraint::Length(lh - ph - ch),
         Constraint::Length(ph),
         Constraint::Min(0),
     ])
     .split(body[0]);
     board(f, left[0], app, &marks, focus);
-    players(f, left[1], app);
-    cards(f, left[2], app);
+    if ph > 0 {
+        players(f, left[1], app);
+    }
+    if ch > 0 {
+        cards(f, left[2], app);
+    }
 
     // Three fixed lengths over-subscribed this column below ~44 rows, and the
     // solver resolved it by starving whichever panel had the weakest
@@ -449,18 +463,29 @@ pub fn draw(f: &mut Frame, app: &App) {
     // can read past; the shortlist is the answer.
     let h = body[1].height;
     let mv = (h / 3).clamp(6, 12).min(h);
-    let rs = 7.min((h - mv).div_ceil(2));
-    // Temples never wants more than its own height, so anything above that
-    // falls through to the shortlist, which takes the remainder below.
-    let tp = (h - mv - rs).min(13);
+    let rest = h - mv;
+    // Both reference panels are all-or-nothing, and both were drawing borders
+    // with nothing inside them at 80x24 — four rows next to a shortlist that
+    // had three. Research is a border, a heading and *four* tracks: at six it
+    // shows three sciences with nothing on screen saying a fourth exists, so
+    // it is drawn at seven or not at all. Temples scales, needing a heading
+    // and enough ladder to place everybody, so it takes the variable
+    // remainder — and anything neither can use falls through to the shortlist,
+    // which is the panel this viewer exists for.
+    let rs = if rest >= 7 { 7 } else { 0 };
+    let tp = if rest - rs >= 6 { (rest - rs).min(13) } else { 0 };
     let right = Layout::vertical([
         Constraint::Length(tp),
         Constraint::Length(rs),
         Constraint::Min(0),
     ])
     .split(body[1]);
-    temples(f, right[0], app);
-    research(f, right[1], app);
+    if tp > 0 {
+        temples(f, right[0], app);
+    }
+    if rs > 0 {
+        research(f, right[1], app);
+    }
     moves(f, right[2], app, &rows);
 
     units(f, root[2], app);
@@ -1068,6 +1093,178 @@ impl Marks {
     }
 }
 
+/// A worker's lap around a gear, as arithmetic rather than as animation.
+///
+/// The gear advances one space a day, so a worker standing on `pos` on day
+/// `day` is on `pos + k` on day `day + k`, and it rides off the board the
+/// moment that would reach [`Gear::size`]. There is nothing to search and
+/// nothing to project: this is the sum the player is already doing by hand
+/// while looking at the wheel, which is what makes it worth printing beside it.
+///
+/// Cut short by the calendar. A worker put on Tikal on day 25 does not reach
+/// the top of it, and a panel that said `→7` there would be stating a plan the
+/// game does not have time for. Returns the last space it will stand on, the
+/// day it leaves, and whether the game ends first.
+pub fn lap(gear: Gear, pos: Pos, day: u8) -> (u8, u8, bool) {
+    let left = crate::state::LAST_DAY.saturating_sub(day);
+    let off = day + (gear.size() - pos.0);
+    let ends = off > crate::state::LAST_DAY;
+    let last = (pos.0 + left).min(gear.size() - 1);
+    (last, off, ends)
+}
+
+/// The same lap in words, for the pane that has room for them.
+///
+/// Two different sentences, because placing and retrieving are two different
+/// bets on the same arithmetic: one buys days on the wheel, the other gives the
+/// remaining ones back.
+///
+/// Sized to `room` rather than wrapped. The Why pane wraps, and a sentence that
+/// wrapped cost this panel a **second row per marked space** — two retrievals
+/// turned four lines into six and pushed the state diff off the bottom, which
+/// is the pane's own subject. Returns nothing at all rather than a fragment.
+fn lap_words(gear: Gear, pos: Pos, day: u8, arriving: bool, room: usize) -> String {
+    let (last, off, ends) = lap(gear, pos, day);
+    let (long, short) = if !arriving {
+        let spare = off.min(crate::state::LAST_DAY + 1) - day;
+        (
+            format!("giving up {spare} more days of the lap, which ends at {last}"),
+            format!("−{spare}d of its lap"),
+        )
+    } else if last == pos.0 {
+        ("no calendar left to ride".into(), "no lap left".into())
+    } else if ends {
+        (
+            format!("rides to {last}; the game ends before it comes off"),
+            format!("→{last}, then the game ends"),
+        )
+    } else {
+        (
+            format!("rides to {last}, off the wheel on day {off}"),
+            format!("→{last} by d{}", off - 1),
+        )
+    };
+    if long.chars().count() <= room {
+        long
+    } else if short.chars().count() <= room {
+        short
+    } else {
+        String::new()
+    }
+}
+
+/// `1→7 d18`: on space 1 now, will stand on 7, off the board on day 18.
+///
+/// `end` rather than a day where the calendar runs out first, because the two
+/// are different facts and a reader planning a retrieval needs to tell them
+/// apart: one is a deadline, the other is the game being over.
+pub fn lap_str(gear: Gear, pos: Pos, day: u8) -> String {
+    let (last, off, ends) = lap(gear, pos, day);
+    if last == pos.0 {
+        format!("{}·", pos.0)
+    } else if ends {
+        format!("{}→{last} end", pos.0)
+    } else {
+        format!("{}→{last} d{off}", pos.0)
+    }
+}
+
+/// Three letters of a gear's name, for a line that has five of them on it.
+fn short_gear(gear: Gear) -> &'static str {
+    &gear.name()[..3]
+}
+
+/// Cut a run of spans to `room` columns, ending in an ellipsis if anything was
+/// lost.
+///
+/// Spans carry the colour that tells one player's worker from another's, so a
+/// line built out of them cannot be round-tripped through [`fit`]. Left to
+/// ratatui the overflow is clipped silently at the right edge — which is how a
+/// second placed worker goes missing from the move line with nothing on screen
+/// saying a worker was dropped.
+fn clip(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
+    let mut used = 0usize;
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for sp in spans {
+        let n = sp.content.chars().count();
+        if used + n <= room {
+            used += n;
+            out.push(sp);
+            continue;
+        }
+        let keep = room.saturating_sub(used + 1);
+        if keep > 0 {
+            let t: String = sp.content.chars().take(keep).collect();
+            out.push(Span::styled(t, sp.style));
+        }
+        out.push(Span::styled("…", dim()));
+        return out;
+    }
+    out
+}
+
+/// What the highlighted move does to the wheels, in one line.
+///
+/// The Why pane already names the spaces and says what they do; this says the
+/// thing only the board knows — that a worker put on Palenque 0 today is on
+/// Palenque 7 on day 18 and gone the day after, and that a worker picked up off
+/// Chichen 6 is giving up the rest of its lap to do it. Placed and retrieved
+/// are told apart by the sign, by the colour and by the underline, none of
+/// which the other relies on.
+fn move_line(g: &GameState, marks: &Marks, room: usize) -> Option<Line<'static>> {
+    if marks.placed.is_empty() && marks.taken.is_empty() && marks.first.is_none() {
+        return None;
+    }
+    let mut spans = vec![Span::styled("move   ", dim())];
+    for &(gear, pos, c) in &marks.placed {
+        spans.push(Span::styled(
+            format!("+{c} {} {}   ", short_gear(gear), lap_str(gear, pos, g.day)),
+            Style::default().fg(colour(c)).add_modifier(Modifier::BOLD),
+        ));
+    }
+    for &(gear, pos, c) in &marks.taken {
+        // What a retrieval costs is on the wheel and nowhere else: the days
+        // that worker still had before it would have come off by itself.
+        let (_, off, ends) = lap(gear, pos, g.day);
+        let spare = if ends { crate::state::LAST_DAY + 1 - g.day } else { off - g.day };
+        spans.push(Span::styled(
+            format!("-{c} {} {}→hand ({spare}d early)   ", short_gear(gear), pos.0),
+            Style::default().fg(colour(c)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+    }
+    if let Some(c) = marks.first {
+        spans.push(Span::styled(
+            format!("+{c} first player   "),
+            Style::default().fg(colour(c)).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Some(Line::from(clip(spans, room)))
+}
+
+/// Where every worker on the focused gear is in its lap.
+///
+/// The rings show the circle; this says how far round each worker has got and
+/// when it comes off, which is the half of "moving in circles" that a still
+/// picture cannot draw.
+fn rides_line(g: &GameState, gear: Gear, room: usize) -> Line<'static> {
+    let mut spans = vec![Span::styled("rides  ", dim())];
+    let mut any = false;
+    for i in 0..gear.size() {
+        let Some(wk) = g.gears[gear.idx()].at(Pos(i)) else { continue };
+        any = true;
+        let c = g.players[wk.owner().idx()].color;
+        spans.push(Span::styled(
+            format!("{c}{}   ", lap_str(gear, Pos(i), g.day)),
+            Style::default().fg(colour(c)),
+        ));
+    }
+    spans.push(Span::styled(
+        if any { "(space→last, d = rides off)" } else { "nobody on this gear" }.to_string(),
+        dim(),
+    ));
+    Line::from(clip(spans, room))
+}
+
 /// A gear as a ring: the number of rows and columns it occupies, and the slot
 /// each worker space sits in.
 ///
@@ -1140,6 +1337,11 @@ fn space_cell(g: &GameState, gear: Gear, pos: Pos, marks: &Marks, cw: usize) -> 
         None if crate::spaces::is_free_choice(gear, pos) => {
             pad(format!("{}*", pos.0), label())
         }
+        // The space every worker gets on at. Without it the ring is eight
+        // numbers in a circle and nothing says which way a lap starts; with it
+        // the `↻` in the hub has a beginning to turn from. The number stays,
+        // because the list underneath is indexed by it.
+        None if pos.0 == 0 && cw >= 3 => pad("→0".into(), label()),
         None => pad(pos.0.to_string(), dim()),
     }
 }
@@ -1201,7 +1403,7 @@ fn board(f: &mut Frame, area: Rect, app: &App, marks: &Marks, focus: Gear) {
             }
             // The hub says the ring turns, and which way: a worker rides from
             // the entry space clockwise and off the far side of it.
-            cells[if rows == 4 { 1 } else { 1 }][1] = Span::styled(format!("{:^cw$}", "↻"), dim());
+            cells[1][1] = Span::styled(format!("{:^cw$}", "↻"), dim());
             for r in 0..4 {
                 if r < top {
                     grid[r].push(Span::raw(" ".repeat(width + gap)));
@@ -1261,60 +1463,45 @@ fn board(f: &mut Frame, area: Rect, app: &App, marks: &Marks, focus: Gear) {
         .collect();
     let want = (cells.iter().map(|(t, _)| t.chars().count()).max().unwrap_or(10) + 2).clamp(16, w);
     let cols = (w / want).clamp(1, n);
-    // The key line comes out of the table's budget, not the other way round:
-    // with one spare row and eight spaces, sizing the columns to fit the table
-    // instead produced eight six-column cells reading `…ter  …blk  …orn`.
-    let room = h.saturating_sub(lines.len() + 1);
     let rows = n.div_ceil(cols);
-    // A table is only shown whole. A partial one looks complete — there is
-    // nothing on a truncated column to say four more spaces exist — so a panel
-    // that cannot hold all of them flows the labels as a sentence instead,
-    // which ends in an ellipsis when it runs out of room.
-    let tbl = if rows <= room { rows } else { 0 };
     let colw = w / cols;
 
-    // Two reference lines, taken only out of what the table did not want. The
-    // Palenque stacks are the one thing the labels cannot say: `choices_at`
-    // reports that space 3 still offers wood, not that it offers it twice more.
-    let spare = h.saturating_sub(lines.len() + tbl);
-    if spare >= 1 {
-        let tiles: String = (2..=5)
-            .map(|i| {
-                let t = g.palenque[i];
-                let _ = i;
-                format!("{}w{}c ", t.wood, t.corn)
-            })
-            .collect();
-        // Terse because at a hundred columns the long form elided its own
-        // middle and took two of the four Palenque stacks with it. The stacks
-        // are spaces 2-5 in order, which is what the ring above shows.
-        let key = format!("+placed -taken  Palenque 2-5 {tiles}");
-        lines.push(Line::from(Span::styled(fit(&key, w), dim())));
-    }
-    // Where the workers on the focused gear are in their lap. A gear advances
-    // one space a day and a worker riding off the end goes back to its owner's
-    // hand, so `size - pos` is exactly how many more days it has on the board —
-    // deterministic, and the thing a player is actually planning around.
-    if spare >= 2 {
-        let rides: Vec<Span> = (0..focus.size())
-            .filter_map(|i| {
-                let w = g.gears[focus.idx()].at(Pos(i))?;
-                let c = g.players[w.owner().idx()].color;
-                Some(Span::styled(
-                    format!("{c}@{i} {}d  ", focus.size() - i),
-                    Style::default().fg(colour(c)),
-                ))
-            })
-            .collect();
-        let head = if rides.is_empty() {
-            "rides  nobody on this gear".to_string()
-        } else {
-            "rides  ".to_string()
-        };
-        let mut spans = vec![Span::styled(head, dim())];
-        spans.extend(rides);
-        spans.push(Span::styled("(1 space a day, then off)", dim()));
-        lines.push(Line::from(spans));
+    // The lines that sit between the rings and the space list, in the order
+    // they earn their room. The move line first: it is the answer to the
+    // question the reader asked by putting the cursor on that shortlist row,
+    // and at eighty columns it is the only one of the three that will fit.
+    // The key last, because with the move line on screen it is a legend for
+    // marks that have already been spelled out in words.
+    let mut extras: Vec<Line> = Vec::new();
+    extras.extend(move_line(g, marks, w));
+    extras.push(rides_line(g, focus, w));
+    extras.push({
+        // The Palenque stacks are the one thing the labels cannot say:
+        // `choices_at` reports that space 3 still offers wood, not that it
+        // offers it twice more. Terse because at a hundred columns the long
+        // form elided its own middle and took two of the four stacks with it.
+        let tiles: String =
+            (2..=5).map(|i| format!("{}w{}c ", g.palenque[i].wood, g.palenque[i].corn)).collect();
+        let key = format!("+on -off  →0 entry  n* free  Palenque 2-5 {tiles}");
+        Line::from(Span::styled(fit(&key, w), dim()))
+    });
+
+    // How the rows below the rings are split. A table is only ever shown whole
+    // — a partial one looks complete, there being nothing on a truncated column
+    // to say four more spaces exist — so it gets first refusal on the rows it
+    // needs and the extras take what is left over. When it cannot fit at all
+    // the order reverses: the extras win and the flowed sentence takes the
+    // remainder, because a list that ends in `…` says less than the move line
+    // does. One row is always kept back for the list unless one row is all
+    // there is, in which case the move line is the better use of it.
+    let avail = h.saturating_sub(lines.len());
+    let (tbl, keep) = if rows <= avail {
+        (rows, extras.len().min(avail - rows))
+    } else {
+        (0, extras.len().min(avail.saturating_sub(1).max(1)).min(avail))
+    };
+    for l in extras.into_iter().take(keep) {
+        lines.push(l);
     }
 
     if tbl > 0 {
@@ -1364,6 +1551,20 @@ fn board(f: &mut Frame, area: Rect, app: &App, marks: &Marks, focus: Gear) {
 fn temples(f: &mut Frame, area: Rect, app: &App) {
     let g = &app.game.state;
     let tallest = TEMPLES.iter().map(|t| t.steps).max().unwrap_or(0);
+    // `Paragraph` truncates its tail, and this panel's tail is step 0 — where
+    // everybody starts. One row short of the tallest track, the row it dropped
+    // was the most-occupied one on the board: at seed 7 round 9 the panel drew
+    // steps 8 down to 1 while two players stood on a step that was not on
+    // screen. The window is anchored on the highest step anyone has reached
+    // instead, so what gets cut is empty ladder and `↑` says it was cut.
+    let room = (area.height.saturating_sub(3) as usize).max(1);
+    let top = Temple::ALL
+        .iter()
+        .flat_map(|t| PlayerId::ALL.map(|q| g.temple_pos(q, *t)))
+        .max()
+        .unwrap_or(0) as usize;
+    let hi = (top + 1).max(room).min(tallest as usize);
+    let lo = hi.saturating_sub(room);
     // Each temple column below is 11 wide, after a 3-wide step gutter.
     let mut head = String::from("   ");
     for name in ["Brown", "Yellow", "Green"] {
@@ -1371,8 +1572,18 @@ fn temples(f: &mut Frame, area: Rect, app: &App) {
     }
     let mut lines = vec![Line::from(vec![Span::styled(head, label())])];
 
-    for step in (0..tallest).rev() {
-        let mut spans = vec![Span::styled(format!("{step:>2} "), dim())];
+    for step in (lo as u8..hi as u8).rev() {
+        // `↑` on the top row and `↓` on the bottom where the ladder carries on
+        // past the panel. Without them a window looks like the whole track and
+        // a reader counts a player's climb from the wrong end.
+        let edge = if step as usize + 1 == hi && hi < tallest as usize {
+            '↑'
+        } else if step as usize == lo && lo > 0 {
+            '↓'
+        } else {
+            ' '
+        };
+        let mut spans = vec![Span::styled(format!("{step:>2}{edge}"), dim())];
         for t in Temple::ALL {
             let d = &TEMPLES[t.idx()];
             if step >= d.steps {
@@ -1457,10 +1668,18 @@ fn research(f: &mut Frame, area: Rect, app: &App) {
 
 fn players(f: &mut Frame, area: Rect, app: &App) {
     let g = &app.game.state;
-    let mut lines = vec![Line::from(vec![Span::styled(
-        "   corn   W  S  G  sk   pts   wk  free  disc  bld mon  tiles",
-        label(),
-    )])];
+    // The heading is a legend; the rows are the data. `Paragraph` truncates its
+    // tail, so keeping the heading at six rows cost a *player* to keep a column
+    // key — and the columns are guessable from four rows of numbers in a way
+    // that a missing player is not.
+    let terse = area.height < 8;
+    let mut lines = Vec::new();
+    if !terse {
+        lines.push(Line::from(vec![Span::styled(
+            "   corn   W  S  G  sk   pts   wk  free  disc  bld mon  tiles",
+            label(),
+        )]));
+    }
 
     for p in PlayerId::ALL {
         let pl = &g.players[p.idx()];
@@ -1498,12 +1717,15 @@ fn players(f: &mut Frame, area: Rect, app: &App) {
             ),
         ]));
     }
-    lines.push(Line::from(vec![Span::styled(
-        "   wk = in hand + on gears",
-        dim(),
-    )]));
+    if !terse {
+        lines.push(Line::from(vec![Span::styled(
+            "   wk = in hand + on gears",
+            dim(),
+        )]));
+    }
 
-    f.render_widget(Paragraph::new(lines).block(boxed("Players")), area);
+    let title = if terse { "Players — corn W S G sk pts wk" } else { "Players" };
+    f.render_widget(Paragraph::new(lines).block(boxed(title)), area);
 }
 
 fn cards(f: &mut Frame, area: Rect, app: &App) {
@@ -1892,6 +2114,12 @@ fn why_pane(f: &mut Frame, area: Rect, app: &App, rows: &[Row], marks: &Marks) {
             // these same cells; this is the half of that a screen dump can
             // read, and it is the only place the space's action is spelled out
             // at full width rather than squeezed into a column.
+            // `+R off Chichen Itza 10 ` is the widest fixed part of the row;
+            // the label and the lap share what is left of the pane, the label
+            // first because it is the space's own name for itself.
+            let room = area.width.saturating_sub(2) as usize;
+            let head = 3 + 5 + Gear::ALL.iter().map(|g| g.name().len()).max().unwrap_or(12) + 4;
+            let lw = room.saturating_sub(head).clamp(8, 30);
             for (arriving, gear, pos, c) in marks
                 .placed
                 .iter()
@@ -1912,7 +2140,16 @@ fn why_pane(f: &mut Frame, area: Rect, app: &App, rows: &[Row], marks: &Marks) {
                         format!("{} ", pos.0),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(info.label, dim()),
+                    Span::styled(format!("{:<lw$}", fit(&info.label, lw), lw = lw), dim()),
+                    // The lap, spelled out at whatever width is left over. A
+                    // placement is a bet on the next several days, and this is
+                    // the only place the viewer says how many of them there
+                    // are; the Board's `move` line has the same fact in the
+                    // ten columns it can spare for it.
+                    Span::styled(
+                        lap_words(gear, pos, before.day, arriving, room.saturating_sub(head + lw)),
+                        label(),
+                    ),
                 ]));
             }
             if let Some(c) = marks.first {

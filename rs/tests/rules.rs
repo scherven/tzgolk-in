@@ -1532,6 +1532,288 @@ fn elision_keeps_both_ends() {
     assert!(tail.ends_with("NOT the whole move space"), "got {tail}");
 }
 
+/// A worker's lap is arithmetic, and the calendar is part of it.
+///
+/// A gear advances one space a day, so a worker on `pos` is on `pos + k` on day
+/// `day + k` and rides off when that would reach `Gear::size()`. The panel
+/// prints this beside the wheel instead of animating it, so the sum has to be
+/// the game's and not a plausible-looking one — and it has to stop at day 27,
+/// because a worker put on Tikal on day 25 does **not** reach the top of it and
+/// a viewer that said `→7` there would be inventing a plan the game has no
+/// time for. `docs/FINDINGS-tui.md` T11.
+#[test]
+fn a_lap_stops_at_the_end_of_the_calendar() {
+    use tzolkin::ui::{lap, lap_str};
+
+    // Mid-game: the whole ride is available.
+    let (last, off, ends) = lap(Gear::Tikal, Pos(1), 11);
+    assert_eq!((last, off, ends), (7, 18, false), "1 + 7 days is the top, then off");
+    assert_eq!(lap_str(Gear::Tikal, Pos(1), 11), "1→7 d18");
+
+    // The entry space of the big gear, from the same day.
+    let (last, off, ends) = lap(Gear::Chichen, Pos(0), 11);
+    assert_eq!((last, off, ends), (10, 22, false));
+
+    // Late: the calendar runs out first, and the panel must say so rather than
+    // promise a space the worker never stands on.
+    let (last, off, ends) = lap(Gear::Tikal, Pos(2), 25);
+    assert_eq!(last, 4, "two days left, so 2 -> 3 -> 4 and no further");
+    assert!(ends, "off day {off} is past the last day");
+    assert!(lap_str(Gear::Tikal, Pos(2), 25).ends_with("end"), "{}", lap_str(Gear::Tikal, Pos(2), 25));
+
+    // The top space: nowhere left to ride, on any day.
+    assert_eq!(lap_str(Gear::Tikal, Pos(7), 3), "7·");
+    assert_eq!(lap(Gear::Tikal, Pos(7), 3).0, 7);
+
+    // Never off the end of the gear, at any day, from any space.
+    for gear in Gear::ALL {
+        for pos in 0..gear.size() {
+            for day in 0..=tzolkin::state::LAST_DAY {
+                let (last, _, _) = lap(gear, Pos(pos), day);
+                assert!(last < gear.size(), "{gear:?} {pos} d{day} rode to {last}");
+                assert!(last >= pos, "{gear:?} {pos} d{day} went backwards to {last}");
+            }
+        }
+    }
+}
+
+/// The board tells a placed worker from a retrieved one **in a screen dump**.
+///
+/// Three markings carry it — the glyph, the paint, and the blink rate — and a
+/// terminal may honour none of the last two: `Modifier::SLOW_BLINK` is widely
+/// ignored, and a dump has no colour at all. So the glyph is the one that has
+/// to work, and this test reads the buffer as text, exactly as review does.
+/// The same assertion covers the ring and the flat-row fallback, because at
+/// 60x20 there is no room for rings and the markers must survive that too.
+#[test]
+fn the_board_marks_placed_and_retrieved_workers_without_colour() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tzolkin::ui::{self, App, Marks, MoveSource};
+
+    // Two positions: an opening, where the shortlist is placements, and a
+    // late one, where it is retrievals off gears workers are standing on.
+    for rounds in [9usize, 14, 20] {
+        let mut game = Game::new(7);
+        for _ in 0..rounds {
+            if game.state.over {
+                break;
+            }
+            game.play_round();
+        }
+        let p = game.state.current;
+        let ranking = tzolkin::eval::rank_all(&game.state, p, 10);
+        if ranking.moves.is_empty() {
+            continue;
+        }
+
+        let n = ranking.moves.len();
+        let state = game.state;
+        let mut app = App {
+            game,
+            agent: None,
+            agent_name: String::new(),
+            thinking: None,
+            last_decisions: Vec::new(),
+            last_played: None,
+            ranking,
+            selected: 0,
+            source: MoveSource::Full,
+            autoplay: false,
+            status: String::new(),
+            focus: None,
+        };
+        for sel in 0..n {
+            let marks = Marks::of(&state, Some(&app.ranking.moves[sel].0));
+            if marks.placed.is_empty() && marks.taken.is_empty() {
+                continue;
+            }
+            app.selected = sel;
+            for &(w, h) in &[(80u16, 24u16), (132, 44), (60, 20)] {
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| ui::draw(f, &app)).unwrap();
+                let buf = term.backend().buffer();
+                let text: String = (0..h)
+                    .map(|y| {
+                        (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n"
+                    })
+                    .collect();
+
+                // The cell marker. `+Y` and `-B` are the two-column forms; the
+                // three-column ring writes `+Y+` and `-B-`, which contain them.
+                for &(_, _, c) in &marks.placed {
+                    assert!(
+                        text.contains(&format!("+{c}")),
+                        "{w}x{h} r{rounds} sel {sel}: no +{c} anywhere on screen\n{text}"
+                    );
+                }
+                for &(_, _, c) in &marks.taken {
+                    assert!(
+                        text.contains(&format!("-{c}")),
+                        "{w}x{h} r{rounds} sel {sel}: no -{c} anywhere on screen\n{text}"
+                    );
+                }
+                // And the two are never spelled the same way. At the size
+                // where the Why pane is drawn whole, the distinction is also
+                // written out in words, which is what survives a reader who
+                // does not know the glyph convention.
+                if (w, h) == (132, 44) {
+                    for &(_, _, c) in &marks.placed {
+                        assert!(
+                            text.contains(&format!("+{c} onto")),
+                            "{w}x{h} r{rounds} sel {sel}: +{c} is not said to arrive\n{text}"
+                        );
+                    }
+                    for &(_, _, c) in &marks.taken {
+                        assert!(
+                            text.contains(&format!("-{c} off")),
+                            "{w}x{h} r{rounds} sel {sel}: -{c} is not said to leave\n{text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The Board panel says what a space does at **every** size it renders at.
+///
+/// It was drawing five rings and not one word about any space at 80x24 — the
+/// default terminal, and the size where the panel is hardest to fit and most
+/// needed. The rings alone are eight numbers in a circle. `FINDINGS-tui.md`
+/// T10.1.
+#[test]
+fn the_board_always_says_what_at_least_one_space_does() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tzolkin::ui::{self, App, MoveSource};
+
+    for &(w, h) in &[(60u16, 20u16), (80, 24), (100, 30), (132, 44), (200, 60)] {
+        for rounds in [0usize, 9, 20] {
+            let mut game = Game::new(7);
+            for _ in 0..rounds {
+                if game.state.over {
+                    break;
+                }
+                game.play_round();
+            }
+            let p = game.state.current;
+            let ranking = tzolkin::eval::rank_all(&game.state, p, 10);
+            let mut app = App {
+                game,
+                agent: None,
+                agent_name: String::new(),
+                thinking: None,
+                last_decisions: Vec::new(),
+                last_played: None,
+                ranking,
+                selected: 0,
+                source: MoveSource::Full,
+                autoplay: false,
+                status: String::new(),
+                focus: None,
+            };
+            for focus in [None, Some(Gear::Chichen), Some(Gear::Palenque)] {
+                app.focus = focus;
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| ui::draw(f, &app)).unwrap();
+                let buf = term.backend().buffer();
+                let text: String = (0..h)
+                    .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+                    .collect();
+                // `0 enter` is the entry space's label on every gear, and it is
+                // the first cell of the space list whichever way the list is
+                // laid out — table, flowed sentence, or one truncated row.
+                assert!(
+                    text.contains("0 enter"),
+                    "{w}x{h} r{rounds} focus {focus:?}: the Board panel names no space\n{text}"
+                );
+                // And the lap line, which is the half of "moving in circles"
+                // that a still picture cannot draw.
+                assert!(
+                    text.contains("rides") || text.contains("move   "),
+                    "{w}x{h} r{rounds}: neither the move line nor the rides line survived\n{text}"
+                );
+            }
+        }
+    }
+}
+
+/// Temples never hides a player.
+///
+/// `Paragraph` truncates its tail and this panel's tail is step 0, which is
+/// where everybody starts — so one row short of the tallest track, the row it
+/// dropped was the most-occupied one on the board. At 132x44 that was exactly
+/// the case: the panel drew steps 8 down to 1 and three players standing on 0
+/// were simply not on screen. `docs/FINDINGS-tui.md` T10.4.
+#[test]
+fn the_temple_panel_never_truncates_away_an_occupied_step() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tzolkin::ui::{self, App, MoveSource};
+
+    for &(w, h) in &[(100u16, 30u16), (132, 44), (150, 40), (200, 60)] {
+        for rounds in [0usize, 9, 20, 27] {
+            let mut game = Game::new(7);
+            for _ in 0..rounds {
+                if game.state.over {
+                    break;
+                }
+                game.play_round();
+            }
+            let p = game.state.current;
+            let ranking = tzolkin::eval::rank_all(&game.state, p, 10);
+            let colors: Vec<char> =
+                PlayerId::ALL.iter().map(|q| game.state.players[q.idx()].color.letter()).collect();
+            let app = App {
+                game,
+                agent: None,
+                agent_name: String::new(),
+                thinking: None,
+                last_decisions: Vec::new(),
+                last_played: None,
+                ranking,
+                selected: 0,
+                source: MoveSource::Full,
+                autoplay: false,
+                status: String::new(),
+                focus: None,
+            };
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| ui::draw(f, &app)).unwrap();
+            let buf = term.backend().buffer();
+            let rowtext = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
+
+            // Find the panel by its title and read only its own columns, so a
+            // colour letter elsewhere on the screen cannot stand in for one
+            // that is missing here.
+            let Some(top) = (0..h).find(|&y| rowtext(y).contains("┌ Temples")) else {
+                continue; // too short to draw at all; that is a layout choice
+            };
+            let line = rowtext(top);
+            let x0 = line.find("┌ Temples").expect("just matched") as u16;
+            let x0 = line[..x0 as usize].chars().count() as u16;
+            let bot = (top + 1..h)
+                .find(|&y| rowtext(y)[..].contains('└'))
+                .unwrap_or(h - 1);
+            let region: String = (top + 1..bot)
+                .map(|y| (x0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+                .collect();
+
+            // Every player stands on all three tracks, so every player's letter
+            // must appear at least three times inside the panel.
+            for c in colors {
+                let n = region.matches(c).count();
+                assert!(
+                    n >= 3,
+                    "{w}x{h} r{rounds}: {c} on {} of 3 temple tracks in the panel\n{region}",
+                    n
+                );
+            }
+        }
+    }
+}
+
 /// The preview pane describes exactly what the move does.
 #[test]
 fn preview_diff_describes_the_move() {

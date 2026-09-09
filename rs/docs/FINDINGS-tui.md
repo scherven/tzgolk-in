@@ -215,3 +215,186 @@ Smallest change that fixes it: a second optional score on `Ranking` (say
 `values: Vec<f32>`, parallel to `moves`, empty where a producer has none), plus
 the `unit` field T1 already asked for. `ui.rs` would render it as a third
 column beside `visits` and `1-ply` and needs nothing else.
+
+## T10 — what the Board panel was actually drawing, read off dumps at four sizes
+
+Resumed after a kill. `App::focus`, `Marks`, `ring`, `space_cell`, `space_info`
+and `board` are all on disk and working; the rings render, the space labels come
+out of `spaces::choices_at`, and the `+`/`-` markers land on the right cells.
+What the dumps say is wrong is **where the panel's rows go**, not what it knows.
+
+`uidump 7 9 132 44`, `7 9 100 30`, `7 9 80 24`, and `7 14/20/24 132 44`:
+
+1. **At 80x24 the space list is not on screen at all.** The left column gets ten
+   rows; `bh` takes seven, the rings need five of its five interior rows, and
+   `spare` is then zero. So at the default terminal size the panel that exists
+   to say what a space does says nothing about any space. Every larger size
+   shows it, which is why this survived.
+2. **The three rows under the Board at 80x24 are a Players box with a header in
+   it and not one player**, and the right column spends four more on a Temples
+   box and a Research box with nothing but borders. Seven rows drawing zero
+   facts, next to a panel that was cut for want of one.
+3. **`rides` — the "moving in circles" line — is drawn only at `spare >= 2`,**
+   which at 100x30 and 80x24 never happens. It reached the screen at 132x44 and
+   nowhere else, and it reads `rides  nobody on this gear(1 space a day, then
+   off)` with no space when the gear is empty.
+4. **Temples truncates from the bottom, and the bottom is step 0.** At 132x44
+   the panel is one row short of the tallest track, so the row it drops is the
+   one every player starts on: at seed 7 round 9 the dump shows steps 8..1 and
+   two players standing on step 0 are simply not on the board. A `Paragraph`
+   cuts its tail, and this panel's tail is its most-occupied row.
+5. `rides` prints days-left (`R@1 7d`) and nothing about *where*. The brief's own
+   framing — "this worker reaches Tikal 4 in two days" — is not on screen; the
+   arithmetic is `pos + k` on day `day + k`, off at `Gear::size()`, and none of
+   it needs a search.
+
+Not bugs, checked and left alone: the ring winding is genuinely clockwise from
+the bottom-centre entry (`SMALL` slots go bottom-centre → bottom-left → up the
+left → across the top → down the right, which is 6 → 7 → 9 → 12 → 3 o'clock),
+so the `↻` hub is honest; the `+Y+` / `-B-` markers are correct on both a place
+and a retrieve, verified at rounds 9 and 14; and the `spare`/`room` arithmetic
+that looked off-by-one cannot actually clip the table, because `spare` is
+recomputed from the table that was already sized.
+
+**Decisions taken from this.** (a) Rows a panel cannot use go to a panel that
+can — a box with only a header is worse than no box, and Players, Temples and
+Research each get a floor below which they are skipped. (b) The Board's floor
+rises to eight rows so the move line always has somewhere to go. (c) The extras
+under the rings are ranked *move, rides, key*, and a whole table outranks all
+three; the flowed list outranks none, because a sentence ending in `…` says
+less than the move line does. (d) Temples anchors its window on the highest
+occupied step instead of on the top of the ladder.
+
+## T11 — the lap is arithmetic, and it fits where an animation would not
+
+The user's ask was "workers moving in circles". The gear advances one space a
+day, so a worker on `pos` is on `pos + k` on day `day + k` and rides off when
+that would reach `Gear::size()`. **`ui::lap` is that sum and nothing else** — no
+search, no projection, no evaluator — which is why it can be printed as a fact
+next to a still picture instead of being animated into one.
+
+Three renderings of it, at three widths, because the panel is a different size
+in each place it appears:
+
+| where | form | e.g. |
+| --- | --- | --- |
+| Board, `rides` | every worker on the focused gear | `R1→7 d18   Y2→7 d17` |
+| Board, `move`  | the highlighted move's workers  | `+Y Tik 0→7 d19` / `-B Chi 6→hand (5d early)` |
+| Why pane       | words, sized to the pane        | `giving up 5 more days of the lap, which ends at 10` |
+
+**Cut at day 27, deliberately.** A worker put on Tikal on day 25 does not reach
+the top of it, and `→7` there would be the panel stating a plan the game has no
+time for. `lap` clamps the last space to `pos + (LAST_DAY - day)` and says
+`end` instead of a day. Pinned in `a_lap_stops_at_the_end_of_the_calendar`,
+including a sweep asserting the ride never runs off the end of a gear and never
+goes backwards, for every gear, space and day.
+
+**What a retrieval costs is on the wheel and nowhere else.** The state diff can
+say the worker is in hand and what its space paid; only the gear knows it had
+five more days of ride to give up. `move_line` prints `(5d early)` and the Why
+pane spells it out.
+
+### The row budget, which is what this actually was
+
+Rings, three lines under them and a whole space table do not fit together below
+about 44 rows, and the ranking between them had never been written down. It is
+now, in `board`:
+
+1. **A whole table outranks everything.** A partial one looks complete — there
+   is nothing on a truncated column to say four more spaces exist — so it gets
+   first refusal on the rows it needs and the extras take the remainder.
+2. **Where the table cannot fit at all, the extras win** and the flowed
+   sentence takes what is left, because a list ending in `…` says less than the
+   move line does. One row is always kept back for the list *unless one row is
+   all there is*, in which case the move line is the better use of it.
+3. Extras rank `move`, `rides`, `key`. The key was first before and is a legend
+   for marks that the move line now spells out in words.
+
+### Rows a panel cannot use go to a panel that can
+
+Three boxes were drawing borders with nothing inside them at 80x24 — Players
+with a heading and **not one player**, Temples and Research with nothing at all
+— seven rows stating nothing, next to a Board that had been cut for want of one
+and a shortlist that had three rows. Each panel now has a floor and is skipped
+below it: Players 6 (and `players` drops its heading before it drops a player),
+Research 7 (four tracks or none — at six it drew three sciences with nothing
+saying a fourth existed), Temples 6. The Board's floor rose 7→8 and its ceiling
+13→14, the height at which everything is on screen at once.
+
+Measured at 80x24, which is the size all of this was invisible at:
+
+| | before | after |
+| --- | --- | --- |
+| Board | 5 ring rows, no space named | rings, `move`, `rides`, and the list |
+| Players | a heading, no players | not drawn |
+| Temples / Research | two empty boxes | not drawn |
+| shortlist | **3 rows** | **7 rows** |
+
+The right column gained four rows by this and gave up none.
+
+### T10.4, fixed: Temples was hiding the players
+
+`Paragraph` truncates its tail and this panel's tail is step 0, where everybody
+starts. At 132x44 it was one row short of the tallest track, so the row it
+dropped was the most-occupied one on the board: seed 7 round 9 drew steps 8..1
+while `RGY / GBY / RGBY` stood on a step that was not on screen. The window is
+anchored on the highest step anyone has reached instead, with `↑` and `↓` in the
+gutter where the ladder carries on past the panel. Pinned by
+`the_temple_panel_never_truncates_away_an_occupied_step`, which reads *only the
+panel's own columns* out of the buffer — a colour letter elsewhere on screen
+must not be able to stand in for one missing here — and requires each player's
+letter three times, once per track.
+
+### Also landed
+
+* **The entry space is marked** `→0` on the rings at three columns a cell. Eight
+  numbers in a circle do not say where a lap starts; with it the `↻` in the hub
+  has something to turn from. The number stays, because the list below is
+  indexed by it.
+* **`clip`**, a span-wise truncation that ends in `…`. Lines built out of spans
+  carry the colour that tells one player's worker from another's and so cannot
+  be round-tripped through `fit`; left to ratatui the overflow was clipped
+  silently at the right edge, which is how a second placed worker would go
+  missing from the move line with nothing on screen saying so.
+* **`lap_words` is sized, not wrapped.** The Why pane wraps, and the first cut of
+  this cost it a *second row per marked space*: two retrievals turned four lines
+  into six and pushed the state diff — the pane's own subject — off the bottom.
+  It picks the longest of a long form, a short form and nothing that fits.
+* `rides  nobody on this gear(1 space a day…)` had no space in it, and the line
+  only ever reached the screen at 132x44 in the first place.
+
+### Tests
+
+Four inserted into `tests/rules.rs` (78 → 82; suite 199 passed, 0 failed):
+`a_lap_stops_at_the_end_of_the_calendar`,
+`the_board_marks_placed_and_retrieved_workers_without_colour` (reads the buffer
+as text at 60x20 / 80x24 / 132x44 across three positions and every candidate
+that touches the board — the glyph is the only one of the three markings that
+survives a dump, and `Modifier::SLOW_BLINK` is widely ignored),
+`the_board_always_says_what_at_least_one_space_does` (five sizes x three
+positions x three focus settings; this is the 80x24 regression),
+`the_temple_panel_never_truncates_away_an_occupied_step`.
+
+A fifth assertion was written and thrown away: "no doubled marker glyph
+anywhere on screen" failed on the **calendar strip** in the header,
+`-------R--#--P------R-----P`. The distinction is pinned through the Why pane's
+words (`+Y onto` / `-B off`) instead, at the one size that draws it whole.
+
+### Not fitted, and why
+
+* **Five rings and eight space labels do not both fit at 80x24.** 41 columns of
+  Tikal's labels is six flowed rows; the panel has three after the rings and the
+  two lines that answer the hovered question. It shows the rings, the move, the
+  rides and a list that ends in `…`. There is no arrangement of that panel that
+  holds all of it, and the honest cut is to answer what the cursor is on.
+* **Temples is not drawn at 100x30** — Research is fixed at seven rows and
+  all-or-nothing, Temples scales, so Research takes its seven first and Temples
+  takes a remainder that is only three. Reversing the order costs the shortlist
+  three rows. Both orderings are defensible; this one favours the deliverable.
+* **`Gear::ALL` order is fixed and Chichen's ring is 4x4** with the bottom-right
+  slot empty, so the five rings need 56 columns at three per cell. Below 32 the
+  panel drops to flat rows and there is no `↻` and no ring at all; the `rides`
+  line is the only thing carrying the lap there.
+* **No trail on the ring.** A worker entering at 0 passes every other space, so
+  a trail marker from the entry space is the whole wheel and says nothing. The
+  `rides` line carries the same fact in a form that is legible in a dump.
