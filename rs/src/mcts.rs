@@ -8,17 +8,28 @@
 //!
 //! Two constants away from the shipped defaults, and both of them were shipped
 //! one to two orders of magnitude wrong for a search factored into
-//! sub-decisions. Against `mcts:8192:heuristic:cp=0.02` it is **+3.06** (CI
-//! +1.43..+4.68, 46 paired blocks) on the current evaluator and **+4.73** (CI
-//! +3.22..+6.24, 50 paired blocks, p = 4e-10) on the one before it; against the
-//! shipped `c_puct` at the same budget, `cp=0.02` alone is **+10.39** (CI
-//! +7.68..+13.10, 13 paired blocks) on the current evaluator. Cost is 158 ms of
-//! user CPU per turn against `mcts:2048:heuristic:quality`'s 14.7.
+//! sub-decisions. Against `mcts:8192:heuristic:cp=0.02`, `pmin=2` is **+2.78**
+//! (CI +2.39..+3.16, **600 paired blocks**) and reproduces on three separate
+//! evaluators (+4.73 / 50 blk, +2.78 / 600 blk, +3.12 / 117 blk); against the
+//! shipped `c_puct` at the same budget, `cp=0.02` alone is **+9.85** (CI
+//! +8.29..+11.40, 44 paired blocks). Cost on the current build is 182 ms of
+//! user CPU per turn against `mcts:2048:heuristic:quality`'s 18.8 — and
+//! **`pmin=2` itself is free**: 0.98x `cp=0.02` measured in the same sample
+//! (182.0 against 186.5 ms), so it buys three points for nothing.
 //!
 //! **More budget is worth more, and costs a lot**: `mcts:32768:heuristic:deeper`
-//! is the strongest thing measured — the budget rung alone is +2.45 (99 paired
-//! blocks) — at **775 ms/turn, 52x**. The ladder flattens above it: 65,536 is
-//! +0.70 over 32,768 with an interval covering zero, for 2.1x the CPU again.
+//! is the strongest thing measured — the budget rung is **+4.30** (CI
+//! +3.40..+5.19, 110 paired blocks) — at **823 ms/turn, 44x**. The ladder stops
+//! there: 65,536 is **-0.79** over 32,768 (CI -3.46..+1.88, 9 blk), agreeing in
+//! sign and size with an independent +0.70 (14 blk) on an older platform.
+//!
+//! **The three constants are additive, not multiplicative.** `pmin=2` is worth
+//! the same three points at 32,768 as at 8,192 — difference-in-differences
+//! **+0.20** (CI -1.12..+1.53, 109 paired blocks, p = 0.76) — so `c_puct` sets
+//! the descent length, the budget supports the tree that length digs, and
+//! `prior_min_edges` fixes the narrow nodes it passes through, each
+//! independently. The axis looked dead for years because all three were wrong
+//! at once.
 //!
 //! `docs/SEARCH.md` §3 and §4. The three things that make this not a textbook
 //! AlphaZero search:
@@ -359,9 +370,13 @@ pub struct MctsConfig {
     /// and *within 9% independent of the budget* — so once the length is right
     /// more simulations only support it. **Depth is the axis; the budget is the
     /// support.** Paired against `8192:cp=0.02`: 2,048 is -4.79, 4,096 is
-    /// -1.90, 32,768 is **+2.45** (99 paired blk) and 65,536 is +3.15 (14 blk),
-    /// i.e. **+0.70 for the last 2.1x of CPU with an interval covering zero.**
-    /// The ridge stops paying at about 32,768.
+    /// -1.90, and 32,768 is **+4.03** (CI +3.14..+4.92, 127 paired blk, p=6e-19
+    /// — re-measured 2026-09-09 on a frozen binary; the earlier +2.45 at 99
+    /// blocks was on an older evaluator). At `pmin=2` the same rung is **+4.30**
+    /// (110 paired blk). **65,536 is -0.79** over 32,768 (CI -3.46..+1.88, 9
+    /// blk), which agrees in sign and size with an independent +0.70 (14 blk)
+    /// on the older platform: two looks at the top of the ridge, neither able
+    /// to find a gain. **The ridge stops paying at 32,768.**
     ///
     /// The matched form, two runs sharing a baseline and a seed sequence with
     /// only `c_puct` between them: at 8,192 simulations **+5.93 (CI
@@ -694,10 +709,25 @@ pub struct MctsConfig {
     /// # That verdict inverts in the deep regime, and this is the second-largest
     /// constant in the file
     ///
-    /// At `cp = 0.02` and 8,192 simulations, `pmin=2` is **+4.73** (CI
-    /// +3.22..+6.24, 50 paired blocks, p = 4e-10) — and **+2.92** (CI
-    /// +1.06..+4.77, 28 paired blocks) re-measured on the post-`d7b4e42`
-    /// evaluator, so it is not an artefact of the platform it was found on.
+    /// At `cp = 0.02` and 8,192 simulations, `pmin=2` reproduces on **three
+    /// separate evaluators** — +4.73 (CI +3.22..+6.24, 50 paired blk),
+    /// **+2.78** (CI +2.39..+3.16, **600 paired blk**, p = 5e-46), and +3.12
+    /// (CI +2.23..+4.00, 117 paired blk) — so it is not an artefact of the
+    /// platform it was found on. Call it **three points**.
+    ///
+    /// **It is free.** Measured against `cp=0.02` in one sample, `pmin=2` is
+    /// **0.98x** the user CPU (182.0 against 186.5 ms/turn, two alternated
+    /// reps). An earlier 1.15x came from comparing two separately-taken
+    /// samples. A more accurate prior makes the descent more decisive, and the
+    /// descent it saves pays for the extra one-ply probes at two-edge nodes.
+    ///
+    /// **It does not stack with the budget.** The increment is +3.20 (CI
+    /// +2.23..+4.17, 109 paired blk) at 32,768 simulations against +3.00 on the
+    /// same seeds at 8,192 — a difference-in-differences of **+0.20 (CI
+    /// -1.12..+1.53, p = 0.76)**. `c_puct`, the budget and this knob are three
+    /// independent contributions, which is why no 1-D sweep ever found any of
+    /// them. (An eight-block reading once suggested +7.8 of stacking here; at
+    /// 109 blocks it is +0.20. Low-block readings drift.)
     ///
     /// The mechanism is the descent length. A node's *median* searched width is
     /// **2**, so `prior_min_edges = 3` means roughly half of all nodes get a

@@ -6,6 +6,19 @@ survived; assume the same.
 
 ## The answer, if you read nothing else
 
+> **Updated 2026-09-09.** With no time cap the spec is
+> **`mcts:32768:heuristic:deeper`** — +4.38 over the 8,192 rung (CI
+> +3.48..+5.28, 118 paired blocks) at 823 ms/turn of user CPU. **The ladder
+> stops there**: 65,536 is -0.79 (9 blk), and an older platform independently
+> read +0.70 (14 blk). If any latency matters, **`mcts:8192:heuristic:deeper`**
+> at 182 ms/turn is four fifths of the strength for a fifth of the CPU.
+>
+> The **three** constants are **additive**: `c_puct` sets the descent length,
+> the budget supports the tree it digs, and `prior_min_edges` fixes the narrow
+> nodes it passes through. `pmin=2` is worth the same three points at 32,768 as
+> at 8,192 (difference-in-differences +0.33, CI -0.99..+1.64, 117 paired
+> blocks), and **it is free** — 0.98x the CPU. See the 2026-09-09 entries.
+
 **`mcts:8192:heuristic:deeper`** — sugar for `mcts:8192:heuristic:cp=0.02,pmin=2`.
 **Two constants**, both shipped one to two orders of magnitude wrong for a
 search factored into sub-decisions, and neither of them the simulation budget.
@@ -1839,3 +1852,165 @@ about the search.
 
 Three evaluators, three block sets, same sign, all three intervals clear of
 zero and mutually overlapping. This is the most-replicated result in the file.
+
+### 2026-09-09 04:00 — **`pmin=2` does not stack with the budget. The two effects are additive.**
+
+The question the 06:45 entry left open, taken properly. `arena_v8`, seed
+3000000, baseline `mcts:2048:heuristic:quality`, one binary, everything paired
+on seed. The 8,192 arms are the ones that kept running after the session died
+and are at 600 blocks; the 32,768 arms are this wave's.
+
+| contrast | centred | 95% CI | paired blk | p |
+|---|---|---|---|---|
+| `pmin=2` - `pmin=3` at **8,192** | **+2.78** | +2.39..+3.16 | **600** | 5e-46 |
+| `pmin=2` - `pmin=3` at **32,768** | **+3.20** | +2.23..+4.17 | **109** | 6e-11 |
+| the same two **on the 109 seeds they share** | +3.00 / +3.20 | | 109 | |
+| **difference-in-differences** | **+0.20** | **-1.12..+1.53** | **109** | **0.76** |
+
+**The increment is a constant three points, the same at 32,768 as at 8,192.**
+The interaction term is +0.20 with an interval of +/-1.3, so anything larger
+than about one and a half points of stacking is excluded.
+
+**The +17.05 that suggested stacking was an eight-block reading, and it was
+noise.** At eight blocks `x-32768pmin2` read +17.05 against `x-32768cp002`'s
++9.29 — a +7.8 increment, which would have been stacking. The same cell on the
+same platform family at 109 paired blocks is +3.20. This is the third time in
+this file that an eight-to-thirteen-block reading has drifted by a factor of
+two or more on its way to a verdict (`cp=0.02` +4.68 -> +5.99; `null-self`
++1.63 -> -0.10; now this), and the first time the drift changed the *answer*
+rather than the size.
+
+**What that means mechanically.** `c_puct` sets the descent length, the budget
+supports the tree that length digs, and `prior_min_edges` fixes what happens at
+the narrow nodes the descent passes through. The 04:50 depth table already said
+the first two are separable — eight times the budget moves the mean descent by
+9% — and this says the third is separable from the budget too. Three
+independent knobs, three independent contributions, and the reason the axis
+looked dead for years is that all three were wrong at once.
+
+### 2026-09-09 04:00 — **the ridge tops out at 32,768**
+
+Same wave, paired on seed, each rung against 8,192 **at the same `pmin`**:
+
+| contrast | centred | 95% CI | paired blk | p |
+|---|---|---|---|---|
+| `32768:cp=0.02` - `8192:cp=0.02` | **+4.03** | +3.14..+4.92 | 127 | 6e-19 |
+| **`32768:deeper` - `8192:deeper`** | **+4.30** | **+3.40..+5.19** | **110** | 1e-21 |
+| `65536:deeper` - `32768:deeper` | **-0.79** | -3.46..+1.88 | 9 | 0.49 |
+
+and as absolute rows against the same baseline:
+
+| run | spec | blk | centred | win |
+|---|---|---|---|---|
+| `v8-32768cp002` | `mcts:32768:heuristic:cp=0.02` | 127 | +11.97 | 0.646 |
+| **`v8-32768pmin2`** | **`mcts:32768:heuristic:deeper`** | **110** | **+15.37** | **0.778** |
+| `v8-65536pmin2` | `mcts:65536:heuristic:deeper` | 9 | +16.50 | 0.861 |
+
+**8,192 -> 32,768 is worth +4.30 and 32,768 -> 65,536 is worth nothing
+measurable** (-0.79, interval covering zero, 9 blocks). That agrees in sign and
+size with the v6 reading of +0.70 at 14 blocks, from a different platform and a
+different block set: **two independent looks at the top of the ridge, neither
+of them able to find a gain.** 32,768 is where it stops paying.
+
+**The 65,536 rung could not be finished and the reason is worth recording.**
+Twenty-five consecutive launches were killed within ~70 s each, at
+`--concurrency` 1 and 2, with 8.6-10.4 GB reported "available" every time. A
+32,768 arm running beside it survived the whole period. So the ceiling is not a
+number `vm_stat` reports; it is the compressor plus swap, and it sits between
+32,768 and 65,536 simulations on a 24 GB machine that another workstream is
+using. The nine blocks it did produce are directional only.
+
+### 2026-09-09 03:50 — cost on HEAD, user CPU (`mc/cost.sh`, `sprobe_v9`)
+
+Two alternated reps agreeing to 3%, one spec per process, 228-turn sample.
+
+| spec | ms/turn user CPU | x old champion |
+|---|---|---|
+| `mcts:2048:heuristic:quality` | 18.75 | 1.00 |
+| `mcts:8192:heuristic:cp=0.02` | 186.47 | 9.95 |
+| **`mcts:8192:heuristic:deeper`** | **182.02** | **9.71** |
+| **`mcts:32768:heuristic:deeper`** | **822.87** | **43.89** |
+
+**Correction to the 06:23 entry: `pmin=2` is not 1.15x, it is free.** Measured
+against `cp=0.02` in the *same* sample it is **0.98x** (182.02 against 186.47),
+and both reps agree (41.53/40.78 against 42.54/41.11 seconds). The 1.15x came
+from comparing a 72-turn sample of one spec with a 72-turn sample of the other
+taken at a different time. A more accurate prior makes the descent more
+decisive, and the saved descent pays for the extra one-ply probes at two-edge
+nodes. **So `pmin=2` buys three points for nothing**, which makes it the best
+ratio in this file by a wide margin — the previous claim understated it.
+
+**The frontier, on HEAD's cost and the `v8` strength ladder:**
+
+| ms/turn | x old champion | spec | vs `8192:deeper` |
+|---|---|---|---|
+| 18.8 | 1.0 | `mcts:2048:heuristic:quality` | — |
+| **182.0** | **9.7** | **`mcts:8192:heuristic:deeper`** | 0 by construction |
+| **822.9** | **43.9** | **`mcts:32768:heuristic:deeper`** | **+4.30** (110 blk) |
+| ~1750 | ~93 | `mcts:65536:heuristic:deeper` | -0.79 (9 blk) — no |
+
+**If there is no time cap, `mcts:32768:heuristic:deeper` is the spec.** It costs
+4.5x the 8,192 rung for +4.30 centred, and the rung above it costs 2.1x more
+again for nothing.
+
+### 2026-09-09 04:11 — FINAL for this wave
+
+Two pinned binaries, both fingerprinted in `mc/bin/*.rev`. `arena_v9` is HEAD
+`48c39bd` and carries the headline; `arena_v8` is `5318276` and carries the
+deep ladder, because its 8,192 arms were already at 600 blocks. **Never pool
+across them** — the `c949bcf` entry above measures exactly how far apart they
+are.
+
+#### (c) The headline, on HEAD, `eval.rs` frozen for the whole wave
+
+| run | candidate | baseline | blk | centred | 95% CI | win |
+|---|---|---|---|---|---|---|
+| `w9-null-greedy` | `heuristic:full` | itself | 237 | **+0.00** | -0.03..+0.03 | **0.250** |
+| `w9-oldchamp-vs-greedy` | `mcts:2048:heuristic:quality` | `heuristic:full` | 243 | -0.40 | -0.95..+0.16 | 0.222 |
+| **`w9-champ-vs-greedy`** | **`mcts:8192:heuristic:deeper`** | `heuristic:full` | **186** | **+7.45** | **+6.86..+8.04** | **0.509** |
+
+**Champion - old champion, common stateless opponent, paired on seed:
++7.94 (CI +6.98..+8.90, 129 paired blocks, p = 3e-59).**
+
+#### (a) `pmin=2` x budget — **additive, not multiplicative**
+
+| contrast | centred | 95% CI | paired blk |
+|---|---|---|---|
+| `pmin=2` at 8,192 (`v8`) | +2.78 | +2.39..+3.16 | **600** |
+| `pmin=2` at 8,192 (HEAD) | +3.04 | +2.17..+3.91 | 120 |
+| `pmin=2` at 32,768 (`v8`) | +3.19 | +2.22..+4.16 | 117 |
+| **difference-in-differences (32,768 - 8,192)** | **+0.33** | **-0.99..+1.64** | **117** |
+
+#### (b) The ridge — **tops out at 32,768**
+
+| contrast | centred | 95% CI | paired blk |
+|---|---|---|---|
+| **`32768:deeper` - `8192:deeper`** | **+4.38** | **+3.48..+5.28** | **118** |
+| `32768:cp=0.02` - `8192:cp=0.02` | +4.03 | +3.14..+4.92 | 127 |
+| `65536:deeper` - `32768:deeper` | **-0.79** | -3.46..+1.88 | 9 |
+
+#### (d) The strongest spec, and what it costs
+
+    mcts:32768:heuristic:deeper          # 823 ms/turn user CPU, 44x the old champion
+    mcts:8192:heuristic:deeper           # 182 ms/turn, 9.7x — four fifths of the strength
+
+#### (e) What did not work
+
+1. **The stacking hypothesis.** Eight blocks read +17.05 and implied a +7.8
+   increment at 32,768; 117 paired blocks say +3.19, the same as at 8,192.
+2. **65,536.** Twenty-five consecutive launches killed inside ~70 s each with
+   8.6-10.4 GB reported available. Nine blocks, directional only.
+3. **Two deep arenas at once.** Both die within 90 s while system daemons crash
+   at the same timestamps. Serialising them is the only thing that works here.
+4. **A 16,384 cell** was opened as a cheaper "above 8,192" and closed an hour
+   later: at two usable cores it would have halved the 32,768 cell for a second
+   point on a curve that turned out to be flat.
+5. **"`pmin=2` costs 1.15x".** It is 0.98x — free — measured against `cp=0.02`
+   in one sample rather than across two.
+6. **`--concurrency 3` at 32,768** and `--concurrency 2` at 65,536: both are
+   above the memory line on this machine, and the failure is silent.
+
+**Still running and safe to leave:** `v8-32768pmin2` / `v8-32768cp002` under
+`mc/supervise.sh jobs/w9deep.txt`, which restarts either one if jetsam takes it.
+Everything is `--resume`-safe; `mc/sum.py`, `mc/pair.py` and `mc/did.py` read the
+files without touching them.
