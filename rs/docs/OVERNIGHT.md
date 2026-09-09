@@ -218,10 +218,14 @@ opponent, 110 paired blocks. ~181 ms/turn of user CPU.
    and the two display bugs it was spawned for are open — the shortlist is
    mostly one retrieval restated with trailing no-op pickups, and the score
    column's units are unlabelled. `docs/FINDINGS-tui.md` has its notes.
-2. **`board = 0.90` is probably worth taking**: +2.45 [+1.74, +3.17] at 122
-   blocks on `mcts:1024:cp=0.05`, nothing on either shallow agent. It was left
-   because 122 blocks is under this project's own bar for a deep number. If a
-   250-block reading exists in the scratchpad, take it.
+2. ~~**`board = 0.90` is probably worth taking**~~ — **done, and the +2.45 was
+   on a pre-`48c39bd` `mcts.rs`.** Re-measured on the shipped search at **600**
+   blocks it is +0.48 [+0.19, +0.76] *, still free on both shallow agents, and
+   it landed together with `TEMPLE_SCALE` 1.4 -> 1.2 — the pair is worth **+1.71
+   [+1.34, +2.08] * on `mcts:1024:cp=0.05`** and costs `greedy:64` −0.30.
+   `docs/FINDINGS-eval.md` F41-F48. **Note for anyone quoting a deep number from
+   before 2026-09-09: `mcts.rs` changed by 830 lines between `6afe5fc` and
+   `48c39bd`, so `--agent mcts:N` named a different search then (F39).**
 3. **The headline race never ran on a frozen build.** Every number above was
    measured while `eval.rs` was still moving. Before believing the champion's
    margin, re-run it on one pinned binary.

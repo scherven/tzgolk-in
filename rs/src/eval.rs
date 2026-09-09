@@ -139,11 +139,27 @@ const ACTION_VALUE: f32 = 0.2;
 /// still on that agent and is left to whoever has its 250-block number.
 /// `docs/FINDINGS-eval.md` F5a, F7, F29c, F34, F35.
 ///
+/// **0.90 now has that number, and it is 600 blocks rather than 250.** On
+/// `evalab-p25` (rev `48c39bd`), against this file as it shipped at 0.80:
+/// `greedy:64` −0.21 [−0.46, +0.04] at 800 blocks, `mcts:256` −0.09
+/// [−0.43, +0.26] at 400, and **`mcts:1024:cp=0.05` +0.48 [+0.19, +0.76] \* at
+/// 600**, win rate 0.273. Free on both shallow agents, distinguishable on the
+/// one that searches. The deep curve peaks near 1.0-1.1 (+0.93 \*, +1.01 \*)
+/// and turns over by 1.2, but 1.0 costs `greedy:64` −1.00 \* and 1.1 costs
+/// −1.53 \*, so 0.90 is the last value that is free everywhere.
+/// `docs/FINDINGS-eval.md` F41, F45b, F47.
+///
 /// Do **not** also subtract the placed worker from `engine_value`'s action
 /// count. That corrects the same double count a second time and measures
 /// −12.09 / −9.95 with a 0.028 win rate, the worst configuration in the log
 /// after ungating the space table entirely (F5b).
-const BOARD_SCALE: f32 = 0.8;
+///
+/// The constants this one is supposed to be double-counting against were all
+/// re-swept on top of `board = 0.8` and not one of them moved: `ACTION_VALUE`
+/// is +0.01 ± 0.04 at zero on 800 blocks, `action_cap` is −0.00 ± 0.03,
+/// `GEAR_SCALE[Chichen]` and `[Palenque]` are still unimodal at 0.7 and 1.5.
+/// **`BOARD_SCALE` is not coupled to any of them** (F43).
+const BOARD_SCALE: f32 = 0.9;
 
 /// [`temple_outlook`] is *under*-priced, which is the one thing nobody
 /// expected: scaling it alone is monotone improving from 0.5 to 1.4 on both
@@ -158,7 +174,35 @@ const BOARD_SCALE: f32 = 0.8;
 /// are strongly collinear, so least squares drove the temple coefficient
 /// negative to cancel the other two rather than because temples are worth
 /// less. Correct board and engine first and the sign flips. `docs/FINDINGS-eval.md` F8.
-const TEMPLE_SCALE: f32 = 1.4;
+///
+/// **All of that was measured on agents that search one turn, and an agent
+/// that searches six wants the opposite.** `temple_outlook` prices where
+/// everyone's standings will be on a scoring day up to thirteen days away; a
+/// one-ply agent has to take that on trust, and a search that plays the ride
+/// out watches the standings actually move and does not need to be told twice.
+/// Against this file as it shipped at 1.4, on `evalab-p25`:
+///
+/// | `temple` | `greedy:64` (800) | `mcts:256` (400) | `mcts:1024:cp=0.05` |
+/// | --- | --- | --- | --- |
+/// | 0.7 | **−4.02** * | — | +1.36 * (190) |
+/// | 0.9 | −1.25 * | — | +1.74 * (250) |
+/// | 1.0 | −0.59 * | +0.16 | +1.33 * (250) |
+/// | 1.1 | −0.43 * | +0.27 | +1.40 * (400) |
+/// | **1.2** | **−0.13 [−0.35, +0.09]** | **+0.19 [−0.11, +0.49]** | **+1.35 [+1.00, +1.71]** * (400) |
+///
+/// The deep tier is a **plateau** from 0.7 to 1.2 at about +1.4 and the shallow
+/// one is a cliff, so 1.2 is taken as the point on that plateau which costs
+/// `greedy:64` and `mcts:256` nothing distinguishable. This is not the temple
+/// term being worth less than F8 measured — F8 is right about the two agents it
+/// measured — it is the largest term in the evaluator being a *forecast*, and
+/// the deliverable being `mcts:8192:heuristic:cp=0.02,pmin=2`.
+///
+/// The control that makes this shape rather than magnitude: moving both
+/// constants the *other* way (`board = 0.7, temple = 1.7`) costs `greedy:64`
+/// −0.25 [−0.51, +0.01] — nothing — and the deep search **−2.23 [−2.61, −1.85]
+/// \***, win rate 0.185. Same magnitude change, opposite sign of result.
+/// `docs/FINDINGS-eval.md` F41, F45, F46a, F47.
+const TEMPLE_SCALE: f32 = 1.2;
 
 /// Rounds a worker typically spends riding a gear between actions.
 const ROUNDS_PER_ACTION: f32 = 2.6;

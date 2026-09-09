@@ -344,9 +344,12 @@ pub mod v {
     /// F24 landed the second one, `g_pal` (1.0) and `chi` (1.0) when F28 landed
     /// `GEAR_SCALE`, and `pal_need` (0.0) and `board_scale` (0.5) when F29
     /// landed `HUNGRY_CORN` and re-fitted `BOARD_SCALE` on the new table. So
-    /// the null is now `--ab 'board=0.8,av=0.2,temple=1.4,rs=0.05,ci=0.0,
+    /// the null is now `--ab 'board=0.9,av=0.2,temple=1.2,rs=0.05,ci=0.0,
     /// ceiling,pal=1.5,chi=0.7,pneed=0.25'` and must measure 0 against this.
-    /// `board_scale` moved again (0.65 -> 0.8) with F35.
+    /// `board_scale` moved again (0.65 -> 0.8) with F35 and (0.8 -> 0.9) with
+    /// F47, which also took `temple_scale` 1.4 -> 1.2. The pre-F47 evaluator —
+    /// the one every number before this session was measured against — is
+    /// `--base 'board=0.8,temple=1.4'`.
     /// The pre-F24 evaluator is `--base 'rs=0.5,ci=1.9,noceiling'`, the pre-F28
     /// one is `--base 'pal=1,chi=1,pneed=0,board=0.5'`, and the pre-F29 one is
     /// `--base 'pneed=0,board=0.5'`.
@@ -367,9 +370,9 @@ pub mod v {
         contend_monument: false,
         charge_placed: false,
         hand_lag: 1.0,
-        board_scale: 0.8,
+        board_scale: 0.9,
         engine_scale: 1.0,
-        temple_scale: 1.4,
+        temple_scale: 1.2,
         t_near: 0.85,
         t_far: 0.55,
         t_half: 0.0,

@@ -2706,6 +2706,56 @@ fn evaluator_starvation_ignores_income_it_has_not_earned() {
     );
 }
 
+/// `starvation_risk`'s urgency floor is **unreachable**, and this pins that.
+///
+/// The term discounts a shortfall that is still several rounds out by
+/// `(1.0 / (1.0 + rounds * 0.25)).max(0.3)`. The `.max` never fires: the
+/// longest run-up to a food day is the one to `RESOURCE_DAYS[0]` from day 0,
+/// and `1 / (1 + 0.25 * 8) = 0.3333`, which is above the floor. Measured as
+/// well as derived — `evalab --ab ufl=0.1` reads **+0.0000 in all 656 blocks**,
+/// an identity rather than a small effect (`docs/FINDINGS-eval.md` F43a).
+///
+/// The reason this is worth a test rather than a deletion is the failure mode
+/// it guards. Lengthening the calendar, or lowering the 0.25 coefficient, would
+/// bring the floor into play — silently, since nothing else changes shape — and
+/// the value it would take is a hand number that has never been measured while
+/// live. If this test fails, the floor has just become load-bearing and wants
+/// sweeping before it is trusted.
+#[test]
+fn evaluator_starvation_urgency_never_reaches_its_floor() {
+    use tzolkin::state::{LAST_DAY, POINT_DAYS, RESOURCE_DAYS};
+
+    const URGENCY: f32 = 0.25; // `starvation_risk`'s coefficient
+    const FLOOR: f32 = 0.30; // its `.max(..)`
+
+    let mut worst = f32::INFINITY;
+    for day in 0..LAST_DAY {
+        let Some(next) = RESOURCE_DAYS
+            .iter()
+            .chain(POINT_DAYS.iter())
+            .copied()
+            .filter(|&d| d > day)
+            .min()
+        else {
+            continue;
+        };
+        let rounds = (next - day) as f32;
+        let urgency = 1.0 / (1.0 + rounds * URGENCY);
+        assert!(
+            urgency > FLOOR,
+            "day {day}: the food day is {rounds} rounds out, urgency {urgency} \
+             has reached the {FLOOR} floor -- it is no longer dead code and has \
+             never been swept while live"
+        );
+        worst = worst.min(urgency);
+    }
+    assert!(
+        worst < FLOOR + 0.05,
+        "the floor is not merely unreached, it is far away ({worst}) -- if the \
+         calendar changed, this test is checking nothing"
+    );
+}
+
 /// The board table is scaled per *gear*, because it prices what a space hands
 /// over and never what it charges.
 ///
