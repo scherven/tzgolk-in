@@ -1,0 +1,48 @@
+=== control : heuristic:full vs heuristic:full (400 games) 05:04 ===
+  metric                  value        95% CI              null
+  ----------------------------------------------------------------
+  mean centred score       0.000   ( +0.000,  +0.000)  .    0.00
+  points vs baseline      -0.000   ( -0.000,  +0.000)  .    0.00
+  win rate                 0.250   ( +0.250,  +0.250)  .    0.25
+  ----------------------------------------------------------------
+  candidate mean score     50.39                        baseline   50.39
+  NOT DISTINGUISHABLE. Centred score +0.00, interval (+0.00, +0.00) 
+  Read the win rate against a null of 25%, not 50%: one seat of four is 
+
+=== champ8192 : mcts:8192:heuristic:deeper vs heuristic:full (800 games) 05:06 ===
+  metric                  value        95% CI              null
+  ----------------------------------------------------------------
+  mean centred score       9.213   ( +8.595,  +9.830)  +    0.00
+  points vs baseline      12.283   (+11.460, +13.107)  +    0.00
+  win rate                 0.564   ( +0.526,  +0.602)  +    0.25
+  ----------------------------------------------------------------
+  candidate mean score     58.12                        baseline   45.84
+  STRONGER. The candidate's centred score is +9.21 and the interval 
+  Read the win rate against a null of 25%, not 50%: one seat of four is 
+  Two-sided p for centred score = 0: 0.0000 (one look; see docs/TRAINING.md).
+
+=== champ32768 : mcts:32768:heuristic:deeper vs heuristic:full (400 games) 05:41 ===
+  metric                  value        95% CI              null
+  ----------------------------------------------------------------
+  mean centred score      11.831   (+11.024, +12.639)  +    0.00
+  points vs baseline      15.775   (+14.698, +16.852)  +    0.00
+  win rate                 0.676   ( +0.628,  +0.724)  +    0.25
+  ----------------------------------------------------------------
+  candidate mean score     61.35                        baseline   45.58
+  STRONGER. The candidate's centred score is +11.83 and the interval 
+  Read the win rate against a null of 25%, not 50%: one seat of four is 
+  Two-sided p for centred score = 0: 0.0000 (one look; see docs/TRAINING.md).
+
+=== champ_vs_old : mcts:8192:heuristic:deeper vs mcts:2048:heuristic:quality (400 games) 07:22 ===
+  metric                  value        95% CI              null
+  ----------------------------------------------------------------
+  mean centred score       5.867   ( +5.137,  +6.596)  +    0.00
+  points vs baseline       7.822   ( +6.850,  +8.795)  +    0.00
+  win rate                 0.417   ( +0.368,  +0.467)  +    0.25
+  ----------------------------------------------------------------
+  candidate mean score     51.93                        baseline   44.11
+  STRONGER. The candidate's centred score is +5.87 and the interval 
+  Read the win rate against a null of 25%, not 50%: one seat of four is 
+  Two-sided p for centred score = 0: 0.0000 (one look; see docs/TRAINING.md).
+
+=== ALL DONE 07:33 ===

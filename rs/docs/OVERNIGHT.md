@@ -235,3 +235,36 @@ opponent, 110 paired blocks. ~181 ms/turn of user CPU.
 **The one thing to carry forward above any result:** every workstream's log
 (`FINDINGS-eval.md` ~93 KB, `-mcts.md`, `-generation.md`, `-tui.md`) survived
 eight agent deaths by usage limit. Nothing else did.
+
+## The final ladder — measured 2026-09-09 05:04-07:33, one binary pinned at `f81666d`
+
+Every earlier headline moved because `eval.rs` or `mcts.rs` moved underneath
+it. These four races share one binary, one evaluator and one search, and the
+control says so: `heuristic:full` against itself reads **+0.000, interval
+(+0.000, +0.000), win 0.250** — a zero-width interval, because identical agents
+on identical seeds play identical games.
+
+| candidate | baseline | centred | 95% CI | win (null 0.250) | final score |
+| --- | --- | --- | --- | --- | --- |
+| `heuristic:full` | itself | +0.000 | (+0.000, +0.000) | 0.250 | 50.39 vs 50.39 |
+| **`mcts:8192:heuristic:deeper`** | `heuristic:full` | **+9.21** | (+8.60, +9.83) | **0.564** | 58.12 vs 45.84 |
+| **`mcts:32768:heuristic:deeper`** | `heuristic:full` | **+11.83** | (+11.02, +12.64) | **0.676** | 61.35 vs 45.58 |
+| `mcts:8192:heuristic:deeper` | `mcts:2048:heuristic:quality` | +5.87 | (+5.14, +6.60) | 0.417 | 51.93 vs 44.11 |
+
+200 / 100 / 100 blocks. Raw log in `docs/FINAL-LADDER.txt`.
+
+**The headline: `mcts:32768:heuristic:deeper` wins 67.6% of its games against
+three copies of the strongest one-ply agent**, where an equal player wins 25%,
+and finishes ~16 points ahead on raw score. `mcts:8192` is 0.564 at 182 ms/turn
+against 823 — four and a half times cheaper for four fifths of the margin.
+
+### Why this number moved three times
+
++13.32, then +7.45, then +9.21 for the same spec against the same opponent. The
+platform moved under the first two. The fall to +7.45 is the interesting one and
+is not a regression: `BOARD_SCALE 0.65 -> 0.80` made `heuristic:full` **+6.75**
+stronger against `random`, and **a better one-ply evaluator does more of the
+work itself, so the search's marginal contribution falls.** The rise to +9.21
+came from shaping the evaluator for the search that ships. On this build the
+*old* champion, `mcts:2048:heuristic:quality`, no longer beats one-ply greedy at
+all.
