@@ -128,13 +128,31 @@ impl ScoreUnit {
 /// Plain data on purpose: the thread, the channel and the agent handle all live
 /// in `bin/tui.rs`, so this module stays a pure renderer and the size-sweep test
 /// can build a thinking screen without starting anything.
-#[derive(Clone)]
+///
+/// # Why there is no percentage in here
+///
+/// Nothing outside `mcts.rs` can see a simulation counter, so a bar that filled
+/// from 0 to 1 would be inventing the only number on the screen. Every field
+/// below is something the viewer genuinely knows: which search of how many is
+/// running, what the finished ones returned, and what the *previous* turn cost.
+#[derive(Clone, Default)]
 pub struct Thinking {
     /// What is running, in the present tense: "searching R's turn".
     pub what: String,
     /// One honest line of detail — a stage count, or what is already known.
     pub detail: String,
     pub elapsed: Duration,
+    /// Search `k` of `n`. Pressing `n` costs two — one to choose the move, one
+    /// to rank what it passed over — and this is the one fraction on the screen
+    /// that is a fraction of something counted.
+    pub stage: Option<(u32, u32)>,
+    /// What the run has already settled, oldest first: after stage 1 this holds
+    /// the move that was chosen, so a slow stage 2 is not a bare clock.
+    pub known: Vec<String>,
+    /// What the last comparable search cost. The only defensible scale for "how
+    /// much longer", and the bar below is labelled as a comparison to it rather
+    /// than as progress, because it can and does run past 100%.
+    pub prior: Option<Duration>,
 }
 
 impl Thinking {
@@ -163,10 +181,16 @@ pub struct App {
     /// never simply stop redrawing: at the champion's budget a turn is ~200 ms,
     /// and the deliverable may be run at a budget where it is seconds.
     pub thinking: Option<Thinking>,
-    /// The sub-decisions of the last turn the agent played: label, what it
-    /// chose, and the share of visits that went there. This is the search
+    /// The sub-decisions of the last turn the agent played. This is the search
     /// talking, not a heuristic ranking of it.
-    pub last_decisions: Vec<(String, String, f32)>,
+    pub last_decisions: Vec<Decision>,
+    /// Who played that turn and what they played, e.g. `R played retrieve …`.
+    ///
+    /// Not decoration. The search pane sits beside a shortlist belonging to a
+    /// *different* player in the position *after* the move — press `n` and the
+    /// left half is R's reasoning while the right half is G's options — and
+    /// with nothing saying so the two read as one account of one turn.
+    pub last_played: Option<String>,
     /// The move list on show, best first, together with how many moves it was
     /// drawn from and what produced it.
     pub ranking: crate::eval::Ranking,
@@ -177,6 +201,13 @@ pub struct App {
 }
 
 impl App {
+    /// The raw ranking, spellings and all.
+    ///
+    /// Almost never what a caller wants: the panel, the selection and the
+    /// preview all work over [`App::rows`], which is this list with the
+    /// restatements folded, and a caller that sized a walk on *this* count
+    /// walked the selection off the end of the panel. Kept for the arithmetic
+    /// the fold itself needs.
     pub fn candidates(&self) -> &[(Move, f32)] {
         &self.ranking.moves
     }
@@ -195,6 +226,22 @@ impl App {
 
     pub fn unit(&self) -> ScoreUnit {
         ScoreUnit::infer(self.source, &self.ranking.note)
+    }
+
+    /// Move the selection by `d` rows, wrapping.
+    ///
+    /// Over [`App::rows`], **not** `ranking.moves`. The two differ by exactly
+    /// the fold — ten spellings become three outcomes — and a caller that
+    /// wrapped on the raw count walked the selection off the end of the panel,
+    /// where `selected_move` returns `None` and the preview goes blank.
+    pub fn step_selection(&mut self, d: isize) {
+        let n = self.rows().len();
+        if n == 0 {
+            self.selected = 0;
+            return;
+        }
+        let n = n as isize;
+        self.selected = (((self.selected as isize + d) % n + n) % n) as usize;
     }
 }
 
@@ -274,7 +321,12 @@ pub fn row_text(m: &Move) -> String {
     for (w, c) in v.iter().filter(|(_, c)| !c.is_skip()) {
         s.push_str(&format!(" w{}[{c}]", w.0));
     }
-    let idle = idle(v);
+    let mut idle = idle(v);
+    // Sorted, because `same_outcome` treats these as a set and folds the
+    // orderings together: leaving them in sequence order printed `w3,w2` for
+    // one row and `w2,w3` for the next, which is a difference the fold has
+    // already decided is not one.
+    idle.sort_unstable();
     if !idle.is_empty() {
         let who: Vec<String> = idle.iter().map(|w| format!("w{w}")).collect();
         // "+ ... to hand" rather than "[skip]": the worker really does come
@@ -315,6 +367,12 @@ pub fn fold_rows(moves: &[(Move, f32)], g: &GameState, p: PlayerId) -> Vec<Row> 
 // ---- top-level layout ---------------------------------------------------
 
 pub fn draw(f: &mut Frame, app: &App) {
+    // The bottom pane grows with the terminal. A turn is a chain of up to a
+    // dozen sub-decisions and the pane that lists them was pinned at eight
+    // rows, so on a tall terminal the extra height went to a Moves panel with
+    // three rows in it while the search's own account of the turn was cut off
+    // at two.
+    let deep = (f.area().height / 4).clamp(8, 16);
     let root = Layout::vertical([
         Constraint::Length(4),
         Constraint::Min(10),
@@ -322,10 +380,16 @@ pub fn draw(f: &mut Frame, app: &App) {
         // the Moves column mean. It is only one row because it was previously
         // zero and the panel was unreadable for want of it.
         Constraint::Length(1),
-        Constraint::Length(8),
+        Constraint::Length(deep),
         Constraint::Length(1),
     ])
     .split(f.area());
+
+    // Folded once and threaded down. Both the shortlist and the preview need
+    // this list, and each row costs a `successor` and a `margin`; recomputing
+    // it per panel spent that twice per frame, on the draw loop, at the exact
+    // moment the other thread is saturating a core with the search.
+    let rows = app.rows();
 
     header(f, root[0], app);
 
@@ -342,18 +406,30 @@ pub fn draw(f: &mut Frame, app: &App) {
     players(f, left[1], app);
     cards(f, left[2], app);
 
+    // Three fixed lengths over-subscribed this column below ~44 rows, and the
+    // solver resolved it by starving whichever panel had the weakest
+    // constraint — which was the move list, the one panel this viewer exists
+    // for: at 80x30 the shortlist was a single row. Allocated explicitly
+    // instead, moves first. Temples and Research are reference panels a reader
+    // can read past; the shortlist is the answer.
+    let h = body[1].height;
+    let mv = (h / 3).clamp(6, 12).min(h);
+    let rs = 7.min((h - mv).div_ceil(2));
+    // Temples never wants more than its own height, so anything above that
+    // falls through to the shortlist, which takes the remainder below.
+    let tp = (h - mv - rs).min(13);
     let right = Layout::vertical([
-        Constraint::Length(13),
-        Constraint::Length(7),
-        Constraint::Min(4),
+        Constraint::Length(tp),
+        Constraint::Length(rs),
+        Constraint::Min(0),
     ])
     .split(body[1]);
     temples(f, right[0], app);
     research(f, right[1], app);
-    moves(f, right[2], app);
+    moves(f, right[2], app, &rows);
 
     units(f, root[2], app);
-    preview(f, root[3], app);
+    preview(f, root[3], app, &rows);
     help(f, root[4], app);
 }
 
@@ -705,6 +781,53 @@ fn cost_wide(cost: Bundle) -> String {
     s
 }
 
+/// Shorten `s` to `room` columns by dropping the **middle**.
+///
+/// Cutting from the right is what the panel used to do, and after the fold it
+/// removes precisely the characters that make one row different from another:
+/// the shared body `retrieve w0[+3 corn] w1[-3 corn, G+1]` survives and the
+/// distinguishing tail `+ w2 to hand` becomes `+..`, so three genuinely
+/// different outcomes render as three copies of one line. Head and tail are
+/// both load-bearing; the middle of a long retrieval is the part a reader
+/// skims.
+pub fn fit(s: &str, room: usize) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    if cs.len() <= room {
+        return s.to_string();
+    }
+    if room <= 4 {
+        return cs.iter().take(room).collect();
+    }
+    // A third to the tail: enough for `+ w2,w3 to hand`, not so much that the
+    // verb and the first pickup are lost from the head.
+    let keep = room - 1;
+    let tail = (keep / 3).max(3);
+    let head = keep - tail;
+    let mut out: String = cs[..head].iter().collect();
+    out.push('…');
+    out.extend(&cs[cs.len() - tail..]);
+    out
+}
+
+/// [`fit`], but keeping three quarters at the **end**.
+///
+/// For a producer's note, where the closing clause is a caveat and the opening
+/// one is a label already on screen. Right-truncating `... — NOT the whole move
+/// space` removed the warning; a centred elision left ` move space`, which
+/// reads as the opposite of what it says. Losing the head costs a duplicate.
+pub fn fit_tail(s: &str, room: usize) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    if cs.len() <= room || room <= 8 {
+        return fit(s, room);
+    }
+    let keep = room - 1;
+    let head = keep / 4;
+    let mut out: String = cs[..head].iter().collect();
+    out.push('…');
+    out.extend(&cs[cs.len() - (keep - head)..]);
+    out
+}
+
 fn cost_str(cost: Bundle) -> String {
     let mut s = String::new();
     for r in Resource::BLOCKS {
@@ -718,9 +841,8 @@ fn cost_str(cost: Bundle) -> String {
     s
 }
 
-fn moves(f: &mut Frame, area: Rect, app: &App) {
+fn moves(f: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
     let r = &app.ranking;
-    let rows = app.rows();
     let unit = app.unit();
     // Folded rows, not raw ones: the count in the title has to be the count of
     // lines below it, or the panel is describing a different list.
@@ -741,9 +863,14 @@ fn moves(f: &mut Frame, area: Rect, app: &App) {
             app.source.label()
         )
     } else if unit == ScoreUnit::VisitShare {
-        // `total` here is turns the tree *reached*, not legal turns, and the
-        // panel has to not imply otherwise. See `SearchAgent::ranked_moves`.
-        format!("Moves — {shown} of {} turns the search reached", r.total)
+        // Two different truncations happen before this list, and a reader who
+        // is told about neither will read the shares as a distribution that
+        // ought to sum to 100. `total` is turns the tree *reached*, not legal
+        // turns (see `SearchAgent::ranked_moves`); and the shortlist is the top
+        // few of those, so say what fraction of the search's own visits the
+        // rows below actually account for.
+        let held: f32 = rows.iter().map(|x| x.score).sum();
+        format!("Moves — {shown} outcomes, {held:.0}% of visits, of {} reached", r.total)
     } else {
         format!("Moves — {shown} of {} · {}", r.total, app.source.label())
     };
@@ -753,7 +880,11 @@ fn moves(f: &mut Frame, area: Rect, app: &App) {
     // between them. Budget from the real width instead.
     let inner = area.width.saturating_sub(2) as usize;
     let wide = inner >= 46;
-    let gutter = if wide { 2 + 7 + 8 } else { 2 + 7 };
+    // Every `ScoreUnit::render` arm is six columns wide, deliberately; the rest
+    // of this is the selection marker, the separator and the 1-ply column. It
+    // has to be exact — a gutter one short clips the `xN` marker that the fold
+    // reserved room for, which is the one mark saying a row stands for several.
+    let gutter = 2 + 6 + 2 + if wide { 8 } else { 0 };
     let room = inner.saturating_sub(gutter).max(8);
 
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len() + 1);
@@ -771,14 +902,19 @@ fn moves(f: &mut Frame, area: Rect, app: &App) {
 
     for (i, row) in rows.iter().enumerate() {
         let sel = i == app.selected;
-        let mut text = row.text.clone();
         // The fold hides nothing: say how many spellings went into the row.
-        if row.spellings > 1 {
-            text.push_str(&format!("  x{}", row.spellings));
-        }
-        if text.chars().count() > room {
-            text = text.chars().take(room.saturating_sub(3)).collect::<String>() + "...";
-        }
+        // Budgeted *before* the move text rather than appended after it — as a
+        // suffix it was the first thing the truncation ate, so the one marker
+        // saying the row stands for several was never on screen.
+        let mark = if row.spellings > 1 {
+            format!("  x{}", row.spellings)
+        } else {
+            String::new()
+        };
+        let text = format!(
+            "{}{mark}",
+            fit(&row.text, room.saturating_sub(mark.chars().count()))
+        );
         let mut spans = vec![
             Span::styled(
                 if sel { "> " } else { "  " },
@@ -833,9 +969,7 @@ fn moves(f: &mut Frame, area: Rect, app: &App) {
 /// other.
 fn units(f: &mut Frame, area: Rect, app: &App) {
     let mine = match app.unit() {
-        ScoreUnit::VisitShare => {
-            "visits = share of the search's finished simulations that played this turn"
-        }
+        ScoreUnit::VisitShare => "visits = share of finished sims that played this turn",
         ScoreUnit::Margin => "margin = projected final score less the best opponent's",
         ScoreUnit::Unstated => "agent = this agent's own scale, which it does not name",
     };
@@ -847,46 +981,75 @@ fn units(f: &mut Frame, area: Rect, app: &App) {
         .strip_prefix(&app.agent_name)
         .map(|s| s.trim_start_matches(" ·").trim())
         .unwrap_or(&app.ranking.note);
-    let mut text = format!(" {mine} · 1-ply = eval::margin of the successor · {note}");
+
+    // Assembled shortest-first and dropped from the right, because the pieces
+    // are in falling order of certainty: the viewer's own definition of its own
+    // column, then of the column it computed, then the producer's prose. The
+    // note is *elided in the middle* rather than cut off, since its tail is
+    // where a producer puts its caveat — "NOT the whole move space" is the
+    // sentence that stops the shortlist being read as the move list, and
+    // truncating from the right removed exactly that.
     let w = area.width as usize;
+    let mut text = format!(" {mine}");
+    let ply = " · 1-ply = eval::margin of the successor";
+    // The note goes on before the 1-ply gloss, and only the gloss is dropped
+    // when they will not both fit: the column is already headed `1-ply`, while
+    // the note is the only line that can contradict this panel's own guess at
+    // what its numbers are.
+    let left = w.saturating_sub(text.chars().count() + 3);
+    if left >= 20 && !note.is_empty() {
+        text.push_str(" · ");
+        text.push_str(&fit_tail(note, left.min(76)));
+    }
+    if text.chars().count() + ply.chars().count() <= w {
+        text.push_str(ply);
+    }
     if text.chars().count() > w {
-        text = text.chars().take(w.saturating_sub(1)).collect();
+        text = fit(&text, w);
     }
     f.render_widget(Paragraph::new(Span::styled(text, dim())), area);
 }
 
-fn preview(f: &mut Frame, area: Rect, app: &App) {
+fn preview(f: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
     if let Some(t) = &app.thinking {
         thinking(f, area, app, t);
         return;
     }
 
     // Both halves, not one or the other. The diff answers "what does this move
-    // do"; the sub-decisions answer "how did the search arrive at it". The old
-    // pane showed the second and, once an agent had moved, could never be made
-    // to show the first again.
-    let split = area.width >= 100 && !app.last_decisions.is_empty();
-    let (l, r) = if split {
-        let cols =
-            Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)]).split(area);
-        (cols[0], Some(cols[1]))
+    // do"; the sub-decisions answer "how did the search arrive at it". Showing
+    // only the second — which is what a narrow terminal used to get, since the
+    // split needed 100 columns — meant that under an agent the move preview
+    // was unreachable, and `j`/`k` moved a selection nothing then described.
+    // Below 100 columns the two stack instead, which every plausible terminal
+    // has the height for.
+    let both = !app.last_decisions.is_empty();
+    let (l, r) = if both && area.width >= 100 {
+        let c = Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)])
+            .split(area);
+        (c[0], Some(c[1]))
+    } else if both && area.height >= 8 {
+        // The diff gets the larger half: it is what the selection keys act on,
+        // and the search pane's first line already carries its headline number.
+        let c = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(area);
+        (c[0], Some(c[1]))
     } else {
         (area, None)
     };
 
-    if let Some(r) = r {
-        search_pane(f, r, app);
-        why_pane(f, l, app);
-    } else if app.last_decisions.is_empty() {
-        why_pane(f, l, app);
-    } else {
-        search_pane(f, l, app);
+    match r {
+        Some(r) => {
+            why_pane(f, l, app, rows);
+            search_pane(f, r, app);
+        }
+        None if both => search_pane(f, l, app),
+        None => why_pane(f, l, app, rows),
     }
 }
 
 /// What the highlighted candidate does, and what the two columns said about it.
-fn why_pane(f: &mut Frame, area: Rect, app: &App) {
-    let rows = app.rows();
+fn why_pane(f: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
     let unit = app.unit();
     let lines = match (rows.get(app.selected), app.selected_move()) {
         (Some(row), Some(m)) => {
@@ -930,6 +1093,7 @@ fn why_pane(f: &mut Frame, area: Rect, app: &App) {
                 )]),
                 Line::from(head),
             ];
+            out.extend(lookahead_line(rows, unit, app.selected));
             out.extend(diff_lines(&before, &after));
             out
         }
@@ -944,80 +1108,224 @@ fn why_pane(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Why the shortlist is in the order it is in, in one line.
+///
+/// The two numeric columns are a search's opinion and a one-ply evaluator's,
+/// and where they disagree the gap *is* the lookahead — priced in the unit the
+/// second column is already in. Saying that out loud is the difference between
+/// a reader seeing two numbers and a reader seeing an argument: the search is
+/// giving up points now, and the amount is on the line.
+///
+/// Only under [`ScoreUnit::VisitShare`]. Under `Margin` both columns are the
+/// same evaluator and any disagreement would be a bug, not a plan.
+fn lookahead_line(rows: &[Row], unit: ScoreUnit, selected: usize) -> Option<Line<'static>> {
+    // Only under the top row. It is a statement about the search's *pick*, and
+    // read three rows down it looked like a claim about the row highlighted
+    // there — which already has `vs top` on the line above saying what it cost.
+    if unit != ScoreUnit::VisitShare || rows.len() < 2 || selected != 0 {
+        return None;
+    }
+    let top = rows.first()?;
+    let (i, best) = rows
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.margin.total_cmp(&b.1.margin))?;
+    if i == 0 {
+        return Some(Line::from(vec![
+            Span::styled("why ", label()),
+            Span::styled(
+                "the pick also tops the one-ply column".to_string(),
+                dim(),
+            ),
+        ]));
+    }
+    Some(Line::from(vec![
+        Span::styled("why ", label()),
+        Span::raw(format!(
+            "the pick is {:.1} pts behind row {} right now; the search is buying \
+             something one ply cannot see",
+            best.margin - top.margin,
+            i + 1
+        )),
+    ]))
+}
+
 /// The search's own account of the turn it just played.
+///
+/// The Moves panel says *which* turn won; this says how it was assembled. Each
+/// row is one link of the chain: what the search settled on, how hard, out of
+/// how many, and — the part that carries the reasoning — the best thing it
+/// declined. A 51/49 row is where the game was actually close.
 fn search_pane(f: &mut Frame, area: Rect, app: &App) {
     let short = short_agent(&app.agent_name);
-    let n = app.last_decisions.len();
-    let mut out = vec![Line::from(vec![Span::styled(
+    let d = &app.last_decisions;
+    // The value at the first node is the value of the position the turn started
+    // from, which is the search's one-number verdict on how the game is going.
+    let inner = area.width.saturating_sub(2) as usize;
+    let mut out = Vec::new();
+    if let Some(played) = &app.last_played {
+        out.push(Line::from(Span::styled(
+            fit(played, inner),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+    }
+    // The agent's name is already in the top bar; spending 38 columns repeating
+    // it here cost the value its place on the line.
+    let head = match d.first() {
+        Some(x) => format!(
+            // "choice points", not "sub-decisions": forced links of the chain
+            // carry no distribution and are never recorded, so this is a count
+            // of where the search had something to decide, not of turn length.
+            "{} choice point{} · position ~{:+.0} pts vs field",
+            d.len(),
+            if d.len() == 1 { "" } else { "s" },
+            x.points()
+        ),
         // Forced sub-decisions carry no distribution and are not recorded, so
         // this is never the whole chain and must not read as if it were.
-        format!("{short} — {n} sub-decisions it had a choice at"),
-        Style::default().add_modifier(Modifier::BOLD),
-    )])];
-    // Room for the bar shrinks with the pane; at 46% of 80 columns there is
-    // none, and a bar clipped mid-way misreports a share.
-    let bar_w = (area.width as usize).saturating_sub(46).min(20);
-    for (phase, chosen, share) in app.last_decisions.iter().take(area.height.saturating_sub(3) as usize) {
+        None => format!("{short} — no recorded sub-decisions"),
+    };
+    out.push(Line::from(vec![Span::styled(fit(&head, inner), label())]));
+
+    // Everything before the step text is fixed width, so the step and the
+    // rejected alternative share whatever is left. Bars go first when the pane
+    // is narrow: a bar clipped mid-way misreports a share, and the number it
+    // duplicates is already there.
+    let fixed = 9 + 5 + 6;
+    let rest = inner.saturating_sub(fixed);
+    // The bar is the first thing cut. It restates the percentage two columns to
+    // its left, whereas the rejected alternative beside it is the only thing on
+    // the row that is not already somewhere else on the screen.
+    let bar_w = if rest >= 56 { 12 } else { 0 };
+    let room = rest - bar_w;
+
+    for x in d.iter().take((area.height as usize).saturating_sub(2 + out.len())) {
         let mut spans = vec![
-            Span::styled(format!("{phase:<11}"), label()),
+            Span::styled(format!("{:<9}", fit(&x.phase, 8)), label()),
             Span::styled(
-                format!("{:>4.0}% ", share * 100.0),
+                format!("{:>3.0}% ", x.share * 100.0),
                 Style::default().fg(ratatui::style::Color::Cyan),
             ),
+            // Out of how many. `97%` is a different statement at 2 edges and at
+            // 40, and without this the reader cannot tell the two apart.
+            Span::styled(format!("/{:<4} ", x.edges), dim()),
         ];
         if bar_w > 0 {
-            let bar = "#".repeat(((share * bar_w as f32) as usize).min(bar_w));
+            let bar = "#".repeat(((x.share * bar_w as f32) as usize).min(bar_w));
             spans.push(Span::styled(format!("{bar:<w$} ", w = bar_w), dim()));
         }
-        spans.push(Span::raw(chosen.clone()));
+        // The runner-up is the *reason* text: it is what the position offered
+        // and the search turned down. It is elided before the chosen step is,
+        // because a row that lost its chosen step says nothing at all.
+        match &x.runner_up {
+            Some((alt, share)) if room >= 26 => {
+                let half = room / 2;
+                spans.push(Span::raw(format!("{:<w$}", fit(&x.chosen, half), w = half)));
+                spans.push(Span::styled(
+                    fit(
+                        &format!(" · not {alt} ({:.0}%)", share * 100.0),
+                        room - half,
+                    ),
+                    dim(),
+                ));
+            }
+            _ => spans.push(Span::raw(fit(&x.chosen, room))),
+        }
         out.push(Line::from(spans));
     }
-    if app.last_decisions.is_empty() {
+    if d.is_empty() {
         out.push(Line::from(Span::styled(
-            "nothing recorded — this agent does not build a tree",
+            "this agent builds no tree, so it has no visit counts to show",
             dim(),
         )));
     }
     f.render_widget(
-        Paragraph::new(out).block(boxed("Search — visit share per sub-decision")),
+        Paragraph::new(out).block(boxed("Search — the turn just played, step by step")),
         area,
     );
 }
 
 /// The screen while a search is running.
 ///
-/// Deliberately indeterminate: nothing here knows how many simulations have
-/// finished (see `docs/FINDINGS-tui.md` T3), so there is no progress *fraction*
-/// to draw and a bar that filled up would be inventing one. A sweep and a
-/// ticking clock say "running" without claiming to say how far.
+/// Nothing outside `mcts.rs` can see a simulation counter, so there is no
+/// completion fraction to draw and a bar that filled from 0 to 1 would be
+/// inventing the only number on the screen. What is drawn instead is measured:
+/// which search of how many, what the finished ones returned, and elapsed
+/// against **what the last turn cost** — which can and does run past the end of
+/// the bar, and is labelled as a comparison rather than as progress so that
+/// overrun reads as information instead of as a stuck widget. With no prior to
+/// compare against, a sweep says "running" and claims nothing else.
 fn thinking(f: &mut Frame, area: Rect, app: &App, t: &Thinking) {
     let secs = t.elapsed.as_secs_f64();
     let w = (area.width as usize).saturating_sub(4).clamp(8, 100);
-    // Position derives from the clock, so a slow frame shifts the marker
-    // further rather than stalling it.
-    let span = (w * 2).max(2);
-    let at = (t.elapsed.as_millis() / 40) as usize % span;
-    let at = if at < w { at } else { span - at - 1 };
-    let mut sweep = String::new();
-    for i in 0..w {
-        sweep.push(if i.abs_diff(at) < 2 { '#' } else { '·' });
+
+    let mut top = vec![
+        Span::styled(
+            format!("{} {}", t.tick(), t.what),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("   {secs:.1}s"),
+            Style::default().fg(ratatui::style::Color::Cyan),
+        ),
+    ];
+    if let Some((k, n)) = t.stage {
+        top.push(Span::styled(format!("   search {k} of {n}"), label()));
+    }
+    let mut out = vec![Line::from(top), Line::from(Span::styled(t.detail.clone(), label()))];
+
+    // What is already settled. Two lines at most: the pane is eight rows tall
+    // and the bar and the footer have to fit under whatever this takes.
+    for k in t.known.iter().rev().take(2).rev() {
+        out.push(Line::from(vec![
+            Span::styled("· ", dim()),
+            Span::raw(fit(k, w.saturating_sub(2))),
+        ]));
     }
 
-    let out = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{} {}", t.tick(), t.what),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("   {secs:.1}s"), Style::default().fg(ratatui::style::Color::Cyan)),
-        ]),
-        Line::from(Span::styled(t.detail.clone(), label())),
-        Line::from(Span::styled(sweep, dim())),
-        Line::from(Span::styled(
+    match t.prior {
+        Some(d) if d.as_secs_f64() > 0.05 => {
+            let frac = secs / d.as_secs_f64();
+            let filled = ((frac * w as f64) as usize).min(w);
+            let bar: String = (0..w)
+                .map(|i| if i < filled { '#' } else { '·' })
+                .collect();
+            out.push(Line::from(Span::styled(bar, dim())));
+            out.push(Line::from(Span::styled(
+                format!(
+                    "{secs:.1}s against {:.1}s for the last search — a scale, not a deadline",
+                    d.as_secs_f64()
+                ),
+                dim(),
+            )));
+        }
+        _ => {
+            // Position derives from the clock, so a slow frame shifts the
+            // marker further rather than stalling it.
+            let span = (w * 2).max(2);
+            let at = (t.elapsed.as_millis() / 40) as usize % span;
+            let at = if at < w { at } else { span - at - 1 };
+            let sweep: String = (0..w)
+                .map(|i| if i.abs_diff(at) < 2 { '#' } else { '·' })
+                .collect();
+            out.push(Line::from(Span::styled(sweep, dim())));
+            out.push(Line::from(Span::styled(
+                "no earlier search to compare against, so this shows only that it is running"
+                    .to_string(),
+                dim(),
+            )));
+        }
+    }
+    // Orientation, and the first thing to go: the footer already says `q quit`
+    // while a search runs, and what stage 2 has to report is worth more than a
+    // hint. Dropped rather than clipped, so nothing renders as a half-sentence.
+    if out.len() + 1 <= area.height.saturating_sub(2) as usize {
+        out.push(Line::from(Span::styled(
             "the board above is the position it is thinking about · q quits".to_string(),
             dim(),
-        )),
-    ];
+        )));
+    }
+
     f.render_widget(
         Paragraph::new(out)
             .block(boxed(&format!("Thinking — {}", short_agent(&app.agent_name))))
@@ -1047,16 +1355,6 @@ fn help(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Span::styled(text, label())), area);
 }
 
-/// Turn an agent's decision nodes into the search panel's rows.
-///
-/// `Node::visits` stores `(edge index, visit count)`, not the step itself, so
-/// the enumeration has to be regenerated to say what was chosen. That is also
-/// why `done` rides along: at `PickWorker` the edge set depends on it, and a
-/// list one edge short would mislabel everything after the gap.
-///
-/// Only about a quarter of turns carry nodes — the rest run a reduced search
-/// budget and record nothing — so a caller wanting a populated panel should
-/// keep playing until this returns something.
 /// A displayable agent name. Checkpoint specs carry a whole path.
 pub fn short_agent(name: &str) -> String {
     match name.rsplit_once('/') {
@@ -1090,7 +1388,54 @@ fn step_label(s: &crate::phase::Step) -> String {
     }
 }
 
-pub fn decisions_from(nodes: &[crate::record::Node]) -> Vec<(String, String, f32)> {
+/// One sub-decision of a turn, as the search left it.
+///
+/// The share alone does not say much: 97% out of two edges is a coin that came
+/// up the same way twice, and 97% out of forty is a conclusion. So the width of
+/// the choice and what came second travel with it.
+#[derive(Clone)]
+pub struct Decision {
+    /// The `Phase` variant, without its payload — the payload is the step, and
+    /// it is already in `chosen`.
+    pub phase: String,
+    pub chosen: String,
+    /// Share of the node's visits that went to `chosen`.
+    pub share: f32,
+    /// The best step the search declined, and its share. `None` at a node with
+    /// one edge, where there was nothing to decline.
+    pub runner_up: Option<(String, f32)>,
+    /// Legal edges at this node, before the widening cap.
+    pub edges: usize,
+    pub visits: u32,
+    /// Backed-up value for the player to move, on `record::z_rel`'s scale.
+    pub value: f32,
+}
+
+impl Decision {
+    /// `value` read back as points ahead of the table average.
+    ///
+    /// `z_rel` is `tanh((score - mean) / Z_SCALE)`, so this inverts it. It is
+    /// approximate and the panel says so with a `~`: the backed-up number is a
+    /// mean of `tanh`, not the `tanh` of a mean, so the magnitude is pulled in
+    /// towards zero. The sign and the ordering — which is what a reader takes
+    /// from it — survive the transform exactly, because it is monotone.
+    pub fn points(&self) -> f32 {
+        let v = self.value.clamp(-0.999, 0.999);
+        v.atanh() * crate::record::Z_SCALE
+    }
+}
+
+/// Turn an agent's decision nodes into the search panel's rows.
+///
+/// `Node::visits` stores `(edge index, visit count)`, not the step itself, so
+/// the enumeration has to be regenerated to say what was chosen. That is also
+/// why `done` rides along: at `PickWorker` the edge set depends on it, and a
+/// list one edge short would mislabel everything after the gap.
+///
+/// The denominator is `total_visits`, not the sum of the vector: `visits` is
+/// truncated to `record::MAX_VISITS` before it is written, so summing it would
+/// quietly renormalise a long tail away and inflate every share on screen.
+pub fn decisions_from(nodes: &[crate::record::Node]) -> Vec<Decision> {
     let mut out = Vec::new();
     for node in nodes {
         // Only `TREE_EDGE` nodes index the step enumeration. A one-ply or
@@ -1100,27 +1445,37 @@ pub fn decisions_from(nodes: &[crate::record::Node]) -> Vec<(String, String, f32
         if node.policy_kind != crate::record::policy_kind::TREE_EDGE {
             continue;
         }
-        let total: u32 = node.visits.iter().map(|(_, n)| *n as u32).sum();
-        if total == 0 {
+        let total = node.total_visits;
+        if total == 0 || node.visits.is_empty() {
             continue;
         }
-        let Some(&(idx, n)) = node.visits.iter().max_by_key(|(_, n)| *n) else {
-            continue;
-        };
         let steps = crate::tree::legal_steps(&node.state, node.phase, node.turn, node.done);
-        let chosen = steps
-            .get(idx as usize)
-            .map(step_label)
-            .unwrap_or_else(|| format!("edge {idx}"));
-        out.push((
-            format!("{:?}", node.phase)
+        let name = |idx: u16| {
+            steps
+                .get(idx as usize)
+                .map(step_label)
+                .unwrap_or_else(|| format!("edge {idx}"))
+        };
+        // `search_node` sorts descending before it truncates, but a caller
+        // could hand us anything, so take the top two rather than assume.
+        let mut top: Vec<(u16, u16)> = node.visits.clone();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        let (best, n) = top[0];
+        out.push(Decision {
+            phase: format!("{:?}", node.phase)
                 .split(['{', ' '])
                 .next()
                 .unwrap_or("?")
                 .to_string(),
-            chosen,
-            n as f32 / total as f32,
-        ));
+            chosen: name(best),
+            share: n as f32 / total as f32,
+            runner_up: top
+                .get(1)
+                .map(|&(i, m)| (name(i), m as f32 / total as f32)),
+            edges: node.n_edges as usize,
+            visits: total,
+            value: node.root_value[node.turn.idx()],
+        });
     }
     out
 }

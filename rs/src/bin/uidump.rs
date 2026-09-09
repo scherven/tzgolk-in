@@ -60,6 +60,8 @@ fn main() {
     let mut agent_name = String::new();
     let mut last_decisions = Vec::new();
     let mut agent_ranking = None;
+    let mut last_move = None;
+    let mut played_by = game.state.current;
     if let Some(sp) = &spec {
         use rand::SeedableRng;
         let agent = tzolkin::record::parse_analysis_agent(sp).expect("bad --agent");
@@ -80,6 +82,8 @@ fn main() {
             match agent.play_turn(&game.state, p, 0.0, &mut rng) {
                 Some(o) => {
                     last_decisions = ui::decisions_from(&o.nodes);
+                    last_move = Some(ui::row_text(&o.mv));
+                    played_by = p;
                     game.play(p, &o.mv);
                     game.state.current = game.state.current.next(1);
                     // The `agent` view: the agent's own ranking of whole
@@ -97,14 +101,45 @@ fn main() {
 
     // `--thinking SECS` renders the mid-search screen. There is no other way to
     // review it: by the time a search returns, the thing being checked is gone.
+    // `--stage2` renders it as the *second* of a turn's two searches, which is
+    // the interesting one — it is the state that carries a settled result and a
+    // prior to measure the clock against, and the two halves lay out
+    // differently.
+    let stage2 = std::env::args().any(|a| a == "--stage2");
     let thinking = std::env::args()
         .position(|a| a == "--thinking")
         .map(|i| {
             let secs: f64 = std::env::args().nth(i + 1).and_then(|v| v.parse().ok()).unwrap_or(2.4);
+            let colour = game.state.players[game.state.current.idx()].color;
+            let short = ui::short_agent(&agent_name);
             ui::Thinking {
-                what: format!("searching {}'s turn", game.state.players[game.state.current.idx()].color),
-                detail: format!("{} · one search per sub-decision", ui::short_agent(&agent_name)),
+                what: if stage2 {
+                    format!("ranking what {colour} passed over")
+                } else {
+                    format!("searching {colour}'s turn")
+                },
+                detail: if stage2 {
+                    format!("{short} · one search over whole turns, for the shortlist only")
+                } else {
+                    format!("{short} · one search per sub-decision, then one more to rank the alternatives")
+                },
                 elapsed: std::time::Duration::from_secs_f64(secs),
+                stage: Some((if stage2 { 2 } else { 1 }, 2)),
+                known: if stage2 {
+                    vec![
+                        "3.1s to choose the move".into(),
+                        format!(
+                            "chose {}",
+                            last_move.as_deref().unwrap_or("(nothing yet)")
+                        ),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                // Only the second stage has a comparable search behind it, so
+                // only the second stage gets the bar. That is the whole point of
+                // being able to dump both.
+                prior: stage2.then(|| std::time::Duration::from_secs_f64(3.1)),
             }
         });
 
@@ -119,14 +154,22 @@ fn main() {
     // the TUI puts it in the status line, so a dump that dropped it would be
     // reviewing a different screen.
     let status = format!("seed {seed}, {rounds} rounds in · {}", ranking.note);
+    let last_played = last_move
+        .as_ref()
+        .map(|m| format!("{} played {m}", game.state.players[played_by.idx()].color));
     let app = App {
         game,
         agent: None,
         agent_name,
-        thinking: None,
+        thinking,
         last_decisions,
+        last_played,
         ranking,
-        selected: 0,
+        selected: std::env::args()
+            .position(|a| a == "--select")
+            .and_then(|i| std::env::args().nth(i + 1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         source,
         autoplay: false,
         status,

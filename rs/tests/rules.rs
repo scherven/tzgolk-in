@@ -1020,6 +1020,7 @@ fn ui_renders_at_many_sizes() {
                         agent_name: "net".into(),
                         thinking: None,
                         last_decisions: Vec::new(),
+                        last_played: None,
                         ranking: Ranking {
                             exhaustive,
                             note: "x".repeat(200),
@@ -1037,6 +1038,191 @@ fn ui_renders_at_many_sizes() {
             }
         }
     }
+}
+
+/// The two screens the size sweep above cannot reach: the mid-search display,
+/// and the sub-decision pane with rows in it.
+///
+/// Both are new panels with their own width arithmetic, and both are states a
+/// dump can only be taken of deliberately — by the time a search returns, the
+/// thinking screen is gone. Same sizes as `ui_renders_at_many_sizes`, so a
+/// panel that only breaks at 60x20 is caught here too.
+#[test]
+fn ui_renders_while_thinking_and_after_a_search() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tzolkin::eval::Ranking;
+    use tzolkin::ui::{self, App, Decision, MoveSource, Thinking};
+
+    let mut game = Game::new(3);
+    for _ in 0..6 {
+        game.play_round();
+    }
+    let p = game.state.current;
+    let ranking = tzolkin::eval::rank_all(&game.state, p, 10);
+
+    // A chain long enough to overflow a short pane, with and without a rival
+    // edge, since the runner-up is what the row's width budget is split for.
+    let decisions: Vec<Decision> = (0..12)
+        .map(|i| Decision {
+            phase: "Take".repeat(1 + i % 3),
+            chosen: "-1W, -1G, build #7, +1 corn, free worker+1, G+1".into(),
+            share: 0.5 + 0.04 * i as f32,
+            runner_up: (i % 3 != 0).then(|| ("place first player space".to_string(), 0.11)),
+            edges: 1 + i * 7,
+            visits: 8192,
+            value: -0.9 + 0.15 * i as f32,
+        })
+        .collect();
+
+    let thinking = Thinking {
+        what: "searching R's turn".into(),
+        detail: "x".repeat(200),
+        elapsed: std::time::Duration::from_secs_f64(3.7),
+        stage: Some((2, 2)),
+        known: vec!["y".repeat(200), "chose retrieve w0[+3 corn]".into()],
+        prior: Some(std::time::Duration::from_secs_f64(2.9)),
+    };
+
+    for &(w, h) in &[(80u16, 24u16), (100, 30), (132, 44), (200, 60), (60, 20)] {
+        for busy in [None, Some(thinking.clone()), Some(Thinking::default())] {
+            for decs in [Vec::new(), decisions.clone()] {
+                for source in [MoveSource::Full, MoveSource::Agent] {
+                    let app = App {
+                        game: Game::new(3),
+                        agent: None,
+                        agent_name: "mcts8192/heuristic:pt=1:pmin=2:cp=0.02".into(),
+                        thinking: busy.clone(),
+                        last_decisions: decs.clone(),
+                        last_played: Some("R played ".to_string() + &"z".repeat(200)),
+                        ranking: Ranking {
+                            note: "visit share (%) of 8192 sims — NOT the whole move space".into(),
+                            ..ranking.clone()
+                        },
+                        selected: 0,
+                        source,
+                        autoplay: false,
+                        status: "x".repeat(200),
+                    };
+                    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    term.draw(|f| ui::draw(f, &app))
+                        .unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
+                }
+            }
+        }
+    }
+}
+
+/// The selection is over the *folded* rows, and every one of them describes
+/// something.
+///
+/// `j`/`k` used to wrap on `Ranking::moves.len()` while `selected_move` indexed
+/// the folded list, so past the last row the preview pane went blank. Both ends
+/// of the walk are checked because the wrap is where it went wrong.
+#[test]
+fn selection_stays_on_a_real_row() {
+    let mut game = Game::new(3);
+    for _ in 0..7 {
+        game.play_round();
+    }
+    let p = game.state.current;
+    let mut app = tzolkin::ui::App {
+        ranking: tzolkin::eval::rank_all(&game.state, p, 10),
+        game,
+        agent: None,
+        agent_name: String::new(),
+        thinking: None,
+        last_decisions: Vec::new(),
+        last_played: None,
+        selected: 0,
+        source: tzolkin::ui::MoveSource::Full,
+        autoplay: false,
+        status: String::new(),
+    };
+    let n = app.rows().len();
+    assert!(n > 0, "the fixture position should have moves");
+
+    for _ in 0..n * 2 + 3 {
+        assert!(app.selected < n, "selection {} left {n} rows", app.selected);
+        assert!(app.selected_move().is_some(), "row {} describes nothing", app.selected);
+        app.step_selection(1);
+    }
+    for _ in 0..n * 2 + 3 {
+        app.step_selection(-1);
+        assert!(app.selected < n, "backwards selection {} left {n} rows", app.selected);
+    }
+}
+
+/// A `skip` pickup written in three places is one outcome written three ways,
+/// and the panel shows it once — with the workers it returns named in the
+/// suffix, sorted, so two spellings do not render as two different rows.
+#[test]
+fn the_shortlist_folds_restated_retrievals() {
+    use tzolkin::effect::Choice;
+    use tzolkin::ids::WorkerId;
+    use tzolkin::moves::{Move, MoveKind, Retrievals};
+
+    let act = Choice::new().with(tzolkin::effect::Effect::Corn(3));
+    let skip = Choice::new();
+    let mk = |v: Retrievals| Move {
+        kind: MoveKind::Retrieve(v),
+        beg: None,
+        corn_cost: 0,
+    };
+    let w = |i: u8| WorkerId(i);
+
+    // One effectful pickup and two idle ones, in three different orders.
+    let a = mk([(w(0), act.clone()), (w(2), skip.clone()), (w(3), skip.clone())].into_iter().collect());
+    let b = mk([(w(2), skip.clone()), (w(0), act.clone()), (w(3), skip.clone())].into_iter().collect());
+    let c = mk([(w(3), skip.clone()), (w(2), skip.clone()), (w(0), act.clone())].into_iter().collect());
+    // A genuinely different move: one fewer worker comes back.
+    let d = mk([(w(0), act.clone()), (w(2), skip.clone())].into_iter().collect());
+
+    assert!(tzolkin::ui::same_outcome(&a, &b));
+    assert!(tzolkin::ui::same_outcome(&a, &c));
+    assert!(!tzolkin::ui::same_outcome(&a, &d), "a dropped pickup is a real difference");
+
+    // The suffix names the idle workers in a fixed order, or the fold would be
+    // showing one outcome under two different labels.
+    assert_eq!(tzolkin::ui::row_text(&a), tzolkin::ui::row_text(&c));
+    assert!(
+        tzolkin::ui::row_text(&a).ends_with("+ w2,w3 to hand"),
+        "got {}",
+        tzolkin::ui::row_text(&a)
+    );
+
+    let g = Game::new(3).state;
+    let rows = tzolkin::ui::fold_rows(
+        &[(a, 40.0), (b, 20.0), (c, 10.0), (d, 5.0)],
+        &g,
+        g.current,
+    );
+    assert_eq!(rows.len(), 2, "three spellings of one outcome, plus one other");
+    assert_eq!(rows[0].spellings, 3);
+    // The share is summed, not taken from the best spelling: the reader is being
+    // told how much of the search went to this *outcome*.
+    assert!((rows[0].score - 70.0).abs() < 1e-3, "got {}", rows[0].score);
+    assert_eq!(rows[1].spellings, 1);
+}
+
+/// Long rows lose their middle, never their ends.
+///
+/// The fold puts what makes a row different in the suffix, so right-truncation
+/// erased exactly the characters a reader is scanning for; `fit_tail` exists
+/// for prose whose closing clause is a warning.
+#[test]
+fn elision_keeps_both_ends() {
+    let s = "retrieve w0[+3 corn] w1[-3 corn, G+1] + w2,w3 to hand";
+    let cut = tzolkin::ui::fit(s, 30);
+    assert_eq!(cut.chars().count(), 30);
+    assert!(cut.starts_with("retrieve w0"), "got {cut}");
+    assert!(cut.ends_with("to hand"), "got {cut}");
+    assert_eq!(tzolkin::ui::fit(s, 200), s, "nothing to cut is nothing to do");
+
+    let note = "mcts8192 · visit share of 8192 sims — NOT the whole move space";
+    let tail = tzolkin::ui::fit_tail(note, 40);
+    assert_eq!(tail.chars().count(), 40);
+    assert!(tail.ends_with("NOT the whole move space"), "got {tail}");
 }
 
 /// The preview pane describes exactly what the move does.
