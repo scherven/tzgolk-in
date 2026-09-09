@@ -392,6 +392,14 @@ struct CensusRow {
 /// column is the level sum as of day 14 and this reproduces it.
 const MID_DAY: u8 = 14;
 
+/// What `--gift` hands over. `None` in the option means corn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GiftKind {
+    Res(Resource),
+    /// One step up whichever temple the evaluator rates highest.
+    Temple,
+}
+
 fn play_traced(
     seed: u64,
     agents: &[&dyn Agent; N_PLAYERS],
@@ -400,9 +408,23 @@ fn play_traced(
     census: bool,
     // `(seat, resource, units, every)` — a standing subsidy, for pricing corn
     // and blocks in points without going through the evaluator.
-    gift: Option<(PlayerId, Option<Resource>, u8, u32)>,
+    gift: Option<(PlayerId, Option<GiftKind>, u8, u32)>,
+    // `(seat, levels)` — research handed over at day 0 for **free**: no Tikal
+    // action, no corn, no worker-turn. This is the other half of the forcing
+    // experiment. `--force` measures `benefit − price`; this measures `benefit`
+    // alone, so the difference is the price the board charges.
+    grant: Option<(PlayerId, [u8; 4], u8)>,
 ) -> Trace {
     let mut state = record::new_drafted_game(seed, agents, rng);
+    let mut granted = false;
+    if let Some((who, levels, day)) = grant {
+        if day == 0 {
+            for (s, &l) in levels.iter().enumerate() {
+                state.research[who.idx()][s] = state.research[who.idx()][s].max(l);
+            }
+            granted = true;
+        }
+    }
     let monuments_dealt = std::array::from_fn(|i| state.monuments_up[i].map(|m| m.0));
     let mut research_mid = state.research;
     let mut corn_to_place = [0u32; N_PLAYERS];
@@ -415,6 +437,14 @@ fn play_traced(
     let mut guard = 0u32;
 
     while !state.over {
+        if let Some((who, levels, day)) = grant {
+            if !granted && state.day >= day {
+                for (s, &l) in levels.iter().enumerate() {
+                    state.research[who.idx()][s] = state.research[who.idx()][s].max(l);
+                }
+                granted = true;
+            }
+        }
         if state.day <= MID_DAY {
             research_mid = state.research;
         }
@@ -425,11 +455,36 @@ fn play_traced(
             let pre = if census { Some(depth_probe(&state, p)) } else { None };
             if let Some((who, res, num, den)) = gift {
                 if who == p && turns[p.idx()] % den == 0 {
-                    let pl = &mut state.players[p.idx()];
                     match res {
-                        None => pl.corn = pl.corn.saturating_add(num),
-                        Some(r) => {
+                        // A free temple step, taken on the temple the evaluator
+                        // likes best. This is the currency the forced arms are
+                        // actually spending, so it needs a causal price measured
+                        // the same way corn and wood were.
+                        Some(GiftKind::Temple) => {
+                            for _ in 0..num {
+                                let mut best: Option<(f32, Temple)> = None;
+                                for t in Temple::ALL {
+                                    if state.can_temple_step(p, t, 1) {
+                                        state.temple_step(p, t, 1);
+                                        let v = eval::heuristic(&state, p);
+                                        state.temple_step(p, t, -1);
+                                        if best.map_or(true, |(b, _)| v > b) {
+                                            best = Some((v, t));
+                                        }
+                                    }
+                                }
+                                if let Some((_, t)) = best {
+                                    state.temple_step(p, t, 1);
+                                }
+                            }
+                        }
+                        Some(GiftKind::Res(r)) => {
+                            let pl = &mut state.players[p.idx()];
                             pl.res[r as usize] = pl.res[r as usize].saturating_add(num)
+                        }
+                        None => {
+                            let pl = &mut state.players[p.idx()];
+                            pl.corn = pl.corn.saturating_add(num)
                         }
                     }
                 }
@@ -677,7 +732,8 @@ fn play_block(
     plan: &Plan,
     base_spec: &AgentSpec,
     cfg: &GameConfig,
-    gift: Option<(Option<Resource>, u8, u32)>,
+    gift: Option<(Option<GiftKind>, u8, u32)>,
+    grant: Option<([u8; 4], u8)>,
 ) -> Block {
     let base = base_spec.instance();
     let cand = Forced {
@@ -700,7 +756,8 @@ fn play_block(
         });
         let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9) ^ c as u64);
         let g = gift.map(|(r, n, d)| (PlayerId(c as u8), r, n, d));
-        let t = play_traced(seed, &agents, cfg, &mut rng, false, g);
+        let gr = grant.map(|(lv, d)| (PlayerId(c as u8), lv, d));
+        let t = play_traced(seed, &agents, cfg, &mut rng, false, g, gr);
 
         mon11 = t.monuments_dealt.iter().any(|m| *m == Some(11));
         mon12 = t.monuments_dealt.iter().any(|m| *m == Some(12));
@@ -789,8 +846,15 @@ rlab — the causal value of research, measured by forcing it.
   --jobs J          blocks in flight (default 3 — the machine is shared)
   --out FILE        JSONL, one row per block; appended
   --resume          skip seeds already in --out
-  --gift RES:N[/D]  subsidise the candidate N units of corn/wood/stone/gold
+  --gift RES:N[/D]  subsidise the candidate N units of corn/wood/stone/gold/temple
                     every D of its own turns; prices a resource in points
+  --grant A3[,R1][@D]
+                    hand the candidate those levels on day D (default 0), free:
+                    no Tikal action, no corn, no worker-turn. `--force` measures
+                    benefit-minus-price; this measures benefit alone, and
+                    sweeping D measures the shape of `uses` directly.
+  --pricecurve N    eval delta for every currency, days 0-6
+  --evalcurve N     what `eval::heuristic` thinks --grant is worth, by day
   --census N        no forcing: per-turn placement-depth rows for N seeds
   --verify N        check this file's driver against record::play_game
 ";
@@ -839,6 +903,14 @@ fn main() {
         verify(&spec, seed0, n);
         return;
     }
+    if let Some(n) = arg("--pricecurve").and_then(|s| s.parse::<u64>().ok()) {
+        price_curve(&spec, seed0, n);
+        return;
+    }
+    if let Some(n) = arg("--evalcurve").and_then(|s| s.parse::<u64>().ok()) {
+        eval_curve(&spec, seed0, n, arg("--grant").unwrap_or_else(|| "A3".into()));
+        return;
+    }
     if let Some(n) = arg("--census").and_then(|s| s.parse::<u64>().ok()) {
         census(&spec, seed0, n, arg("--out").map(PathBuf::from));
         return;
@@ -860,7 +932,7 @@ fn main() {
     // resource in points directly, which is the only way to check
     // `CORN_PER_POINT` without asking the evaluator what it thinks corn is
     // worth.
-    let gift: Option<(Option<Resource>, u8, u32)> = arg("--gift").map(|g| {
+    let gift: Option<(Option<GiftKind>, u8, u32)> = arg("--gift").map(|g| {
         let (what, rate) = g.split_once(':').expect("--gift RES:N[/D]");
         let (n, d) = match rate.split_once('/') {
             Some((n, d)) => (n.parse().expect("N"), d.parse().expect("D")),
@@ -868,12 +940,36 @@ fn main() {
         };
         let r = match what {
             "corn" => None,
-            "wood" => Some(Resource::Wood),
-            "stone" => Some(Resource::Stone),
-            "gold" => Some(Resource::Gold),
+            "wood" => Some(GiftKind::Res(Resource::Wood)),
+            "stone" => Some(GiftKind::Res(Resource::Stone)),
+            "gold" => Some(GiftKind::Res(Resource::Gold)),
+            "temple" => Some(GiftKind::Temple),
             other => panic!("--gift: unknown resource {other:?}"),
         };
         (r, n, d)
+    });
+    // `--grant A3` or `--grant A1,R1` — the levels appear at day 0 for free.
+    // Paired with the matching `--force` arm this splits the causal number in
+    // two: `force = benefit - price`, `grant = benefit`, so `price = grant -
+    // force`. Without it a negative `--force` result cannot distinguish "the
+    // levels are worthless" from "the levels are fine and the board charges
+    // more than they are worth".
+    let grant: Option<([u8; 4], u8)> = arg("--grant").map(|g| {
+        let (body, day) = match g.split_once('@') {
+            Some((b, d)) => (b.to_string(), d.parse().expect("--grant: bad day")),
+            None => (g.clone(), 0u8),
+        };
+        let mut lv = [0u8; 4];
+        for item in body.split(',') {
+            let mut ch = item.chars();
+            let t = ch.next().and_then(science_of)
+                .unwrap_or_else(|| panic!("--grant: bad track in {item:?}; use A R C T"));
+            let l: u8 = ch.as_str().parse()
+                .unwrap_or_else(|_| panic!("--grant: bad level in {item:?}"));
+            assert!((1..=3).contains(&l), "--grant: level in {item:?} must be 1..3");
+            lv[t.idx()] = l;
+        }
+        (lv, day)
     });
     let blocks: usize = arg("--blocks").and_then(|s| s.parse().ok()).unwrap_or(50);
     let jobs: usize = arg("--jobs").and_then(|s| s.parse().ok()).unwrap_or(3);
@@ -933,7 +1029,7 @@ fn main() {
     let rows: Mutex<Vec<String>> = Mutex::new(Vec::new());
     pool.install(|| {
         todo.par_iter().for_each(|&seed| {
-            let b = play_block(seed, &plan, &spec, &cfg, gift);
+            let b = play_block(seed, &plan, &spec, &cfg, gift, grant);
             let line = b.to_json();
             if let Some(f) = &sink {
                 let mut f = f.lock().unwrap();
@@ -1054,6 +1150,239 @@ fn report(lines: &[String], plan: &Plan, agent: &str, took: Duration) {
 }
 
 // =======================================================================
+// --evalcurve
+//
+// The causal `--grant A3@D` sweep asks what the levels are worth if they
+// appear on day D. This asks what `eval::heuristic` *thinks* they are worth on
+// day D, on the same states, by evaluating each position twice — once as
+// played, once with the levels written in — and differencing. Put beside the
+// causal curve it reads the `uses` shape off the evaluator directly, in points,
+// with no reverse-engineering of constants.
+// =======================================================================
+
+fn eval_curve(spec: &AgentSpec, seed0: u64, n: u64, grant: String) {
+    let mut lv = [0u8; 4];
+    for item in grant.split(',') {
+        let mut ch = item.chars();
+        let t = ch.next().and_then(science_of).expect("--grant track");
+        lv[t.idx()] = ch.as_str().parse().expect("--grant level");
+    }
+    let cfg = GameConfig::evaluation();
+    // day -> (sum of eval delta, count)
+    let acc: Mutex<Vec<(f64, u32)>> = Mutex::new(vec![(0.0, 0); LAST_DAY as usize + 2]);
+    let next = AtomicU32::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..4 {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed) as u64;
+                if i >= n {
+                    return;
+                }
+                let seed = seed0 + i;
+                let base = spec.instance();
+                let agents: [&dyn Agent; N_PLAYERS] =
+                    std::array::from_fn(|_| base.as_ref() as &dyn Agent);
+                let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9));
+                let mut state = record::new_drafted_game(seed, &agents, &mut rng);
+                let mut local: Vec<(f64, u32)> = vec![(0.0, 0); LAST_DAY as usize + 2];
+                let mut guard = 0u32;
+                while !state.over && guard < 400 {
+                    guard += 1;
+                    let d = state.day.min(LAST_DAY) as usize;
+                    for p in PlayerId::ALL {
+                        // Only seats with none of the granted levels, so the
+                        // delta is always "gain the whole track".
+                        if lv.iter().enumerate().any(|(s, &l)| l > 0 && state.research[p.idx()][s] > 0) {
+                            continue;
+                        }
+                        let before = eval::heuristic(&state, p);
+                        let saved = state.research[p.idx()];
+                        for (s, &l) in lv.iter().enumerate() {
+                            state.research[p.idx()][s] = state.research[p.idx()][s].max(l);
+                        }
+                        let after = eval::heuristic(&state, p);
+                        state.research[p.idx()] = saved;
+                        local[d].0 += (after - before) as f64;
+                        local[d].1 += 1;
+                    }
+                    state.current = state.first_player;
+                    for _ in 0..N_PLAYERS {
+                        let p = state.current;
+                        let temp = (cfg.temperature)(state.day);
+                        if let Some(out) = agents[p.idx()].play_turn(&state, p, temp, &mut rng) {
+                            apply_move(&mut state, p, &out.mv);
+                            state.refill_buildings();
+                        }
+                        state.current = state.current.next(1);
+                    }
+                    let claimer = state.resolve_first_player();
+                    let mut days = 1u8;
+                    if let Some(p) = claimer {
+                        if state.may_take_extra_day(p) {
+                            let (take, _) = agents[p.idx()].extra_day(&state, p, &mut rng);
+                            if take {
+                                state.spend_extra_day(p);
+                                days = 2;
+                            }
+                        }
+                    }
+                    state.advance_days(days);
+                }
+                let mut g = acc.lock().unwrap();
+                for (i, (s, c)) in local.iter().enumerate() {
+                    g[i].0 += s;
+                    g[i].1 += c;
+                }
+            });
+        }
+    });
+    let g = acc.lock().unwrap();
+    println!("evalcurve: grant={grant} over {n} games");
+    println!("  day   n      eval delta   rel to day 0");
+    let d0 = g[0].0 / g[0].1.max(1) as f64;
+    for (d, (s, c)) in g.iter().enumerate() {
+        if *c == 0 {
+            continue;
+        }
+        let m = s / *c as f64;
+        println!("  {d:>3} {c:>6}      {m:+8.4}       {:.3}", m / d0);
+    }
+}
+
+// =======================================================================
+// --pricecurve
+//
+// The same double-evaluation trick as `--evalcurve`, applied to every currency
+// at once: corn, a block, a temple step, a building, and each maxed research
+// track. Every row is `eval::heuristic` with the thing and without it, on the
+// same real positions. Beside the causal price of the same thing (the `--gift`
+// arms, the cross-arm regression, the `--grant` arms) this is the evaluator's
+// full calibration table, and every entry is measured the same way, so the
+// ratios between rows are meaningful.
+// =======================================================================
+
+fn price_curve(spec: &AgentSpec, seed0: u64, n: u64) {
+    const NROW: usize = 12;
+    let names = [
+        "corn +1", "corn +3", "wood +1", "stone +1", "gold +1", "skull +1",
+        "temple step (best)", "building +1",
+        "Agriculture max", "Extraction max", "Architecture max", "Theology max",
+    ];
+    let cfg = GameConfig::evaluation();
+    let acc: Mutex<[(f64, u32); NROW]> = Mutex::new([(0.0, 0); NROW]);
+    let next = AtomicU32::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..4 {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed) as u64;
+                if i >= n {
+                    return;
+                }
+                let seed = seed0 + i;
+                let base = spec.instance();
+                let agents: [&dyn Agent; N_PLAYERS] =
+                    std::array::from_fn(|_| base.as_ref() as &dyn Agent);
+                let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9));
+                let mut state = record::new_drafted_game(seed, &agents, &mut rng);
+                let mut local = [(0.0f64, 0u32); NROW];
+                let mut guard = 0u32;
+                while !state.over && guard < 400 {
+                    guard += 1;
+                    // Only the first six days: the question is what an early
+                    // action is worth, and that is where the forcing bites.
+                    if state.day <= 6 {
+                        for p in PlayerId::ALL {
+                            let before = eval::heuristic(&state, p);
+                            macro_rules! bump {
+                                ($row:expr, $st:expr) => {{
+                                    let after = eval::heuristic($st, p);
+                                    local[$row].0 += (after - before) as f64;
+                                    local[$row].1 += 1;
+                                }};
+                            }
+                            let saved_corn = state.players[p.idx()].corn;
+                            state.players[p.idx()].corn = saved_corn.saturating_add(1);
+                            bump!(0, &state);
+                            state.players[p.idx()].corn = saved_corn.saturating_add(3);
+                            bump!(1, &state);
+                            state.players[p.idx()].corn = saved_corn;
+                            for (row, r) in [Resource::Wood, Resource::Stone,
+                                             Resource::Gold, Resource::Skull]
+                                .iter().enumerate()
+                            {
+                                let sv = state.players[p.idx()].res[*r as usize];
+                                state.players[p.idx()].res[*r as usize] = sv.saturating_add(1);
+                                bump!(2 + row, &state);
+                                state.players[p.idx()].res[*r as usize] = sv;
+                            }
+                            // Best legal single temple step, which is what a
+                            // Tikal 5 action actually buys half of.
+                            let mut best = f32::NEG_INFINITY;
+                            for t in Temple::ALL {
+                                if state.can_temple_step(p, t, 1) {
+                                    state.temple_step(p, t, 1);
+                                    best = best.max(eval::heuristic(&state, p));
+                                    state.temple_step(p, t, -1);
+                                }
+                            }
+                            if best > f32::NEG_INFINITY {
+                                local[6].0 += (best - before) as f64;
+                                local[6].1 += 1;
+                            }
+                            let sb = state.players[p.idx()].buildings;
+                            state.players[p.idx()].buildings = sb + 1;
+                            bump!(7, &state);
+                            state.players[p.idx()].buildings = sb;
+                            for (row, sc) in Science::ALL.iter().enumerate() {
+                                let sv = state.research[p.idx()][sc.idx()];
+                                if sv > 0 { continue; }
+                                state.research[p.idx()][sc.idx()] = 3;
+                                bump!(8 + row, &state);
+                                state.research[p.idx()][sc.idx()] = sv;
+                            }
+                        }
+                    }
+                    state.current = state.first_player;
+                    for _ in 0..N_PLAYERS {
+                        let p = state.current;
+                        let temp = (cfg.temperature)(state.day);
+                        if let Some(out) = agents[p.idx()].play_turn(&state, p, temp, &mut rng) {
+                            apply_move(&mut state, p, &out.mv);
+                            state.refill_buildings();
+                        }
+                        state.current = state.current.next(1);
+                    }
+                    let claimer = state.resolve_first_player();
+                    let mut days = 1u8;
+                    if let Some(p) = claimer {
+                        if state.may_take_extra_day(p) {
+                            let (take, _) = agents[p.idx()].extra_day(&state, p, &mut rng);
+                            if take {
+                                state.spend_extra_day(p);
+                                days = 2;
+                            }
+                        }
+                    }
+                    state.advance_days(days);
+                }
+                let mut g = acc.lock().unwrap();
+                for (i, (s, c)) in local.iter().enumerate() {
+                    g[i].0 += s;
+                    g[i].1 += c;
+                }
+            });
+        }
+    });
+    let g = acc.lock().unwrap();
+    println!("pricecurve: days 0-6 over {n} games");
+    println!("  {:<22} {:>8}  {:>7}", "thing", "eval", "n");
+    for (i, nm) in names.iter().enumerate() {
+        if g[i].1 == 0 { continue; }
+        println!("  {:<22} {:>+8.4}  {:>7}", nm, g[i].0 / g[i].1 as f64, g[i].1);
+    }
+}
+
+// =======================================================================
 // --census
 // =======================================================================
 
@@ -1070,7 +1399,7 @@ fn census(spec: &AgentSpec, seed0: u64, n: u64, out: Option<PathBuf>) {
             let a = spec.instance();
             let agents: [&dyn Agent; N_PLAYERS] = std::array::from_fn(|_| a.as_ref());
             let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9));
-            let t = play_traced(seed, &agents, &cfg, &mut rng, true, None);
+            let t = play_traced(seed, &agents, &cfg, &mut rng, true, None, None);
             rows.lock().unwrap().extend(t.census);
         });
     });
@@ -1163,7 +1492,7 @@ fn verify(spec: &AgentSpec, seed0: u64, n: u64) {
         let agents: [&dyn Agent; N_PLAYERS] = std::array::from_fn(|_| a.as_ref());
 
         let mut r1 = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9));
-        let t = play_traced(seed, &agents, &cfg, &mut r1, false, None);
+        let t = play_traced(seed, &agents, &cfg, &mut r1, false, None, None);
 
         let mut r2 = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9));
         let g = record::play_game(seed, &agents, &cfg, &mut r2);
