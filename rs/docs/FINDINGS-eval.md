@@ -4311,3 +4311,183 @@ were measured in both directions on four agents and none of them moved.
    that agree cell for cell. `ACTION_VALUE`, `action_cap`, `TEMPO_PER_ROUND`,
    `GEAR_SCALE` and `SKULL_PREMIUM` are not coupled to `BOARD_SCALE` and are not
    coupled to search depth. That question is closed.
+
+---
+
+# Session: is research underpriced? A separated sweep on the agent that ships
+
+The user watched the champion play: *"it never researches; research compounds,
+so it should get more worth it the more you look ahead."* Confirmed by
+inspection — at round 22 of 27 no player holds a track above level 2 and level 3
+is untouched on all four tracks, against monument #11 (9/20/33 for one/two/three
+maxed tracks) and #12 (3 a level).
+
+The suspicion is that `RESEARCH_SCALE = 0.05` is a **measurement artifact**:
+`--promise` cannot tell "this space is overpriced" from "this term is
+underpriced" for a delayed-payoff term, and the cut was decided on `greedy:64`
+and `mcts:256`, neither of which can see a compounding yield.
+
+## F50. Platform, binary, and the two knobs this session adds
+
+`<scratch>/f7/evalab-r1`, built from a pristine `git archive` of **`0fd36d9`**
+(clean HEAD) into `<scratch>/f7/tree` plus one file this workstream owns,
+`src/bin/evalab.rs`. `--eqcheck` over 16,240 (position, seat) pairs reads
+**`0e0`**, and the explicit-spec null
+`--ab 'board=0.9,av=0.2,temple=1.2,rs=0.05,ci=0.0,ceiling,pal=1.5,chi=0.7,
+pneed=0.25,rdiv=3,rcap=7,rpow=1,rtop=0,rmonu=0' --base head` reads **+0.0000 in
+all 40 blocks**, so the new knobs are inert at their HEAD values.
+
+Cost, `/usr/bin/time` user CPU per rotation block on this machine:
+`greedy:64` **0.41 s**, `mcts:256` **1.73 s**, `mcts:1024:cp=0.05` **6.8 s**.
+
+New in `bin/evalab`:
+
+| knob | HEAD | what it moves |
+| --- | --- | --- |
+| `rdiv` / `rcap` | 3.0 / 7.0 | `uses = (rounds_left / rdiv).min(rcap)` — the research horizon's **shape**. At HEAD the cap binds for the first six days, so research on day 0 and day 6 are priced identically. |
+| `rpow` | 1.0 | bends the interior of that curve, `uses = full·(uses/full)^rpow` with `full = (LAST_DAY/rdiv).min(rcap)`. Pure shape: `uses` at a full-length game is held fixed, so it cannot be read as a magnitude change. |
+| `rtop` | 0.0 | `rtop · maxed² · horizon` — convexity in *finished* tracks, which monument #11's 9/20/33 pays for and the per-use sum cannot express. |
+| `rmonu` | 0.0 | credit for a face-up #11/#12. `monument_outlook` skips a monument whose `score` evaluates to 0, so **the two research monuments are invisible to a player with an empty research row** — exactly the player who would have to start a track to reach them. |
+| `--uptake` | — | plays the same rotation blocks and reports **final research levels** per seat, not only score. A landing that raises the number without changing behaviour is measuring noise. |
+
+## F51. `--promise` is circular for research, and here is the measurement of it
+
+`--pvar` runs the whole `--promise` walk under a *different* evaluator.
+`<scratch>/f7/diag/promise_{head,rs015,rs05,rs10}.txt`, `evalab-r2`, 8,126
+standing workers over 4,000 turn roots, same corpus in every column.
+
+`promise` comes from `space_value`; `delivery` comes from the evaluator's own
+estimate of the action. Vary nothing but `RESEARCH_SCALE`:
+
+| `rs` | Tikal 1 promise | Tikal 1 **delivery** | `want` | `dead` | overall ratio |
+| --- | --- | --- | --- | --- | --- |
+| 0.05 (HEAD) | 3.105 | **0.014** | 0.02 | **0.99** | 1.043 |
+| 0.15 | 3.105 | 0.021 | 0.02 | 0.96 | 1.045 |
+| 0.50 | 3.105 | **0.301** | 0.33 | 0.53 | 1.066 |
+| 1.00 | 3.105 | **1.330** | 1.48 | 0.23 | 1.153 |
+
+**The promise column does not move and the delivery column moves by 95x.** So
+F26a's headline — "the first research space is priced at 2.00 and delivers
+0.017, the widest disagreement on the board" — is not a fact about the space
+table at all. It is `RESEARCH_SCALE = 0.05` read back to itself. At `rs = 1.0`
+the identical diagnostic on the identical corpus reports the table 26% high
+instead of 100x high, and the `dead` fraction — "the evaluator refuses its own
+action" — falls from 0.99 to 0.23.
+
+**The brief's charge is upheld as far as the diagnostic goes, and it must be
+stated more narrowly than that for the landing.** `--promise` pointed at
+research; it could not have told which side was wrong, and this table is the
+proof. But F19b/F20 did not stop there: they *swept* `RESEARCH_SCALE` in the
+arena over 0.0-1.5 and found a monotone decreasing curve with a plateau at
+0.0-0.15. The cut was decided by an A/B, not by the diagnostic. What is
+genuinely circular is the *doc comment* in `eval.rs`, which cites Tikal 1's
+promise/delivery gap as evidence for the cut, and F26a/F26d, which read the
+`dead` column as a property of the space table.
+
+Two other things fall out of the same run, both re-reads of F26 on the shipped
+evaluator:
+
+* **The overall promise/delivery ratio is now 1.043**, against 1.49 in F19 and
+  1.62 in F26. `board = 0.9` and `GEAR_SCALE` closed that gap; the board term's
+  level is no longer the thing that is off.
+* **The under-priced spaces are Tikal 5/6/7 and Uxmal 5/6/7, not Tikal 1.**
+  Tikal 5 promises 4.21 and delivers **8.80** (`want` 9.77 against a table of
+  3.89); Yaxchilan 7 promises 1.53 and delivers 5.35. The tail of every gear
+  delivers about twice what the table says, because a worker that far up is one
+  the evaluator will actually cash.
+
+## F52. Raising `RESEARCH_SCALE` **does** change behaviour — and the behaviour it buys loses points
+
+`--uptake`, `greedy:64`, 74-81 blocks, `<scratch>/f7/up/up_rs*_greedy64.jsonl`.
+Levels are the sum of the four track levels at the end of the game, 0..=12;
+`t3` is the number of tracks reaching level 3. Candidate seat against the mean
+of the three baseline seats in the same games.
+
+| `rs` | levels (cand) | levels (base) | Δ levels | tracks maxed (cand) | Δ maxed | centred score |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.05 (null) | **1.264** | 1.264 | +0.000 | **0.024** | +0.000 | +0.00 (exactly) |
+| 0.50 | 1.844 | 1.231 | **+0.612** [+0.50, +0.72] * | 0.053 | +0.035 * | −0.63 [−1.40, +0.13] |
+| 1.00 | **3.198** | 1.239 | **+1.959** [+1.78, +2.14] * | **0.333** | +0.321 * | **−3.50** [−4.66, −2.35] * |
+
+**The champion's evaluator reaches 1.26 research levels out of twelve in a whole
+game and maxes a track in 2.4% of player-games.** The user's observation is
+exactly right as a description.
+
+But it is not a blind spot. **Turn the knob and it researches**: at
+`RESEARCH_SCALE = 1.0` — twenty times the committed value — the agent takes 2.5x
+as many levels and maxes a track fourteen times as often. Uptake responds
+smoothly and hugely to the term. And it **loses 3.5 points doing it**.
+
+This is the strongest form the negative result can take, and it is the one
+measurement that separates "the evaluator cannot see research" from "research is
+not worth taking". It is the second: the evaluator can see it, will chase it,
+and comes back with a worse score. The null row is the control — under `rs =
+0.05` against itself the two arms are bit-identical, Δ levels exactly 0.000, so
+every number in the table is the change and not the noise.
+
+### F52a. Operational: `pkill` on a driver leaves its `xargs` alive, and that is two writers on one file
+
+Recorded because it cost an hour and the file already has F6 on this exact
+failure. `drive.sh` is `bash -> xargs -P N -> q.sh -> evalab`.
+`pkill -f drive.sh` matches **only the bash process**; `xargs` and everything
+under it keeps running, so restarting the driver puts a second writer on every
+output file. At 10:53 there were 24 jobs where 8 were asked for and `ps` showed
+two `--out` writers per file.
+
+Caught by re-running an.py's duplicate-seed guard over every file rather than
+trusting the process count, and the arena files came back clean — `--resume`'s
+BUSY check happened to fire first — but the two `--uptake` files, which have no
+`--resume`, had replayed 25 of 55 seeds. Both were deduplicated by seed before
+anything was read off them.
+
+`<scratch>/f7/stop.sh` kills the pipeline **parents first, then the orphans**
+(`chain -> drive -> xargs -> q.sh -> evalab`, TERM then KILL), and `q.sh`'s
+first act is now a `ps` for another writer on the same `--out`, not a lock
+directory: a SIGKILLed runner orphans a live writer that no lock can see.
+
+## F53. How big the research term actually is: **0.090 points of a 33.4-point estimate**
+
+`--terms --pvar` differences the same corpus under two evaluators, so the gap in
+the `engine` column *is* the research sub-term exactly, with no ninth
+`Components` field. `evalab-r4`, 2,536 turn roots x 4 seats.
+
+| `rs` | `engine` mean | research sub-term | share of the estimate |
+| --- | --- | --- | --- |
+| 0.0 | 3.227 | 0 | — |
+| **0.05 (HEAD)** | 3.317 | **0.090** | **0.27%** |
+| 0.50 | 4.126 | 0.899 | 2.7% |
+| 1.00 | 5.025 | 1.798 | 5.1% |
+
+The whole estimate at HEAD is 33.4 points, of which `temple` is **15.27**,
+`board` 7.10, `liquidation` 3.68, `engine` 3.32, `held` 2.75, `banked` 2.88,
+`starve` −1.80 and `monument` 0.17.
+
+So the term under investigation is **three parts in a thousand of the
+evaluator**, and `RESEARCH_SCALE = 1.0` — the far end of every sweep below —
+takes it to 1.8 points, still smaller than `held_premium`. Anyone reading "the
+champion never researches" as "a term is a factor of ten out" should have this
+number in front of them: a factor of ten on this term is 0.8 points of estimate,
+and F52 shows it moves final research levels by half a level.
+
+### F52b. At full block count, and the extra research is **early** research
+
+`--uptake`, `greedy:64`, **300 blocks (1,200 games)** each, `evalab-r3`.
+`early` is the same level sum as of **day 14**, half way through the calendar —
+the column that separates "it bought levels it had time to use" from "it bought
+levels two rounds before the end".
+
+| `rs` | levels | Δ levels | of which by day 14 | Δ early | tracks maxed | centred |
+| --- | --- | --- | --- | --- | --- | --- |
+| **0.05 (null)** | **1.242** | +0.000 | **0.845** | +0.000 | **0.019** | +0.00 |
+| 0.15 | 1.297 | +0.059 [+0.036, +0.081] * | 0.886 | +0.041 * | 0.022 | −0.09 [−0.23, +0.06] |
+| 0.50 | 1.838 | **+0.626** [+0.57, +0.69] * | 1.302 | +0.462 * | 0.065 | **−1.00** [−1.41, −0.60] * |
+| 1.00 | 3.307 | **+2.099** [+2.01, +2.19] * | 2.555 | **+1.705** * | **0.328** | **−4.33** [−4.86, −3.79] * |
+
+**81% of the extra research at `rs = 1.0` is in place by day 14** (+1.705 of
++2.099). The agent is not buying junk levels in the last rounds — `uses` already
+prices those near zero — it is front-loading exactly the way the hypothesis says
+it should, and it loses **4.33 points** doing it. That is the specific
+refutation: it is not that the evaluator researches at the wrong *time*, it is
+that the research it takes when told research is valuable is not worth what it
+costs.
+

@@ -36,7 +36,7 @@ use rayon::prelude::*;
 use tzolkin::ids::*;
 use tzolkin::phase::{Evaluation, Evaluator, Phase};
 use tzolkin::record::{
-    play_game, Agent, Candidates, GameConfig, GreedyAgent, Summary,
+    play_game, Agent, Candidates, GameConfig, GreedyAgent, Node, Summary, TurnOutcome,
 };
 use tzolkin::state::GameState;
 
@@ -210,6 +210,36 @@ pub mod v {
         /// 0.60 where the table prices it at 2.00 — the widest disagreement on
         /// the board — so either the table is wrong there or `engine_value` is.
         pub research_scale: f32,
+        /// The *shape* of `engine_value`'s research horizon,
+        /// `uses = (rounds_left / r_div).min(r_cap)`, which decides how much
+        /// more an early research level is worth than a late one.
+        ///
+        /// HEAD is `(3.0, 7.0)`. `LAST_DAY = 27`, so the cap binds for the
+        /// first **six** days — research on day 0 and research on day 6 are
+        /// priced identically — and the term is linear in `rounds_left` after
+        /// that. Linear is the right shape for a payout that is *per use* and
+        /// does not feed back; it is the wrong shape for one that compounds, or
+        /// for the two research monuments (#11 pays 9/20/33 for one/two/three
+        /// maxed tracks, #12 pays 3 a level), which are convex in the level
+        /// reached. `r_pow` bends it: `uses = base * (u / base)^r_pow` with
+        /// `base = LAST_DAY / r_div`, which is a pure *shape* change — it holds
+        /// `uses` fixed at a full-length game and only moves the interior, so
+        /// it does not smuggle in a magnitude change the way a raw power would.
+        pub r_div: f32,
+        pub r_cap: f32,
+        pub r_pow: f32,
+        /// A flat bonus per level for holding a *completed* track, on top of
+        /// the per-use sum: monument #11's 9/20/33 is convex in maxed tracks
+        /// and nothing in `engine_value` is. `near_top` is the same idea one
+        /// level down and has only ever measured inert.
+        pub r_top: f32,
+        /// Credit for the two research monuments while they are face up and the
+        /// player has *no* levels yet. `monument_outlook` skips a monument
+        /// whose `score` evaluates to 0, so #11 and #12 are invisible to a
+        /// player with an empty research row — which is exactly the player who
+        /// would have to start a track to reach them. This pays the option:
+        /// `r_monu` points per face-up research monument, faded by `horizon`.
+        pub r_monu: f32,
         /// The `held_premium` price list, and `starvation_risk`'s income
         /// assumption. Every one of these is a hand number that has only ever
         /// been moved as part of the whole term (`held=` scales all of them at
@@ -382,6 +412,11 @@ pub mod v {
         hand_flat: 0.0,
         calib_alpha: 0.0,
         research_scale: 0.05,
+        r_div: 3.0,
+        r_cap: 7.0,
+        r_pow: 1.0,
+        r_top: 0.0,
+        r_monu: 0.0,
         corn_premium: 0.10,
         block_premium: 0.55,
         block_breadth: 0.50,
@@ -684,7 +719,18 @@ pub mod v {
             pl.free_workers as f32 * 2.0 + (pl.worker_discount as f32).min(2.0) * workers;
         v += saved * food_days_left / CORN_PER_POINT * vr.food_saving;
 
-        let uses = (rounds_left / 3.0).min(7.0);
+        // `uses`: how many times a research level still pays before the
+        // calendar runs out. `r_pow` bends the interior of that curve without
+        // moving its value at a full-length game, so shape and magnitude stay
+        // separable (`research_scale` is the magnitude).
+        let mut uses = (rounds_left / vr.r_div).min(vr.r_cap);
+        if vr.r_pow != 1.0 {
+            let full = (LAST_DAY as f32 / vr.r_div).min(vr.r_cap);
+            if full > 0.0 && uses > 0.0 {
+                uses = full * (uses / full).powf(vr.r_pow);
+            }
+        }
+        let mut maxed = 0.0f32;
         for s in Science::ALL {
             let lvl = g.level(p, s);
             for l in 1..=lvl {
@@ -692,6 +738,27 @@ pub mod v {
             }
             if lvl == 2 && horizon > 0.15 {
                 v += vr.near_top;
+            }
+            if lvl == 3 {
+                maxed += 1.0;
+            }
+        }
+        // Convexity in the number of *finished* tracks, which monument #11
+        // pays for and the per-use sum above cannot express.
+        if vr.r_top != 0.0 && maxed > 0.0 {
+            v += vr.r_top * maxed * maxed * horizon;
+        }
+        // The two research monuments are invisible to a player with no levels
+        // (`monument_outlook` skips a monument scoring 0), so the first level
+        // of a track carries an option that nothing prices.
+        if vr.r_monu != 0.0 {
+            let n = g
+                .face_up_monuments()
+                .filter(|&id| id.0 == 11 || id.0 == 12)
+                .count() as f32;
+            if n > 0.0 {
+                let levels: f32 = Science::ALL.iter().map(|&s| g.level(p, s) as f32).sum();
+                v += vr.r_monu * n * levels.min(6.0) * horizon;
             }
         }
 
@@ -1443,6 +1510,11 @@ fn variant(name: &str) -> Option<v::V> {
                             "reach" => out.reach = f,
                             "handv" => out.hand_flat = f,
                             "rs" => out.research_scale = f,
+                            "rdiv" => out.r_div = f,
+                            "rcap" => out.r_cap = f,
+                            "rpow" => out.r_pow = f,
+                            "rtop" => out.r_top = f,
+                            "rmonu" => out.r_monu = f,
                             "cp" => out.corn_premium = f,
                             "bp" => out.block_premium = f,
                             "bb" => out.block_breadth = f,
@@ -1785,16 +1857,25 @@ fn cmd_spacetab(pos: &[(GameState, PlayerId)]) {
 /// `--midturn` says HEAD's estimate climbs +2.70 above the turn it will finish
 /// in by depth 5. This says which of the eight terms does the climbing, which
 /// is what turns "the evaluator drifts mid-turn" into a line to change.
-fn cmd_terms(pos: &[(GameState, PlayerId)], take: usize) {
+fn cmd_terms(pos: &[(GameState, PlayerId)], take: usize, pvar: Option<String>) {
     use tzolkin::phase::Phase;
     let names = v::Components::NAMES;
+    // `--pvar` again: the difference of two `--terms` runs that differ in one
+    // constant is that constant's exact contribution to the estimate, which is
+    // the only way to answer "how big is the research term, really" without a
+    // ninth `Components` field.
+    let vh = match &pvar {
+        Some(n) => variant(n).unwrap_or_else(|| panic!("unknown variant {n}")),
+        None => v::HEAD,
+    };
+    eprintln!("terms: evaluator = {}", pvar.as_deref().unwrap_or("head"));
 
     println!("\n-- term size over {} turn roots x 4 seats --", pos.len().min(take));
     println!("{:>12} {:>9} {:>9} {:>9}", "term", "mean", "sd", "mean|x|");
     let mut cols: Vec<Vec<f64>> = vec![Vec::new(); 8];
     for (g, _) in pos.iter().take(take) {
         for q in PlayerId::ALL {
-            let t = v::components(&v::HEAD, g, q).terms();
+            let t = v::components(&vh, g, q).terms();
             for i in 0..8 {
                 cols[i].push(t[i] as f64);
             }
@@ -1817,7 +1898,7 @@ fn cmd_terms(pos: &[(GameState, PlayerId)], take: usize) {
             let mut g = *g0;
             let mut ph = Phase::Beg;
             let mut done = 0u8;
-            let mut out = vec![v::components(&v::HEAD, &g, *p).terms()];
+            let mut out = vec![v::components(&vh, &g, *p).terms()];
             for _ in 0..64 {
                 let steps = tzolkin::tree::legal_steps(&g, ph, *p, done);
                 if steps.is_empty() {
@@ -1827,7 +1908,7 @@ fn cmd_terms(pos: &[(GameState, PlayerId)], take: usize) {
                 for (i, s) in steps.iter().enumerate() {
                     let mut probe = g;
                     tzolkin::tree::apply_step(&mut probe, ph, *p, done, s);
-                    let sc = v::heuristic(&v::HEAD, &probe, *p);
+                    let sc = v::heuristic(&vh, &probe, *p);
                     if sc > best.0 {
                         best = (sc, i);
                     }
@@ -1838,10 +1919,10 @@ fn cmd_terms(pos: &[(GameState, PlayerId)], take: usize) {
                         g = next;
                         ph = p2;
                         done = d2;
-                        out.push(v::components(&v::HEAD, &g, *p).terms());
+                        out.push(v::components(&vh, &g, *p).terms());
                     }
                     None => {
-                        out.push(v::components(&v::HEAD, &next, *p).terms());
+                        out.push(v::components(&vh, &next, *p).terms());
                         return Some(out);
                     }
                 }
@@ -1887,9 +1968,22 @@ fn cmd_terms(pos: &[(GameState, PlayerId)], take: usize) {
 ///
 /// Reported per gear and position against the hand table's own entry, so a
 /// systematically mis-priced space is one row rather than a sweep.
-fn cmd_promise(pos: &[(GameState, PlayerId)], take: usize) {
+fn cmd_promise(pos: &[(GameState, PlayerId)], take: usize, pvar: Option<String>) {
     use tzolkin::phase::{ModeChoice, Step};
-    let vr = v::HEAD;
+    // `--pvar` runs the whole diagnostic under a *different* evaluator.
+    //
+    // This is what makes `--promise` falsifiable rather than circular. It
+    // compares what `space_value` promises a worker against what the
+    // evaluator's own estimate moves by when the action lands, so for a term
+    // the evaluator underprices it reports "the space is overpriced" and
+    // "the term is underpriced" identically. Re-running it under a variant
+    // that prices the term differently separates the two: a promise/delivery
+    // ratio that moves with `rs` was never a fact about the space table.
+    let vr = match &pvar {
+        Some(n) => variant(n).unwrap_or_else(|| panic!("unknown variant {n}")),
+        None => v::HEAD,
+    };
+    eprintln!("promise: evaluator = {}", pvar.as_deref().unwrap_or("head"));
 
     // (gear, pos) -> (n, sum promise, sum delivery, sum sv_now, n dead)
     type Cell = (usize, f64, f64, f64, usize);
@@ -2414,7 +2508,12 @@ enum Kind {
     /// that cannot look ahead is not necessarily the one that helps a search
     /// that can — every term about the *future* is exactly where the two differ.
     /// `docs/OVERNIGHT.md`, `mcts.rs::MctsConfig::c_puct_init`.
-    Search(u32, f32),
+    ///
+    /// The third field is `MctsConfig::prior_min_edges`, 0 for "leave the
+    /// default alone". The deliverable is `mcts:8192:heuristic:deeper`, which
+    /// is sugar for `cp=0.02,pmin=2`; without this field `bin/evalab` could not
+    /// spell the agent that ships (F27d, and F49's first open item).
+    Search(u32, f32, u32),
 }
 
 fn agent_for(kind: Kind, vr: v::V, name: &'static str, seed: u64) -> Box<dyn Agent> {
@@ -2424,10 +2523,13 @@ fn agent_for(kind: Kind, vr: v::V, name: &'static str, seed: u64) -> Box<dyn Age
             cands: c,
             record: false,
         }),
-        Kind::Search(sims, cp) => {
+        Kind::Search(sims, cp, pmin) => {
             let mut cfg = tzolkin::mcts::MctsConfig::default();
             if cp >= 0.0 {
                 cfg.c_puct_init = cp;
+            }
+            if pmin > 0 {
+                cfg.prior_min_edges = pmin as usize;
             }
             Box::new(tzolkin::record::SearchAgent::with_config(
                 Arc::new(VEval(vr, name)) as Arc<dyn Evaluator>,
@@ -2439,6 +2541,215 @@ fn agent_for(kind: Kind, vr: v::V, name: &'static str, seed: u64) -> Box<dyn Age
             ))
         }
     }
+}
+
+
+// =======================================================================
+// `--uptake`: does the change move *behaviour*, or only the score?
+// =======================================================================
+
+/// An [`Agent`] that watches the states its inner agent is asked about and
+/// keeps the highest research row it has seen for every seat.
+///
+/// A landing that raises a centred score without changing what the players do
+/// is measuring noise. `RESEARCH_SCALE` is the term whose whole claim is about
+/// behaviour — "the champion never researches" — so the honest check is a count
+/// of levels reached, not a difference of scores.
+///
+/// Research levels are monotone, so the maximum over every state the agent is
+/// shown is the final row, except for advances made in the last turn of the
+/// last seat. Every seat is wrapped, so that miss is at most one player's last
+/// turn and it falls on candidate and baseline seats equally under rotation.
+struct Watch {
+    inner: Box<dyn Agent>,
+    seen: Mutex<[[u8; 4]; N_PLAYERS]>,
+    /// The same row as of the last state seen on or before `HALF_DAY`. "Does
+    /// the extra research arrive early, when it still pays for itself, or late,
+    /// when it is a level bought two rounds before the game ends?" is the whole
+    /// of the shape question, and a final count cannot answer it.
+    half: Mutex<[[u8; 4]; N_PLAYERS]>,
+}
+
+/// Half-way through the 27-day calendar.
+const HALF_DAY: u8 = 14;
+
+impl Watch {
+    fn note(&self, g: &GameState) {
+        let mut m = self.seen.lock().unwrap();
+        let mut h = self.half.lock().unwrap();
+        for s in 0..N_PLAYERS {
+            let p = PlayerId(s as u8);
+            for (i, sc) in Science::ALL.iter().enumerate() {
+                let l = g.level(p, *sc);
+                if l > m[s][i] {
+                    m[s][i] = l;
+                }
+                if g.day <= HALF_DAY && l > h[s][i] {
+                    h[s][i] = l;
+                }
+            }
+        }
+    }
+}
+
+impl Agent for Watch {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+    fn play_turn(
+        &self,
+        g: &GameState,
+        p: PlayerId,
+        temp: f32,
+        rng: &mut rand::rngs::StdRng,
+    ) -> Option<TurnOutcome> {
+        self.note(g);
+        let o = self.inner.play_turn(g, p, temp, rng);
+        o
+    }
+    fn extra_day(
+        &self,
+        g: &GameState,
+        p: PlayerId,
+        rng: &mut rand::rngs::StdRng,
+    ) -> (bool, Option<Node>) {
+        self.note(g);
+        self.inner.extra_day(g, p, rng)
+    }
+    fn draft(
+        &self,
+        g: &GameState,
+        p: PlayerId,
+        dealt: [u8; 4],
+        rng: &mut rand::rngs::StdRng,
+    ) -> [u8; 2] {
+        self.inner.draft(g, p, dealt, rng)
+    }
+}
+
+/// Per-seat research totals from one game.
+#[derive(Clone, Copy, Default)]
+struct Uptake {
+    /// Sum of the four track levels, 0..=12.
+    levels: f64,
+    /// The same sum as of day 14, half way through the calendar.
+    early: f64,
+    /// Tracks at level >= 1, >= 2, >= 3.
+    t1: f64,
+    t2: f64,
+    t3: f64,
+    score: f64,
+}
+
+/// One rotation block, reporting research uptake instead of only score.
+fn uptake_block(seed: u64, kind: Kind, cand: v::V, base: v::V) -> Vec<(Uptake, Uptake)> {
+    let cfg = GameConfig::evaluation();
+    let mut out = Vec::new();
+    for c in 0..N_PLAYERS {
+        let watchers: Vec<Watch> = (0..N_PLAYERS)
+            .map(|s| Watch {
+                inner: if s == c {
+                    agent_for(kind, cand, "cand", seed)
+                } else {
+                    agent_for(kind, base, "base", seed)
+                },
+                seen: Mutex::new([[0u8; 4]; N_PLAYERS]),
+                half: Mutex::new([[0u8; 4]; N_PLAYERS]),
+            })
+            .collect();
+        let agents: [&dyn Agent; N_PLAYERS] = std::array::from_fn(|s| &watchers[s] as &dyn Agent);
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(
+            seed.wrapping_mul(0x9E37_79B9),
+        );
+        let r = play_game(seed, &agents, &cfg, &mut rng);
+        // Merge every watcher's view: seat `s` only sees the states it was
+        // asked about, and the union over all four is every state in the game.
+        let mut row = [[0u8; 4]; N_PLAYERS];
+        let mut erow = [[0u8; 4]; N_PLAYERS];
+        for w in &watchers {
+            let m = w.seen.lock().unwrap();
+            let h = w.half.lock().unwrap();
+            for s in 0..N_PLAYERS {
+                for i in 0..4 {
+                    row[s][i] = row[s][i].max(m[s][i]);
+                    erow[s][i] = erow[s][i].max(h[s][i]);
+                }
+            }
+        }
+        let one = |s: usize| Uptake {
+            levels: row[s].iter().map(|&l| l as f64).sum(),
+            early: erow[s].iter().map(|&l| l as f64).sum(),
+            t1: row[s].iter().filter(|&&l| l >= 1).count() as f64,
+            t2: row[s].iter().filter(|&&l| l >= 2).count() as f64,
+            t3: row[s].iter().filter(|&&l| l >= 3).count() as f64,
+            score: r.scores[s] as f64,
+        };
+        let cu = one(c);
+        let mut bu = Uptake::default();
+        for s in 0..N_PLAYERS {
+            if s != c {
+                let u = one(s);
+                bu.levels += u.levels / 3.0;
+                bu.early += u.early / 3.0;
+                bu.t1 += u.t1 / 3.0;
+                bu.t2 += u.t2 / 3.0;
+                bu.t3 += u.t3 / 3.0;
+                bu.score += u.score / 3.0;
+            }
+        }
+        out.push((cu, bu));
+    }
+    out
+}
+
+fn cmd_uptake(cand: &str, base: &str, kind: Kind, blocks: u64, seed0: u64, out: PathBuf) {
+    let cv = variant(cand).unwrap_or_else(|| panic!("unknown variant {cand}"));
+    let bv = variant(base).unwrap_or_else(|| panic!("unknown variant {base}"));
+    let done: std::collections::HashSet<u64> = std::fs::read_to_string(&out)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            l.split("\"seed\":")
+                .nth(1)
+                .and_then(|t| t.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok())
+        })
+        .collect();
+    let f = Arc::new(Mutex::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out)
+            .unwrap(),
+    ));
+    let todo: Vec<u64> = (seed0..seed0 + blocks).filter(|s| !done.contains(s)).collect();
+    todo.par_iter().for_each(|&seed| {
+        let rows = uptake_block(seed, kind, cv, bv);
+        let n = rows.len() as f64;
+        let m = |g: fn(&(Uptake, Uptake)) -> f64| rows.iter().map(g).sum::<f64>() / n;
+        let line = format!(
+            "{{\"seed\":{seed},\"centred\":{:.6},\"win\":0,\"cand\":{:.6},\"base\":{:.6},\
+             \"c_lvl\":{:.6},\"b_lvl\":{:.6},\"c_early\":{:.6},\"b_early\":{:.6},\
+             \"c_t1\":{:.6},\"b_t1\":{:.6},\
+             \"c_t2\":{:.6},\"b_t2\":{:.6},\"c_t3\":{:.6},\"b_t3\":{:.6}}}\n",
+            m(|r| r.0.score - (r.0.score + 3.0 * r.1.score) / 4.0),
+            m(|r| r.0.score),
+            m(|r| r.1.score),
+            m(|r| r.0.levels),
+            m(|r| r.1.levels),
+            m(|r| r.0.early),
+            m(|r| r.1.early),
+            m(|r| r.0.t1),
+            m(|r| r.1.t1),
+            m(|r| r.0.t2),
+            m(|r| r.1.t2),
+            m(|r| r.0.t3),
+            m(|r| r.1.t3),
+        );
+        let mut h = f.lock().unwrap();
+        h.write_all(line.as_bytes()).unwrap();
+        h.flush().unwrap();
+    });
+    eprintln!("uptake: wrote {}", out.display());
 }
 
 /// One rotation block: the same seed played once per seating.
@@ -2667,11 +2978,11 @@ fn main() {
     }
     if has("--terms") {
         let take: usize = get("--take").and_then(|v| v.parse().ok()).unwrap_or(4000);
-        cmd_terms(&pos, take);
+        cmd_terms(&pos, take, get("--pvar"));
     }
     if has("--promise") {
         let take: usize = get("--take").and_then(|v| v.parse().ok()).unwrap_or(4000);
-        cmd_promise(&pos, take);
+        cmd_promise(&pos, take, get("--pvar"));
     }
     if has("--midturn") {
         let budget: i64 = get("--budget").and_then(|v| v.parse().ok()).unwrap_or(60_000);
@@ -2679,7 +2990,7 @@ fn main() {
         cmd_midturn(&pos, budget, take, get("--vars"));
     }
 
-    if let Some(cand) = get("--ab") {
+    if let Some(cand) = get("--ab").or_else(|| get("--uptake")) {
         let base = get("--base").unwrap_or_else(|| "head".into());
         let spec = get("--agent").unwrap_or_else(|| "greedy:full".into());
         let kind = match spec.split_once(':') {
@@ -2688,11 +2999,21 @@ fn main() {
             // `mcts:N` or `mcts:N:cp=X`. Both arms get the same `cp`, so the
             // comparison stays the evaluator; what changes is how deep the
             // search that is reading it looks.
-            Some(("mcts", rest)) => match rest.split_once(":cp=") {
-                Some((n, cp)) => Kind::Search(n.parse().unwrap(), cp.parse().unwrap()),
-                None => Kind::Search(rest.parse().unwrap(), -1.0),
-            },
-            _ => panic!("--agent is greedy:full, greedy:K, mcts:N or mcts:N:cp=X"),
+            // `mcts:N`, `mcts:N:cp=X`, `mcts:N:cp=X:pmin=K`, `mcts:N:pmin=K`.
+            Some(("mcts", rest)) => {
+                let mut it = rest.split(':');
+                let sims: u32 = it.next().unwrap().parse().unwrap();
+                let (mut cp, mut pmin) = (-1.0f32, 0u32);
+                for f in it {
+                    match f.split_once('=') {
+                        Some(("cp", x)) => cp = x.parse().unwrap(),
+                        Some(("pmin", x)) => pmin = x.parse().unwrap(),
+                        _ => panic!("mcts field is cp=X or pmin=K, got {f}"),
+                    }
+                }
+                Kind::Search(sims, cp, pmin)
+            }
+            _ => panic!("--agent is greedy:full, greedy:K, mcts:N, mcts:N:cp=X[:pmin=K]"),
         };
         let games: u64 = get("--games").and_then(|v| v.parse().ok()).unwrap_or(400);
         let blocks = games.div_ceil(N_PLAYERS as u64);
@@ -2700,7 +3021,11 @@ fn main() {
         let out = PathBuf::from(get("--out").unwrap_or_else(|| {
             format!("evalab-{}-{}.jsonl", cand.replace(['=', ','], "_"), spec.replace(':', ""))
         }));
-        let label: &'static str = Box::leak(spec.into_boxed_str());
-        cmd_ab(&cand, &base, kind, blocks, seed0, out, has("--resume"), label);
+        if has("--uptake") {
+            cmd_uptake(&cand, &base, kind, blocks, seed0, out);
+        } else {
+            let label: &'static str = Box::leak(spec.into_boxed_str());
+            cmd_ab(&cand, &base, kind, blocks, seed0, out, has("--resume"), label);
+        }
     }
 }
