@@ -154,13 +154,28 @@ class Buffer:
     loader to understand generations.
     """
 
-    def __init__(self, shards: list[np.ndarray], schema: dict, paths: list[str]):
+    def __init__(
+        self,
+        shards: list[np.ndarray],
+        schema: dict,
+        paths: list[str],
+        holdout: float = 0.0,
+    ):
         self.shards = shards
         self.schema = schema
         self.paths = paths
         self.sizes = np.array([len(s) for s in shards], dtype=np.int64)
         self.offsets = np.concatenate([[0], np.cumsum(self.sizes)])
         self.n = int(self.offsets[-1])
+        # Records are written a whole game at a time, so a contiguous tail is a
+        # set of *whole games* the optimiser never sees. That is what makes an
+        # offline value-fit number ("is this net a better predictor than
+        # `eval::heuristic`?") mean anything: sample from the head, probe on the
+        # tail. `valprobe --from` walks the same tail on the Rust side.
+        self.holdout = float(holdout)
+        self.n_train = int(self.n * (1.0 - self.holdout))
+        if self.n_train <= 0:
+            raise ValueError(f"holdout {holdout} leaves no training records")
 
     @classmethod
     def open(
@@ -169,6 +184,7 @@ class Buffer:
         max_records: int = 1_500_000,
         min_rules_version: int | None = None,
         pattern: str = "*.tzr",
+        holdout: float = 0.0,
     ) -> "Buffer":
         """Open the newest shards in ``directory``, newest first up to the cap.
 
@@ -215,7 +231,7 @@ class Buffer:
                 f"no usable shards in {directory} "
                 f"(looked for {pattern}, rules >= v{min_rules_version})"
             )
-        return cls(shards, schema, kept)
+        return cls(shards, schema, kept, holdout=holdout)
 
     # -- indexing ------------------------------------------------------
 
@@ -233,7 +249,7 @@ class Buffer:
     def sample(self, n: int, rng: np.random.Generator | None = None) -> dict:
         """Uniform sample of ``n`` records, as a dict of decoded arrays."""
         rng = rng or np.random.default_rng()
-        return decode(self.take(rng.integers(0, self.n, size=n)), self.schema)
+        return decode(self.take(rng.integers(0, self.n_train, size=n)), self.schema)
 
     def all(self) -> dict:
         return decode(self.take(np.arange(self.n)), self.schema)
@@ -243,8 +259,13 @@ class Buffer:
         scores = d["final_scores"].astype(np.float64)
         centred = scores - scores.mean(axis=1, keepdims=True)
         pk = d["policy_kind"]
+        held = (
+            f"  ({self.n_train:,} trainable, {self.holdout:.1%} held out)"
+            if self.holdout
+            else ""
+        )
         return (
-            f"{self.n:,} records over {len(self.shards)} shards\n"
+            f"{self.n:,} records over {len(self.shards)} shards{held}\n"
             f"  rules version   : v{self.schema['rules_version']}\n"
             f"  mean score      : {scores.mean():+.1f}  "
             f"(sd {scores.std():.1f}, centred sd {centred.std():.1f})\n"

@@ -171,9 +171,40 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
         source,
+        // `--focus tikal` pins the gear the Board panel describes; with none,
+        // it follows the highlighted move, as the running viewer does.
+        focus: std::env::args()
+            .position(|a| a == "--focus")
+            .and_then(|i| std::env::args().nth(i + 1))
+            .and_then(|v| {
+                tzolkin::ids::Gear::ALL
+                    .into_iter()
+                    .find(|g| g.name().to_lowercase().starts_with(&v.to_lowercase()))
+            }),
         autoplay: false,
         status,
     };
+
+    // `--spaces` prints the label the Board panel derives for every space, with
+    // what it cost to derive. The labels come out of the live generator, so
+    // they are the one part of that panel a dump of a single position cannot
+    // review — a wrong one looks like a plausible sentence.
+    if std::env::args().any(|a| a == "--spaces") {
+        let p = app.game.state.current;
+        for gear in tzolkin::ids::Gear::ALL {
+            for pos in 0..gear.size() {
+                let t = std::time::Instant::now();
+                let s = ui::space_info(&app.game.state, p, gear, tzolkin::ids::Pos(pos));
+                println!("{:<13} {pos:>2}  {:>7.2}ms  {}{}", gear.name(), t.elapsed().as_secs_f64() * 1e3, if s.live { "  " } else { "· " }, s.label);
+                if std::env::args().any(|a| a == "-v") {
+                    for sh in ui::space_shapes(&app.game.state, p, gear, tzolkin::ids::Pos(pos)) {
+                        println!("{:>28}    {sh}", "");
+                    }
+                }
+            }
+        }
+        return;
+    }
 
     let mut term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
     term.draw(|f| ui::draw(f, &app)).unwrap();

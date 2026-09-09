@@ -2579,6 +2579,90 @@ fn a_card_whose_payoff_is_unusable_is_still_buildable() {
     );
 }
 
+/// The other half of the same rule: a mirror the player *can* pay for is still
+/// a privilege, and `RULES-AUDIT.md` A9 settled for this codebase that a
+/// privilege is offered rather than forced -- Uxmal 3, Tikal 2, 4 and 5 were
+/// all fixed on exactly that principle. The rulebook's framing is permissive:
+/// "Pay 1 corn and immediately perform any action on the Palenque, Yaxchilan,
+/// Tikal or Uxmal gear."
+///
+/// Every choice `mirror_choices` returns leads with the one-corn fee -- it
+/// drops the skips its mirrored spaces contribute and prefixes the fee to what
+/// is left -- so `Payoff::Mirror` offered no way to construct building #30 and
+/// leave the mirror alone. Constructing the card forced the corn *and* forced
+/// an action, and the mirror reaches `UnlockWorker`: A9's unwanted Uxmal 3
+/// worker, arriving through a card instead of a space.
+///
+/// The mirror's other caller, Uxmal 5, was never exposed to this and is not
+/// changed: `choices_for_worker` prepends the skip there, as it does for every
+/// space -- Uxmal 1, 2 and 4 and Tikal 2 and 5 carry no skip in their own lists
+/// either. `doing_nothing_is_always_an_option` is what holds that.
+///
+/// Asserted at the layer that generates the options, because the shipped
+/// generator's pruning then hides the fix: Palenque 1 is a plain,
+/// inexhaustible corn space, so the mirror always offers "-1 corn, +3 corn" --
+/// pure wealth, nothing structural -- which dominates declining on every axis
+/// and `dominated_dedup` takes it straight back out. Sound, and the reason this
+/// is a contract fix rather than a play-strength one.
+#[test]
+fn a_mirror_the_player_can_afford_may_still_be_declined() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.buildings_up = [None; tzolkin::state::N_DISPLAY];
+    g.state.buildings_up[0] = Some(BuildingId(30)); // 2w 1s 1g, the mirror + 2 VP
+    g.state.research[p.idx()] = [0; 4];
+    g.state.players[p.idx()].res = [4, 4, 4, 0];
+    g.state.players[p.idx()].corn = 5; // enough to pay the mirror several times over
+
+    let ways: Vec<_> = tzolkin::options::building_choices(&g.state, p, None, true, 1)
+        .into_iter()
+        .filter(|c| c.0.contains(&Effect::Build(BuildingId(30))))
+        .collect();
+    assert!(ways.len() > 1, "a solvent player has the mirror to spend on");
+
+    // Declining spends no corn at all: the mirror's fee is the only `Corn` a
+    // #30 construction can carry here, since the card is paid for in blocks.
+    let declined: Vec<_> = ways
+        .iter()
+        .filter(|c| !c.0.iter().any(|e| matches!(e, Effect::Corn(_))))
+        .collect();
+    assert_eq!(
+        declined.len(),
+        1,
+        "exactly one way to construct #30 and leave the mirror unused, got {} of {}; \
+         e.g. [{}], which is A9's unwanted worker arriving through a card",
+        declined.len(),
+        ways.len(),
+        ways
+            .iter()
+            .find(|c| c.0.contains(&Effect::UnlockWorker))
+            .map_or_else(|| "-".to_string(), |c| c.to_string())
+    );
+    assert!(
+        declined[0].0.contains(&Effect::Points(2)),
+        "declining the mirror still takes the card's two points"
+    );
+
+    // The premise the fix rests on: every choice the mirror itself returns
+    // leads with the fee, so the decline cannot come from inside it and cannot
+    // collide with the bare tail either.
+    let mirror = tzolkin::spaces::uxmal::mirror_choices(&g.state, p, 1);
+    assert!(!mirror.is_empty(), "a solvent player's mirror is not empty");
+    assert!(
+        mirror.iter().all(|c| c.0.first() == Some(&Effect::Corn(-1))),
+        "every mirrored action leads with the one-corn fee"
+    );
+
+    // Uxmal 5, the mirror's other caller, is unchanged and covered from
+    // outside -- the same skip every other space relies on.
+    assert!(
+        tzolkin::moves::choices_for_worker(&g.state, p, Gear::Uxmal, Pos(5))
+            .iter()
+            .any(|c| c.is_skip()),
+        "Uxmal 5 offers no way to decline the mirror"
+    );
+}
+
 /// Tikal action 4, rulebook p.9: "If you construct two buildings, you can apply
 /// your architecture technologies to either the first or the second, but one of
 /// them must be built without architecture technologies. **If the first
@@ -3187,6 +3271,77 @@ fn evaluator_scales_the_board_table_by_gear() {
         (1.2..1.7).contains(&ratio),
         "chichen/tikal at the top should be about 1.41 after the re-price and \
          2.02 before it, got {ratio}"
+    );
+}
+
+/// What a **whole research row** is worth to the evaluator, pinned.
+///
+/// `engine_value` prices research at `research_step_value(s, l) * uses *
+/// RESEARCH_SCALE`, and the constant is 0.05 because a full sweep says so on
+/// three agents at three depths: `greedy:64` at 800 blocks reads
+/// +0.06 / +0.01 / −0.22 * / −0.85 * / −4.28 * at 0.0 / 0.15 / 0.25 / 0.50 /
+/// 1.00, and `mcts:1024:cp=0.05` at 250 reads +0.28 / −0.04 / −0.11 / −0.43 /
+/// −1.01 *. Not one cell above zero.
+///
+/// The number this test pins is the thing those sweeps actually varied: **all
+/// twelve levels, at the start of the game, are worth about 2.6 points**, which
+/// is a fifth of `temple_outlook`'s mean and about 8% of a 33-point estimate.
+/// It is here because four different things can move it silently — the twelve
+/// entries of `research_step_value`, `RESEARCH_SCALE`, the `uses` horizon, and
+/// the `lvl == 2` bonus — and because the *reason* the champion takes 1.3
+/// levels of twelve in a game is this number, so anyone who changes it is
+/// changing a measured result and should re-measure.
+/// `docs/FINDINGS-eval.md` F52, F53, F54, F57.
+#[test]
+fn evaluator_prices_a_whole_research_row_at_about_two_and_a_half_points() {
+    use tzolkin::eval::components;
+
+    let p = PlayerId(0);
+    let engine_with = |row: [u8; 4], day: u8| {
+        let mut g = fresh();
+        g.state.day = day;
+        g.state.research[p.idx()] = row;
+        components(&g.state, p).engine
+    };
+
+    let empty = engine_with([0, 0, 0, 0], 0);
+    let full = engine_with([3, 3, 3, 3], 0);
+    let whole_row = full - empty;
+    assert!(
+        (2.0..3.5).contains(&whole_row),
+        "twelve research levels on day 0 are worth {whole_row}, not ~2.6 -- \
+         `RESEARCH_SCALE`, `research_step_value`, `uses` or the `lvl == 2` \
+         bonus has moved, and the sweep behind 0.05 (F54, F57) no longer \
+         applies to this evaluator"
+    );
+
+    // `uses = (rounds_left / 3).min(7)`: the cap binds while `rounds_left >= 21`
+    // — day 0 through day 6 — so an early level is worth the same on either.
+    // Every alternative shape measured inert on `greedy:64` at 800 blocks: the
+    // early tilt and its exact opposite both read 0.00 +/- 0.09 (F55). The cap
+    // is not a bug and it is not free to remove, so it is asserted rather than
+    // left to be rediscovered.
+    assert_eq!(
+        engine_with([3, 3, 3, 3], 0),
+        engine_with([3, 3, 3, 3], 6),
+        "the `uses` cap should hold research flat over days 0..=6"
+    );
+    let (d6, d12, d18) = (
+        engine_with([3, 3, 3, 3], 6) - engine_with([0, 0, 0, 0], 6),
+        engine_with([3, 3, 3, 3], 12) - engine_with([0, 0, 0, 0], 12),
+        engine_with([3, 3, 3, 3], 18) - engine_with([0, 0, 0, 0], 18),
+    );
+    assert!(
+        d6 > d12 && d12 > d18 && d18 > 0.0,
+        "research must be worth strictly less the later it is taken: \
+         day 6 {d6}, day 12 {d12}, day 18 {d18}"
+    );
+    // Linear after the cap, which is what `uses` says and what every convex
+    // alternative failed to beat: the day 6 -> 12 and 12 -> 18 drops are equal.
+    let (a, b) = (d6 - d12, d12 - d18);
+    assert!(
+        (a - b).abs() < 0.05,
+        "the decline should be linear in `rounds_left`: {a} then {b}"
     );
 }
 

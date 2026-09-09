@@ -215,18 +215,52 @@ const BUILDING_VALUE: f32 = 0.45;
 ///
 /// The other half of the over-priced `engine_value` that [`ACTION_VALUE`] found
 /// in its worker half: at 0.5 a maxed track was several points of pure
-/// forecast. Located by `evalab --promise`, which measures what the estimate
-/// actually *moves by* when a standing worker's action is taken — the first
-/// research space is the widest disagreement on the board, priced at 2.00 by
-/// `space_value` and delivering 0.60. Sweeping the side that is not the space
-/// table settles which of the two is wrong: 0.0, 0.10 and 0.15 are a plateau at
-/// +1.6 greedy:64, 0.35 is +0.96 and 0.75 is −3.40, so it is this one.
+/// forecast. `evalab --promise` *nominated* the term — the first research space
+/// is priced at 2.00 by `space_value` and the evaluator's own accounting for
+/// what it hands over was 0.60 — and an arena sweep of the side that is not the
+/// space table decided it: 0.0, 0.10 and 0.15 were a plateau at +1.6
+/// `greedy:64`, 0.35 was +0.96 and 0.75 was −3.40.
 ///
-/// Worth **+1.11 mcts:256 [+0.75, +1.47]** on its own at 400 blocks, and it
-/// adds to the [`CORN_INCOME_PER_ROUND`] change rather than overlapping it
-/// (+1.73 and +1.11 alone, +2.25 together). Kept just off zero so the search
-/// still has a reason to finish a track; the data cannot tell 0.0 from 0.15.
-/// `docs/FINDINGS-eval.md` F19b, F20, F23.
+/// **Read `--promise` on this term with care; it cannot arbitrate here.** Its
+/// `delivery` column is the evaluator's own estimate, so for a term the
+/// evaluator underprices it reports "the space is overpriced" and "the term is
+/// underpriced" identically. Measured: hold the corpus fixed and vary only this
+/// constant, and Tikal 1's promise stays at 3.105 while its delivery goes
+/// 0.014 → 0.301 → 1.330 at `rs` = 0.05 → 0.5 → 1.0, its `dead` fraction
+/// falling 0.99 → 0.23. F26a's "the widest disagreement on the board" is this
+/// constant read back to itself. The arena sweep is the evidence; the
+/// diagnostic is only the finger.
+///
+/// # Re-measured end to end, because the champion never researches
+///
+/// It does not, and that is correct play as far as anything can measure.
+/// A full curve, `--base head` so 0.05 is the null:
+///
+/// | `rs` | 0.0 | 0.15 | 0.25 | 0.35 | 0.50 | 0.75 | 1.00 |
+/// |---|---|---|---|---|---|---|---|
+/// | `greedy:64` (800 blk) | +0.06 | +0.01 | −0.22 * | −0.41 * | −0.85 * | −2.00 * | **−4.28 \*** |
+/// | `mcts:1024:cp=0.05` (250) | +0.28 | −0.04 | −0.11 | −0.10 | −0.43 | −1.33 * | **−1.01 \*** |
+///
+/// **No cell on either agent is distinguishably positive**, and 0.05 is
+/// interior to the plateau on both. 0.0 is not distinguishable from it and is
+/// not taken, because deleting the term is the only way to make a research
+/// track worth literally nothing to the search.
+///
+/// **This is not a blind spot, it is a decision.** `evalab --uptake` counts
+/// final research levels rather than score: the champion's evaluator reaches
+/// **1.24 levels of twelve** in a game and maxes a track in 1.9% of
+/// player-games, and turning this constant up to 1.0 takes it to **3.31 levels**
+/// with 81% of the extra in place by day 14 — early research, exactly the kind
+/// the compounding argument wants — for **−4.33** points. The evaluator can see
+/// research, will chase it when told to, and comes back with a worse score.
+///
+/// **Depth is a substitute for getting this right, not a magnifier of it.** At
+/// `rs = 1.0` one ply loses 4.28 and the six-turn search loses 1.01, and left
+/// alone the deep search takes 1.32 levels against one ply's 1.24. A search
+/// that plays the line out can decline the investment the evaluator is
+/// recommending.
+///
+/// `docs/FINDINGS-eval.md` F19b, F20, F23, and F51-F57 for everything above.
 const RESEARCH_SCALE: f32 = 0.05;
 
 /// Fraction of a face-up monument's score credited to the player closest to
@@ -562,6 +596,18 @@ fn engine_value(g: &GameState, p: PlayerId, rounds_left: f32, horizon: f32) -> f
 
     // Research. Each level is valued at what it actually pays, scaled by how
     // many actions remain to use it on.
+    //
+    // The cap binds while `rounds_left >= 21`, so days 0..=6 are priced alike
+    // and the term is linear in `rounds_left` after that. That looks like the
+    // wrong shape for a quantity that compounds, and it was measured: a knob
+    // that bends the interior of this curve while holding its value at a
+    // full-length game fixed reads **+0.00 [−0.09, +0.09]** tilted toward the
+    // early game and **−0.00 [−0.09, +0.09]** tilted the other way, 800 blocks
+    // each on `greedy:64`. Treatment and anti-control land on top of each
+    // other. Removing the cap is −0.05, and every larger tilt is worse than the
+    // flat curve of the same magnitude (−0.34 against −0.22). What decides
+    // these cells is the area under the curve, not its slope.
+    // `docs/FINDINGS-eval.md` F55.
     let uses = (rounds_left / 3.0).min(7.0);
     for s in Science::ALL {
         let lvl = g.level(p, s);
@@ -570,6 +616,14 @@ fn engine_value(g: &GameState, p: PlayerId, rounds_left: f32, horizon: f32) -> f
         }
         // Monument #11 pays 9/20/33 for maxed tracks and #12 pays 3 a level, so
         // a track one short of the top is worth finishing.
+        //
+        // Both this and the convexity it stands in for are inert, and the
+        // reason is the same: **a track reaches level 3 in 1.9% of
+        // player-games**. A term keyed on `maxed >= 1` (`rtop`, priced as
+        // `k · maxed² · horizon`) reads +0.01 [+0.00, +0.02] at 800 blocks —
+        // distinguishable from zero and worth a hundredth of a point. The
+        // convexity monument #11 pays for is real and the evaluator never gets
+        // near it. `docs/FINDINGS-eval.md` F52b, F55.
         if lvl == 2 && horizon > 0.15 {
             v += 0.4;
         }
@@ -900,6 +954,14 @@ fn monument_outlook(g: &GameState, p: PlayerId, horizon: f32) -> f32 {
         if pays <= 0.0 {
             continue;
         }
+        // NOTE: this gate makes monuments #11 and #12 — the two that pay for
+        // research — invisible to a player with an empty research row, who is
+        // exactly the player who would have to start a track to reach them.
+        // Paying that option explicitly (`k` per face-up research monument per
+        // level held, faded by `horizon`) was measured and **loses**: −0.13 *
+        // at k = 0.4 and −0.43 * at 0.8, 800 blocks each on `greedy:64`, while
+        // raising final research levels by +0.23. The option is real; taking it
+        // is not worth the corn. `docs/FINDINGS-eval.md` F55.
         // Full value when it is already affordable, falling away with distance.
         best = best.max(pays * MONUMENT_SHARE / (1.0 + short as f32));
     }

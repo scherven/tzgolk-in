@@ -307,8 +307,9 @@ if __name__ == "__main__":
     b = Buffer.open(sys.argv[1] if len(sys.argv) > 1 else "replay")
     batch = b.sample(256, np.random.default_rng(0))
     x, t = batch_arrays(batch, b.schema, augment=True)
-    print(f"D_IN {D_IN}   x {x.shape} {x.dtype}   finite {np.isfinite(x).all()}")
-    print(f"  live columns : {(x != 0).any(axis=0).sum()} / {D_IN}")
+    w = d_in()
+    print(f"D_IN {w}   x {x.shape} {x.dtype}   finite {np.isfinite(x).all()}")
+    print(f"  live columns : {(x != 0).any(axis=0).sum()} / {w}")
     print(f"  range        : {x.min():.3f} .. {x.max():.3f}")
     for k, v in t.items():
         print(f"  {k:<16} {getattr(v, 'shape', type(v).__name__)}")

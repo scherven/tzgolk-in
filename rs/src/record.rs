@@ -1247,6 +1247,36 @@ pub struct NetBatch {
     /// that this file does not depend on whether `net.rs` currently offers a
     /// `name()`, an `impl Evaluator for Net`, or neither.
     pub label: String,
+    /// Mix `eval::heuristic` back into the leaf value:
+    /// `v = (1 - blend) * net + blend * heuristic`.
+    ///
+    /// `LEARNING.md` §7.5 asks for exactly this shape while the value head is
+    /// weak, with a truncated playout on the other side; `eval::heuristic` is
+    /// the cheaper and, on this project, much stronger stand-in for the
+    /// playout. The two endpoints of the sweep are the two arms of the headline
+    /// race — `blend = 0` is the net alone, `blend = 1` reproduces
+    /// `HeuristicEvaluator`'s value exactly — so one knob spans the comparison
+    /// and any interior optimum is a real complementarity rather than a
+    /// re-scaling. Spelled `PATH.safetensors@0.5` in an agent spec; 0 by
+    /// default, so nothing that does not ask for it changes.
+    pub blend: f32,
+}
+
+impl NetBatch {
+    /// `(1 - blend) * v + blend * heuristic(state)`, in place. A no-op at
+    /// `blend == 0`, which is the default, so the fast path pays one compare.
+    fn mix(&self, qs: &[EvalRequest], out: &mut [Evaluation]) {
+        if self.blend <= 0.0 {
+            return;
+        }
+        let (a, b) = (1.0 - self.blend, self.blend);
+        for (e, q) in out.iter_mut().zip(qs) {
+            let h = HeuristicEvaluator.evaluate(&q.state, q.phase, q.turn, 0);
+            for i in 0..N_PLAYERS {
+                e.value[i] = a * e.value[i] + b * h.value[i];
+            }
+        }
+    }
 }
 
 impl BatchEvaluator for NetBatch {
@@ -1256,6 +1286,7 @@ impl BatchEvaluator for NetBatch {
             .map(|q| crate::net::Query::new(&q.state, q.phase, q.turn, q.n_edges))
             .collect();
         self.net.evaluate_batch(&queries, out);
+        self.mix(qs, out);
     }
     fn name(&self) -> String {
         self.label.clone()
@@ -1280,10 +1311,18 @@ impl Evaluator for NetBatch {
             &[crate::net::Query::new(state, phase, turn, n_edges)],
             &mut out,
         );
-        out.pop().unwrap_or(Evaluation {
+        let mut e = out.pop().unwrap_or(Evaluation {
             priors: Vec::new(),
             value: [0.0; N_PLAYERS],
-        })
+        });
+        if self.blend > 0.0 {
+            let h = HeuristicEvaluator.evaluate(state, phase, turn, 0);
+            let (a, b) = (1.0 - self.blend, self.blend);
+            for i in 0..N_PLAYERS {
+                e.value[i] = a * e.value[i] + b * h.value[i];
+            }
+        }
+        e
     }
     fn name(&self) -> String {
         self.label.clone()
@@ -3111,10 +3150,30 @@ fn parse_mcts_flags(flags: &str) -> Result<MctsConfig, String> {
 }
 
 fn parse_backend(spec: &str) -> Result<Backend, String> {
+    // `PATH.safetensors@0.35` mixes `eval::heuristic` into the leaf value at
+    // that weight; see `NetBatch::blend`. Split on the last `@` so a directory
+    // containing one still parses.
+    let (spec, blend) = match spec.rsplit_once('@') {
+        Some((p, l)) if !l.is_empty() && l.chars().all(|c| c.is_ascii_digit() || c == '.') => {
+            let l: f32 = l
+                .parse()
+                .map_err(|_| format!("evaluator @BLEND needs a number, got {l:?}"))?;
+            if !(0.0..=1.0).contains(&l) {
+                return Err(format!("evaluator @BLEND must be in 0..=1, got {l}"));
+            }
+            (p, l)
+        }
+        _ => (spec, 0.0),
+    };
     let wrap = |net: crate::net::Net| {
         Backend::Net(Arc::new(NetBatch {
             net,
-            label: spec.to_string(),
+            label: if blend > 0.0 {
+                format!("{spec}@{blend}")
+            } else {
+                spec.to_string()
+            },
+            blend,
         }))
     };
     match spec {

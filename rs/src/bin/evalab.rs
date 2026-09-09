@@ -2709,9 +2709,13 @@ fn cmd_uptake(cand: &str, base: &str, kind: Kind, blocks: u64, seed0: u64, out: 
         .unwrap_or_default()
         .lines()
         .filter_map(|l| {
-            l.split("\"seed\":")
-                .nth(1)
-                .and_then(|t| t.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok())
+            // `trim_matches` strips from *both* ends, so the naive version kept
+            // everything from the seed to the last digit of the last field and
+            // parsed nothing — `--uptake` silently replayed every seed on
+            // restart, at 85% wasted CPU. Take digits from the front instead.
+            let t = l.split("\"seed\":").nth(1)?;
+            let d: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+            d.parse().ok()
         })
         .collect();
     let f = Arc::new(Mutex::new(

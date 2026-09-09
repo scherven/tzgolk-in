@@ -158,6 +158,10 @@ def main():
     # 8 M x 512 B is 4.1 GB, memory-mapped rather than resident.
     ap.add_argument("--window", type=int, default=8_000_000, help="max records in the buffer")
     ap.add_argument("--size", choices=["small", "main"], default="small")
+    # A contiguous tail of whole games the optimiser never draws from, so
+    # `valprobe --from` measures generalisation rather than memorisation.
+    ap.add_argument("--holdout", type=float, default=0.02,
+                    help="fraction of the newest records reserved for evaluation")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--lr", type=float, default=None, help="override the §6.6 schedule")
     ap.add_argument("--weight-decay", type=float, default=1e-4)
@@ -183,7 +187,7 @@ def main():
         )
     dev = torch.device(args.device)
 
-    buf = Buffer.open(args.replay, max_records=args.window)
+    buf = Buffer.open(args.replay, max_records=args.window, holdout=args.holdout)
     print(buf.summary())
     print()
 

@@ -7,7 +7,7 @@
 use crate::data::buildings::def as bdef;
 use crate::data::monuments::def as mdef;
 use crate::data::temples::TEMPLES;
-use crate::effect::Choice;
+use crate::effect::{Choice, Effect};
 use crate::ids::*;
 use crate::moves::{Move, MoveKind};
 use crate::state::{GameState, WorkerLoc};
@@ -196,6 +196,10 @@ pub struct App {
     pub ranking: crate::eval::Ranking,
     pub selected: usize,
     pub source: MoveSource,
+    /// The gear the Board panel describes, pinned by `g`. `None` follows the
+    /// highlighted move, which is what makes stepping down the shortlist show
+    /// what each candidate's target space actually does.
+    pub focus: Option<Gear>,
     pub autoplay: bool,
     pub status: String,
 }
@@ -222,6 +226,14 @@ impl App {
         let rows = self.rows();
         let i = rows.get(self.selected)?.pick;
         self.ranking.moves.get(i).map(|(m, _)| m)
+    }
+
+    /// Cycle the pinned gear, ending back on "follow the highlighted move".
+    pub fn step_focus(&mut self) {
+        self.focus = match self.focus {
+            None => Some(Gear::ALL[0]),
+            Some(g) => Gear::ALL.get(g.idx() + 1).copied(),
+        };
     }
 
     pub fn unit(&self) -> ScoreUnit {
@@ -390,19 +402,39 @@ pub fn draw(f: &mut Frame, app: &App) {
     // it per panel spent that twice per frame, on the draw loop, at the exact
     // moment the other thread is saturating a core with the search.
     let rows = app.rows();
+    // Both computed once and threaded down. `Marks` needs the highlighted move,
+    // which costs a fold and a lookup, and three panels want it: the rings, the
+    // first player space in the header, and the Why pane.
+    let sel = rows
+        .get(app.selected)
+        .and_then(|r| app.ranking.moves.get(r.pick))
+        .map(|(m, _)| m);
+    let marks = Marks::of(&app.game.state, sel);
+    let focus = app.focus.or_else(|| marks.gear()).unwrap_or(Gear::Palenque);
 
-    header(f, root[0], app);
+    header(f, root[0], app, &marks);
 
     let body = Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)])
         .split(root[1]);
 
+    // Allocated explicitly, for the same reason the right column is: three
+    // fixed lengths let the solver starve whichever panel had the weakest
+    // constraint. The Board comes first because it is the board — but the rings
+    // need five interior rows, and there is no half a ring, so below fourteen
+    // it keeps the flat rows and the two panels under it keep their height.
+    let lh = body[0].height;
+    let bh = if lh >= 14 { (lh * 4 / 9).clamp(9, 13).min(lh) } else { 7.min(lh) };
+    let rest = lh - bh;
+    // Players is a five-row table plus its border and never wants more; the
+    // remainder falls through to Cards.
+    let ph = if rest >= 12 { 8 } else { (rest * 2 / 3).clamp(4, 8).min(rest) };
     let left = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Min(5),
+        Constraint::Length(bh),
+        Constraint::Length(ph),
+        Constraint::Min(0),
     ])
     .split(body[0]);
-    gears(f, left[0], app);
+    board(f, left[0], app, &marks, focus);
     players(f, left[1], app);
     cards(f, left[2], app);
 
@@ -429,7 +461,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     moves(f, right[2], app, &rows);
 
     units(f, root[2], app);
-    preview(f, root[3], app, &rows);
+    preview(f, root[3], app, &rows, &marks);
     help(f, root[4], app);
 }
 
@@ -443,9 +475,455 @@ fn boxed(title: &str) -> Block<'_> {
         ))
 }
 
+// ---- what a space does --------------------------------------------------
+
+/// What one board space is for, as the Board panel prints it.
+pub struct SpaceInfo {
+    /// A short phrase: `+4 corn, +corn tile`, `build`, `-1 blk, +2 temple`.
+    pub label: String,
+    /// Whether the space offers *this* player something right now. False for a
+    /// Chichen space with no skull in hand, for a Palenque space whose tiles
+    /// are gone, and for Tikal 2 with nothing affordable face up.
+    pub live: bool,
+}
+
+/// What `gear:pos` offers `p` **in the position on screen**.
+///
+/// Read out of [`crate::spaces::choices_at`] — the generator the rules actually
+/// run — and never out of a table of descriptions. A table would be a second
+/// copy of the rulebook that nothing tests, and it would already be wrong: the
+/// Palenque jungle pays `corn_yield + corn_bonus`, Yaxchilan 4 pays two skulls
+/// to a theologian and nothing at all once the bank is empty, and Uxmal 4's
+/// price drops by two for a builder. All of that is resolved into the `Choice`
+/// before this sees it, so the label moves with the board.
+pub fn space_info(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> SpaceInfo {
+    // The free-choice spaces repeat every action below them, so asked directly
+    // they generate the union of the whole gear — on Uxmal that is the widest
+    // list generation builds, the mirror included. The predicate the spaces
+    // module exports is read instead of the list it stands for.
+    if crate::spaces::is_free_choice(gear, pos) {
+        let first = (0..gear.size())
+            .find(|&i| crate::spaces::is_free_choice(gear, Pos(i)))
+            .unwrap_or(0);
+        return SpaceInfo {
+            label: format!("any of 0-{}", first.saturating_sub(1)),
+            live: true,
+        };
+    }
+
+    let cs = crate::spaces::choices_at(g, p, gear, pos);
+    let live = cs.iter().any(|c| !c.is_skip());
+    // `spaces::entry_space` gives space 0 a lone `skip` on every gear: it is
+    // where a worker lands, not something it does. Chichen's is the exception —
+    // foresight lets a player act one space up from it — and that arrives here
+    // as a non-skip choice rather than as a rule written out a second time.
+    if pos.0 == 0 {
+        let label = if live { format!("enter / {}", summarise(&cs)) } else { "enter".into() };
+        return SpaceInfo { label, live: true };
+    }
+    if live {
+        return SpaceInfo { label: summarise(&cs), live };
+    }
+
+    // The generator answers "what may this player do here", so a space the
+    // player cannot pay for answers *nothing* — and the reader is then told
+    // less about Chichen the moment they run out of skulls, which is exactly
+    // when they want to know what a skull buys. Asked again with the stock
+    // topped up, the same generator says what the space is for. Research,
+    // temples and the tile stacks are left alone, so the yields printed are
+    // still this board's and this player's, not a generic one's.
+    let mut probe = *g;
+    let pl = &mut probe.players[p.idx()];
+    pl.corn = pl.corn.max(20);
+    for r in [Resource::Wood, Resource::Stone, Resource::Gold, Resource::Skull] {
+        let slot = &mut pl.res[r.idx()];
+        *slot = (*slot).max(3);
+    }
+    let label = summarise(&crate::spaces::choices_at(&probe, p, gear, pos));
+    SpaceInfo { label, live }
+}
+
+/// How much of a `Choice` a token keeps. The grain is raised only when the
+/// finer list was too long to print, so a space with one thing to say still
+/// says it exactly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grain {
+    /// Every value and identity as generated: `A+1`, `+1W`, `B+1`, `+5 corn`.
+    Exact,
+    /// Blocks and science tracks lose their identity, so the payments merge.
+    /// Tikal 1 offers four spellings of one action and every split of its
+    /// price; this is what makes them one line.
+    Kind,
+    /// Temples lose theirs too, and the amounts go. Tikal 5's three unordered
+    /// temple pairs are one action — "pay a block, climb two temples" — and
+    /// only this grain can say so.
+    Sign,
+}
+
+/// Room a label is allowed before the summary is retried a grain coarser.
+///
+/// The focused gear's spaces are printed as one flowing paragraph in a panel
+/// about seventy columns wide, so a label much past this costs a whole line and
+/// pushes another space off the bottom.
+const LABEL_ROOM: usize = 32;
+
+/// One merged term of a choice: a rank (what is gained, what moves, what it
+/// costs), a unit the merge groups on, and a signed amount where it has one.
+#[derive(Clone, PartialEq)]
+struct Part {
+    rank: u8,
+    key: String,
+    /// `None` for a verb — `build`, `unlock worker` — which merges by counting.
+    n: Option<i32>,
+    /// Whether the amount is printed. Off at [`Grain::Sign`], where the amount
+    /// is the thing that differed between the spellings being merged.
+    mag: bool,
+    count: usize,
+}
+
+impl Part {
+    fn render(&self) -> String {
+        match self.n {
+            Some(v) if self.mag => format!("{v:+}{}", self.key),
+            Some(v) => format!("{}{}", if v < 0 { '-' } else { '+' }, self.key.trim_start()),
+            None if self.count > 1 => format!("{} ×{}", self.key, self.count),
+            None => self.key.clone(),
+        }
+    }
+}
+
+fn render(parts: &[Part]) -> String {
+    parts.iter().map(Part::render).collect::<Vec<_>>().join(", ")
+}
+
+fn summarise(cs: &[Choice]) -> String {
+    if cs.is_empty() || cs.iter().all(|c| c.is_skip()) {
+        return "—".into();
+    }
+
+    // One or two spellings, printed as they were generated. Every label that
+    // names a temple, a science track or an exact yield comes out of this arm.
+    for grain in [Grain::Exact, Grain::Kind, Grain::Sign] {
+        let sh = shapes(cs, grain);
+        if let Some(s) = merged_pair(&sh) {
+            if s.chars().count() <= LABEL_ROOM {
+                return s;
+            }
+        }
+        let joined: Vec<String> = sh.iter().map(|p| render(p)).collect();
+        let joined = joined.join(" / ");
+        if sh.len() <= 2 && joined.chars().count() <= LABEL_ROOM {
+            return joined;
+        }
+    }
+
+    // Too many spellings: fall back to what they agree on, finest grain first
+    // so that an identity they *do* share survives. Chichen 1 offers a devout
+    // player a second temple step for a block, which is a dozen spellings of
+    // one action, and this is what keeps `+1B, +4pt` on the label instead of a
+    // generic "climb a temple".
+    for grain in [Grain::Exact, Grain::Kind, Grain::Sign] {
+        let common = intersect_all(cs, grain);
+        // A label that is only a *price* says nothing about the space. The
+        // Uxmal mirror's spellings share their one-corn fee and nothing else,
+        // and `-1 corn` is not what that space is for.
+        if !common.is_empty() && common.iter().any(|p| p.rank < 2) {
+            let s = render(&common);
+            if s.chars().count() <= LABEL_ROOM {
+                return s;
+            }
+        }
+    }
+    verbs(cs)
+}
+
+/// The last resort: name the actions rather than their terms.
+fn verbs(cs: &[Choice]) -> String {
+    let sh = shapes(cs, Grain::Sign);
+
+    let mut out: Vec<String> = Vec::new();
+    for s in &sh {
+        let Some(v) = s.first().map(Part::render) else {
+            continue;
+        };
+        // `build` and `build ×2` are one verb at two multiplicities, and the
+        // larger implies the smaller, so only the larger is printed.
+        if out.iter().any(|u| u.starts_with(&v)) {
+            continue;
+        }
+        out.retain(|u| !v.starts_with(u.as_str()));
+        out.push(v);
+    }
+    if out.len() > 3 {
+        // The Uxmal mirror reaches four gears' worth of actions. Counting them
+        // would be counting a sample (see `shapes`), so it says "many" and
+        // names the fee, which every spelling of it does share.
+        let fee = intersect_all(cs, Grain::Sign);
+        let fee: Vec<String> = fee.iter().filter(|p| p.rank == 2).map(Part::render).collect();
+        return if fee.is_empty() {
+            "many actions".into()
+        } else {
+            format!("many actions, {}", fee.join(", "))
+        };
+    }
+
+    // A unit that is both gained and spent across two or three spellings is a
+    // trade, and naming the two sides beats listing one of them: Uxmal 2 sells
+    // blocks for corn and buys them back with it, so every "verb" there is half
+    // a sentence. Checked only once the list is known to be short — the mirror
+    // also moves corn both ways, and it is not a market.
+    let at = |r: u8| -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        for s in &sh {
+            for p in s.iter().filter(|p| p.rank == r) {
+                let k = p.key.trim().to_string();
+                if !v.contains(&k) {
+                    v.push(k);
+                }
+            }
+        }
+        v
+    };
+    let (up, down) = (at(1), at(2));
+    let both: Vec<String> = up.iter().filter(|k| down.contains(k)).cloned().collect();
+    if both.len() == 2 {
+        return format!("{} ↔ {}", both[0], both[1]);
+    }
+    out.join(" / ")
+}
+
+/// Two spellings that differ in one term's *amount* only, written as a range.
+///
+/// Tikal 3 advances one technology level or two. As two shapes that is
+/// `research+1, -blk / research+1 ×2, -blk` — forty columns to say a number can
+/// be one or two — and as an intersection it is indistinguishable from Tikal 1.
+fn merged_pair(sh: &[Vec<Part>]) -> Option<String> {
+    let [a, b] = sh else { return None };
+    if a.len() != b.len() {
+        return None;
+    }
+    let mut differ = None;
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x.key != y.key || x.rank != y.rank {
+            return None;
+        }
+        // Compared as printed: at `Sign` grain two amounts of one unit render
+        // identically, and calling that a difference produced `pt ×1-1`.
+        if x.render() != y.render() {
+            if differ.is_some() {
+                return None;
+            }
+            differ = Some((x, y));
+        }
+    }
+    let (x, y) = differ?;
+    let out: Vec<String> = a
+        .iter()
+        .map(|p| {
+            if p.key != x.key {
+                return p.render();
+            }
+            match (x.n, y.n) {
+                (Some(m), Some(n)) if x.mag => {
+                    // By magnitude, not by sign: a price of one or two blocks
+                    // is `-1-2 blk`, and ordering the signed values would have
+                    // printed the wider end first.
+                    let (lo, hi) = (m.abs().min(n.abs()), m.abs().max(n.abs()));
+                    format!("{}{lo}-{hi}{}", if m < 0 { "-" } else { "+" }, p.key)
+                }
+                _ => {
+                    let (lo, hi) = (x.count.min(y.count), x.count.max(y.count));
+                    format!("{} ×{lo}-{hi}", p.key)
+                }
+            }
+        })
+        .collect();
+    Some(out.join(", "))
+}
+
+/// Terms every shape carries, at the lowest amount and multiplicity any of them
+/// has.
+///
+/// Compared term by term rather than as text, because `build` and `build ×2`
+/// are the same action twice — Tikal 2 is a single build whose card payoff can
+/// chain a second — and an intersection over strings would have promoted that
+/// minority spelling to the label.
+fn intersect_all(cs: &[Choice], grain: Grain) -> Vec<Part> {
+    let all: Vec<Vec<Part>> = stride(cs).filter(|c| !c.is_skip()).map(|c| shape(c, grain)).collect();
+    intersect(&all)
+}
+
+fn intersect(shapes: &[Vec<Part>]) -> Vec<Part> {
+    let Some(first) = shapes.first() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for p in first {
+        let mut low = p.clone();
+        let mut in_all = true;
+        for s in shapes {
+            match s.iter().find(|q| q.key == p.key && q.rank == p.rank) {
+                Some(q) => {
+                    low.count = low.count.min(q.count);
+                    low.mag = low.mag && q.mag;
+                    low.n = match (low.n, q.n) {
+                        // The smaller magnitude, keeping the sign: two spellings
+                        // that both climb Brown, one of them twice, still climb
+                        // Brown once between them.
+                        (Some(a), Some(b)) if a.abs() <= b.abs() => Some(a),
+                        (Some(_), b) => b,
+                        (a, _) => a,
+                    };
+                }
+                None => {
+                    in_all = false;
+                    break;
+                }
+            }
+        }
+        if in_all {
+            out.push(low);
+        }
+    }
+    out
+}
+
+/// A bounded walk over a choice list.
+///
+/// **A sample when the list is large.** Tikal 4's double build runs to
+/// thousands of choices with the monuments appended last, so a prefix would
+/// have reported a space that cannot take a monument. Striding covers the whole
+/// list at a fixed cost; what it can still miss is a shape occurring once in
+/// hundreds, which is why the label is a label and the Moves panel is the list
+/// of what is actually playable.
+fn stride(cs: &[Choice]) -> impl Iterator<Item = &Choice> {
+    cs.iter().step_by(cs.len().div_ceil(256).max(1))
+}
+
+/// The distinct shapes of a choice list.
+///
+/// Capped, so `summarise` can ask "is this one or two spellings?" cheaply.
+/// Anything that has to be true of *every* spelling goes through
+/// [`intersect_all`] instead, which does not stop at the cap.
+fn shapes(cs: &[Choice], grain: Grain) -> Vec<Vec<Part>> {
+    let mut out: Vec<Vec<Part>> = Vec::new();
+    // Deduplicated on what the shape *prints*, not on its parts. At `Sign`
+    // grain the amount is deliberately not printed, so paying two blocks and
+    // paying three are one spelling on screen — and comparing the parts kept
+    // eleven copies of `research+1 ×2, -blk`, which then read as eleven
+    // spellings and pushed Tikal 3 all the way to the last-resort arm.
+    let mut seen: Vec<String> = Vec::new();
+    for c in stride(cs) {
+        if c.is_skip() {
+            continue;
+        }
+        let s = shape(c, grain);
+        let r = render(&s);
+        if !seen.contains(&r) {
+            seen.push(r);
+            out.push(s);
+        }
+        // Nothing past the twelfth distinct shape can reach the label:
+        // `summarise` prints at most two, and the fallbacks read the whole set
+        // only to intersect it.
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    out
+}
+
+/// Every distinct spelling of a space, as `--spaces -v` prints it. Review only:
+/// a label that reads plausibly and is wrong looks exactly like one that is
+/// right, and this is the list it was derived from.
+pub fn space_shapes(g: &GameState, p: PlayerId, gear: Gear, pos: Pos) -> Vec<String> {
+    let cs = crate::spaces::choices_at(g, p, gear, pos);
+    shapes(&cs, Grain::Exact).iter().map(|s| render(s)).collect()
+}
+
+fn shape(c: &Choice, grain: Grain) -> Vec<Part> {
+    // Merged on (rank, unit), first occurrence keeping the place. Two payments
+    // out of one purse are one price — `pay_blocks` splits a research bill
+    // across wood and stone, and at `Kind` grain those are both blocks — while
+    // a block gained and a block spent keep their own terms, because the ranks
+    // differ by sign.
+    let mut out: Vec<Part> = Vec::new();
+    for e in c.0.iter() {
+        let Some(t) = token(*e, grain) else { continue };
+        match out.iter_mut().find(|p| p.rank == t.rank && p.key == t.key) {
+            Some(p) => {
+                p.count += 1;
+                if let (Some(a), Some(b)) = (p.n, t.n) {
+                    p.n = Some(a + b);
+                }
+            }
+            None => out.push(t),
+        }
+    }
+    // Stable, so effects keep their generated order inside a rank: the jungle's
+    // `+2W` still leads its own `+wood tile`.
+    out.sort_by_key(|p| p.rank);
+    out
+}
+
+fn token(e: Effect, grain: Grain) -> Option<Part> {
+    let coarse = grain != Grain::Exact;
+    let mag = grain != Grain::Sign;
+    let signed = |n: i32, key: &str| Part {
+        rank: if n < 0 { 2 } else { 1 },
+        key: key.to_string(),
+        n: Some(n),
+        mag,
+        count: 1,
+    };
+    let named = |rank: u8, key: &str| Part {
+        rank,
+        key: key.to_string(),
+        n: None,
+        mag: true,
+        count: 1,
+    };
+    Some(match e {
+        Effect::Corn(n) => signed(n as i32, " corn"),
+        Effect::SetCorn(n) => named(1, &format!("corn={n}")),
+        // Skulls never merge into the block bill: they cannot pay for anything
+        // and Chichen is the only place they go.
+        Effect::Res(Resource::Skull, n) => signed(n as i32, " skull"),
+        Effect::Res(r, n) => {
+            signed(n as i32, &if coarse { " blk".into() } else { r.letter().to_string() })
+        }
+        Effect::Points(n) => signed(n as i32, "pt"),
+        Effect::TempleStep(t, d) => Part {
+            rank: if d < 0 { 2 } else { 1 },
+            // At `Sign` grain the amount goes everywhere else, but for temples
+            // the *count of steps* is the action: Tikal 5 climbs two, and both
+            // of its steps merge into this one term.
+            key: if grain == Grain::Sign { " temple".into() } else { t.letter().to_string() },
+            n: Some(d as i32),
+            mag: true,
+            count: 1,
+        },
+        Effect::AdvanceResearch(s) => {
+            named(0, &if coarse { "research+1".into() } else { format!("{}+1", s.letter()) })
+        }
+        Effect::UnlockWorker => named(0, "unlock worker"),
+        Effect::FreeWorker(n) => named(0, &format!("free worker{n:+}")),
+        Effect::WorkerDiscount(n) => named(0, &format!("worker cost{:+}", -n)),
+        Effect::TakePalenqueTile(_, k) => named(
+            1,
+            if k == TileKind::Corn { "+c tile" } else { "+w tile" },
+        ),
+        Effect::BurnPalenqueWood(_) => named(2, "-w tile"),
+        // Bookkeeping: it always names the space the label is already about.
+        Effect::FillChichen(_) => return None,
+        Effect::Build(_) => named(0, "build"),
+        Effect::TakeMonument(_) => named(0, "monument"),
+    })
+}
+
 // ---- panels -------------------------------------------------------------
 
-fn header(f: &mut Frame, area: Rect, app: &App) {
+fn header(f: &mut Frame, area: Rect, app: &App, marks: &Marks) {
     let g = &app.game.state;
     let cur = g.players[g.current.idx()].color;
     let first = g.players[g.first_player.idx()].color;
@@ -468,12 +946,21 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(first.to_string(), Style::default().fg(colour(first))),
         Span::styled("   fp space ", label()),
     ];
-    match g.first_player_space {
-        Some(w) => {
+    // The first player space is a placement like any other, and it is the one
+    // the rings cannot show, so the marker goes here instead.
+    match (g.first_player_space, marks.first) {
+        (_, Some(c)) => spans.push(Span::styled(
+            format!("+{c}"),
+            Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(colour(c))
+                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+        )),
+        (Some(w), None) => {
             let c = g.players[w.owner().idx()].color;
             spans.push(Span::styled(c.to_string(), Style::default().fg(colour(c))));
         }
-        None => spans.push(Span::styled("·", dim())),
+        (None, None) => spans.push(Span::styled("·", dim())),
     }
     spans.push(Span::styled("   pot ", label()));
     spans.push(Span::raw(format!("{} corn", g.accumulated_corn)));
@@ -515,56 +1002,265 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(text).block(boxed("")), area);
 }
 
-fn gears(f: &mut Frame, area: Rect, app: &App) {
-    let g = &app.game.state;
-    let mut lines = Vec::new();
+/// Which board cells the highlighted move touches, and which way.
+///
+/// Built from the `Move` itself rather than from a state diff: a `Placement`
+/// already names its gear and space, and a retrieval names the worker, whose
+/// current `WorkerLoc` says where it is standing. The diff in the preview pane
+/// answers a different question — what the move *changes* — and cannot say
+/// which space a worker was picked up from, because after the move it is not
+/// there.
+#[derive(Default)]
+pub struct Marks {
+    /// Workers this move puts on the board.
+    pub placed: Vec<(Gear, Pos, Color)>,
+    /// Workers it takes off, at the space they are standing on now.
+    pub taken: Vec<(Gear, Pos, Color)>,
+    /// Set when the move claims the first player space.
+    pub first: Option<Color>,
+}
 
-    for gear in Gear::ALL {
-        let mut spans = vec![Span::styled(
-            format!("{:<13}", gear.name()),
-            Style::default().fg(ratatui::style::Color::White),
-        )];
-        for pos in 0..gear.size() {
-            let p = Pos(pos);
-            let last = pos == gear.size() - 1;
-            match g.gears[gear.idx()].at(p) {
-                Some(w) => {
-                    let c = g.players[w.owner().idx()].color;
-                    spans.push(Span::styled(
-                        format!(" {c} "),
-                        Style::default()
-                            .fg(colour(c))
-                            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-                    ));
+impl Marks {
+    pub fn of(g: &GameState, m: Option<&Move>) -> Marks {
+        let mut out = Marks::default();
+        let Some(m) = m else { return out };
+        let who = |w: WorkerId| g.players[w.owner().idx()].color;
+        let mut place = |w: WorkerId, spot: &crate::moves::Placement| match spot {
+            crate::moves::Placement::Gear(gear, pos) => out.placed.push((*gear, *pos, who(w))),
+            crate::moves::Placement::FirstPlayer => out.first = Some(who(w)),
+        };
+        match &m.kind {
+            MoveKind::Place(v) => {
+                for (w, spot) in v {
+                    place(*w, spot);
                 }
-                None => {
-                    // A used-up Chichen space, the mirror space, or a free space.
-                    let (txt, st) = if gear == Gear::Chichen && g.chichen_is_full(p) {
-                        (" x ".to_string(), dim())
-                    } else if last && gear != Gear::Chichen {
-                        (" * ".to_string(), label())
-                    } else {
-                        (format!("{pos:^3}"), dim())
-                    };
-                    spans.push(Span::styled(txt, st));
+            }
+            MoveKind::Pity { worker, spot } => place(*worker, spot),
+            MoveKind::Retrieve(v) => {
+                for (w, _) in v {
+                    if let Some((gear, pos)) = g.loc(*w).on_board() {
+                        out.taken.push((gear, pos, who(*w)));
+                    }
                 }
             }
         }
-        if gear == Gear::Palenque {
-            spans.push(Span::styled("  tiles ", label()));
-            for i in 2..=5usize {
-                let t = g.palenque[i];
-                spans.push(Span::styled(format!("{}/{} ", t.wood, t.corn), dim()));
-            }
-        }
-        lines.push(Line::from(spans));
+        out
     }
-    lines.push(Line::from(vec![Span::styled(
-        "  * = any-action space · x = skull space used · tiles are wood/corn",
-        dim(),
-    )]));
 
-    f.render_widget(Paragraph::new(lines).block(boxed("Gears")), area);
+    fn at(&self, gear: Gear, pos: Pos) -> Option<(bool, Color)> {
+        if let Some(&(_, _, c)) = self.placed.iter().find(|&&(g, p, _)| g == gear && p == pos) {
+            return Some((true, c));
+        }
+        self.taken
+            .iter()
+            .find(|&&(g, p, _)| g == gear && p == pos)
+            .map(|&(_, _, c)| (false, c))
+    }
+
+    /// The gear the move is about, for the panel to describe when nothing is
+    /// pinned. Placements first: a move that both places and retrieves is
+    /// spending its turn on where the new workers go.
+    fn gear(&self) -> Option<Gear> {
+        self.placed.first().or(self.taken.first()).map(|&(g, _, _)| g)
+    }
+}
+
+/// A gear as a ring: the number of rows and columns it occupies, and the slot
+/// each worker space sits in.
+///
+/// Entry at the bottom, travelling clockwise, so a worker's whole ride is one
+/// lap and the space it falls off from sits next to the one it entered on.
+/// Chichen is a wider ring with the bottom-right slot left empty: `Gear::size`
+/// records that the physical gears carry two more holes than spaces, in the
+/// dead arc where the gear meshes with the central calendar, and that is where
+/// the gap belongs.
+fn ring(gear: Gear) -> (usize, usize, &'static [(usize, usize)]) {
+    const SMALL: [(usize, usize); 8] =
+        [(2, 1), (2, 0), (1, 0), (0, 0), (0, 1), (0, 2), (1, 2), (2, 2)];
+    const BIG: [(usize, usize); 11] = [
+        (3, 2), (3, 1), (3, 0), (2, 0), (1, 0), (0, 0), (0, 1), (0, 2), (0, 3), (1, 3), (2, 3),
+    ];
+    match gear {
+        Gear::Chichen => (4, 4, &BIG),
+        _ => (3, 3, &SMALL),
+    }
+}
+
+/// What one worker space shows, and how it is painted.
+///
+/// The two move markers are told apart three ways over, because a terminal may
+/// honour none of them: the glyph (`+` arriving, `-` leaving), the paint
+/// (filled for arriving, outlined and underlined for leaving) and the blink
+/// rate. Only the glyph survives a screen dump, which is the one form of this
+/// panel that gets reviewed.
+fn space_cell(g: &GameState, gear: Gear, pos: Pos, marks: &Marks, cw: usize) -> Span<'static> {
+    let pad = |s: String, st: Style| Span::styled(format!("{s:^cw$}"), st);
+    if let Some((arriving, c)) = marks.at(gear, pos) {
+        let body = if cw >= 3 {
+            format!("{}{c}{}", if arriving { '+' } else { '-' }, if arriving { '+' } else { '-' })
+        } else {
+            format!("{}{c}", if arriving { '+' } else { '-' })
+        };
+        let st = if arriving {
+            Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(colour(c))
+                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK)
+        } else {
+            Style::default()
+                .fg(colour(c))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED | Modifier::RAPID_BLINK)
+        };
+        return pad(body, st);
+    }
+    match g.gears[gear.idx()].at(pos) {
+        Some(w) => {
+            let c = g.players[w.owner().idx()].color;
+            pad(
+                c.to_string(),
+                Style::default().fg(colour(c)).add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            )
+        }
+        // A spent Chichen skull space, a free-choice space, or an empty one.
+        None if gear == Gear::Chichen && g.chichen_is_full(pos) => pad("x".into(), dim()),
+        None if crate::spaces::is_free_choice(gear, pos) => pad("*".into(), label()),
+        None => pad(pos.0.to_string(), dim()),
+    }
+}
+
+/// The board: five gears, what their spaces do, and what the highlighted move
+/// does to them.
+fn board(f: &mut Frame, area: Rect, app: &App, marks: &Marks, focus: Gear) {
+    let g = &app.game.state;
+    let w = area.width.saturating_sub(2) as usize;
+    let h = area.height.saturating_sub(2) as usize;
+
+    // Five rings side by side: four three-wide plus Chichen's four, and a gap
+    // between each. Three columns per space fits `+Y+`; two fits `+Y` and
+    // Chichen's `10`; below that there is no ring and the rows come back.
+    let gaps = 4;
+    let cw = if 16 * 3 + gaps * 2 <= w {
+        3
+    } else if 16 * 2 + gaps <= w {
+        2
+    } else {
+        0
+    };
+    let gap = if cw >= 3 { 2 } else { 1 };
+
+    let mut lines: Vec<Line> = Vec::new();
+    if cw > 0 && h >= 5 {
+        let mut names = Vec::new();
+        let mut grid: Vec<Vec<Span>> = vec![Vec::new(); 4];
+        for gear in Gear::ALL {
+            let (rows, cols, slots) = ring(gear);
+            let width = cols * cw;
+            let on = gear == focus;
+            // Short names below sixty columns: `Yaxchilan` alone is wider than
+            // its two-column ring.
+            let name = if cw >= 3 { gear.name() } else { &gear.name()[..3] };
+            let name = fit(name, width);
+            names.push(Span::styled(
+                format!("{name:^width$}{:gap$}", ""),
+                if on {
+                    Style::default().fg(ratatui::style::Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    label()
+                },
+            ));
+
+            // Bottom-aligned, so every gear's entry space lands on one line and
+            // Chichen's extra row grows upward out of it.
+            let top = 4 - rows;
+            let mut cells: Vec<Vec<Span>> = vec![vec![Span::raw(" ".repeat(cw)); cols]; rows];
+            for (i, &(r, c)) in slots.iter().enumerate() {
+                cells[r][c] = space_cell(g, gear, Pos(i as u8), marks, cw);
+            }
+            // The hub says the ring turns, and which way: a worker rides from
+            // the entry space clockwise and off the far side of it.
+            cells[if rows == 4 { 1 } else { 1 }][1] = Span::styled(format!("{:^cw$}", "↻"), dim());
+            for r in 0..4 {
+                if r < top {
+                    grid[r].push(Span::raw(" ".repeat(width + gap)));
+                    continue;
+                }
+                for c in 0..cols {
+                    grid[r].push(cells[r - top][c].clone());
+                }
+                grid[r].push(Span::raw(" ".repeat(gap)));
+            }
+        }
+        lines.push(Line::from(names));
+        for row in grid {
+            lines.push(Line::from(row));
+        }
+    } else {
+        // No room for rings. The flat rows this panel always drew, which carry
+        // the move markers just the same.
+        for gear in Gear::ALL {
+            let mut spans = vec![Span::styled(
+                format!("{:<13}", gear.name()),
+                if gear == focus {
+                    Style::default().fg(ratatui::style::Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    label()
+                },
+            )];
+            for pos in 0..gear.size() {
+                spans.push(space_cell(g, gear, Pos(pos), marks, 3));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    // One line for the Palenque stacks and the two markers. The stacks are the
+    // one thing the labels cannot say: `choices_at` reports that space 3 still
+    // offers wood, not that it offers it twice more.
+    let tiles: String = (2..=5)
+        .map(|i| {
+            let t = g.palenque[i];
+            format!("{i}:{}w{}c ", t.wood, t.corn)
+        })
+        .collect();
+    let key = format!("+ placed  - taken   Palenque tiles {tiles}");
+    if lines.len() < h {
+        lines.push(Line::from(Span::styled(fit(&key, w), dim())));
+    }
+
+    // The focused gear's spaces, in as many columns as the rows left over
+    // need. Chichen's eleven go three across; a small gear's eight go two.
+    let left = h.saturating_sub(lines.len());
+    if left > 0 {
+        let n = focus.size() as usize;
+        let cols = n.div_ceil(left).max(1);
+        let rows = n.div_ceil(cols);
+        let colw = (w / cols).max(6);
+        let cur = g.current;
+        let cells: Vec<(String, bool)> = (0..n)
+            .map(|i| {
+                let info = space_info(g, cur, focus, Pos(i as u8));
+                (fit(&format!("{i:>2} {}", info.label), colw - 1), info.live)
+            })
+            .collect();
+        for r in 0..rows.min(left) {
+            let mut spans = Vec::new();
+            for c in 0..cols {
+                let Some((text, live)) = cells.get(c * rows + r) else { continue };
+                spans.push(Span::styled(
+                    format!("{text:<w$} ", w = colw - 1),
+                    // Dim where the space offers the player nothing right now —
+                    // no skull for Chichen, no tile left on Palenque. The label
+                    // still says what the space is for; see `space_info`.
+                    if *live { label() } else { dim() },
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    lines.truncate(h);
+    let title = format!("Board — {} (g)", focus.name());
+    f.render_widget(Paragraph::new(lines).block(boxed(&title)), area);
 }
 
 fn temples(f: &mut Frame, area: Rect, app: &App) {
@@ -1010,7 +1706,7 @@ fn units(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Span::styled(text, dim())), area);
 }
 
-fn preview(f: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
+fn preview(f: &mut Frame, area: Rect, app: &App, rows: &[Row], marks: &Marks) {
     if let Some(t) = &app.thinking {
         thinking(f, area, app, t);
         return;
@@ -1040,16 +1736,16 @@ fn preview(f: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
 
     match r {
         Some(r) => {
-            why_pane(f, l, app, rows);
+            why_pane(f, l, app, rows, marks);
             search_pane(f, r, app);
         }
         None if both => search_pane(f, l, app),
-        None => why_pane(f, l, app, rows),
+        None => why_pane(f, l, app, rows, marks),
     }
 }
 
 /// What the highlighted candidate does, and what the two columns said about it.
-fn why_pane(f: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
+fn why_pane(f: &mut Frame, area: Rect, app: &App, rows: &[Row], marks: &Marks) {
     let unit = app.unit();
     let lines = match (rows.get(app.selected), app.selected_move()) {
         (Some(row), Some(m)) => {
@@ -1094,6 +1790,42 @@ fn why_pane(f: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
                 Line::from(head),
             ];
             out.extend(lookahead_line(rows, unit, app.selected));
+            // The spaces the move uses, named and described. The rings blink
+            // these same cells; this is the half of that a screen dump can
+            // read, and it is the only place the space's action is spelled out
+            // at full width rather than squeezed into a column.
+            for (arriving, gear, pos, c) in marks
+                .placed
+                .iter()
+                .map(|&(g, p, c)| (true, g, p, c))
+                .chain(marks.taken.iter().map(|&(g, p, c)| (false, g, p, c)))
+            {
+                let info = space_info(&before, before.current, gear, pos);
+                out.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}{c} ", if arriving { '+' } else { '-' }),
+                        Style::default().fg(colour(c)).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{} {} ", if arriving { "onto" } else { "off" }, gear.name()),
+                        label(),
+                    ),
+                    Span::styled(
+                        format!("{} ", pos.0),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(info.label, dim()),
+                ]));
+            }
+            if let Some(c) = marks.first {
+                out.push(Line::from(vec![
+                    Span::styled(
+                        format!("+{c} "),
+                        Style::default().fg(colour(c)).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("onto the first player space", label()),
+                ]));
+            }
             out.extend(diff_lines(&before, &after));
             out
         }
@@ -1345,14 +2077,14 @@ fn help(f: &mut Frame, area: Rect, app: &App) {
     // be a lie about what the terminal will do.
     let text = match &app.thinking {
         Some(t) => format!(
-            " {} {} · {:.1}s · j/k move · q quit    {}",
+            " {} {} · {:.1}s · j/k move · g gear · q quit    {}",
             t.tick(),
             t.what,
             t.elapsed.as_secs_f64(),
             app.status
         ),
         None => format!(
-            " j/k move · enter play · n next turn · r redraw · t {} · a autoplay [{auto}] · q quit    {}",
+            " j/k move · g gear · enter play · n next turn · r redraw · t {} · a autoplay [{auto}] · q quit    {}",
             app.source.next().label(),
             app.status
         ),

@@ -351,17 +351,33 @@ pub fn expand_payoff(
                 .into_iter()
                 .map(|c| c.chain(&Choice::of(tail.iter().copied())))
                 .collect();
-            // The mirror is a privilege, not a cost. A player who cannot pay
-            // its corn -- or a chain already at its depth bound -- still
-            // constructs the card and still takes the tail. `mirror_choices`
-            // returns an empty list in both cases and `building_choices` reads
-            // an empty payoff as "no way to build this", so card #30 dropped
-            // out of the game entirely at zero corn. Architecture level 1
-            // masked it: the corn the build itself pays lands before the payoff
-            // is expanded, and one corn is exactly the mirror's price.
-            if out.is_empty() {
-                out.push(Choice::of(tail.iter().copied()));
-            }
+            // The mirror is a privilege, not a cost, so the bare tail is
+            // always on offer and the mirrored actions are extras beside it.
+            //
+            // Two ways that used to go wrong, and they are one rule. A player
+            // who *cannot* pay the corn -- or whose chain is at its depth bound
+            // -- still constructs the card and still takes the tail;
+            // `mirror_choices` returns an empty list in both cases and
+            // `building_choices` reads an empty payoff as "no way to build
+            // this", so card #30 dropped out of the game entirely at zero corn.
+            // Architecture level 1 masked that: the corn the build itself pays
+            // lands before the payoff is expanded, and one corn is exactly the
+            // mirror's price. A player who *can* pay and would rather not was
+            // the other half -- every choice `mirror_choices` returns leads
+            // with the fee, so constructing #30 forced the corn and forced an
+            // action, and the mirror reaches `UnlockWorker`. That is
+            // `RULES-AUDIT.md` A9's unwanted Uxmal 3 worker arriving through a
+            // card. Uxmal 5, the mirror's other caller, was never exposed to
+            // it: `choices_for_worker` prepends the skip there, the same way it
+            // does for Uxmal 1, 2 and 4 and Tikal 2 and 5, none of which carry
+            // one in their own list either.
+            //
+            // Pushed unconditionally rather than as an `is_empty` fallback:
+            // both halves are the same sentence of the rulebook, and no choice
+            // `mirror_choices` returns can collide with the bare tail, since it
+            // drops the mirrored spaces' skips and prefixes the fee to what is
+            // left.
+            out.push(Choice::of(tail.iter().copied()));
             out
         }
     }

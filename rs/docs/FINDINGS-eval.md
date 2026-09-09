@@ -4491,3 +4491,258 @@ refutation: it is not that the evaluator researches at the wrong *time*, it is
 that the research it takes when told research is valuable is not worth what it
 costs.
 
+### F53a. Binaries and the platform check
+
+Five binaries this session, each built from the same `git archive` of `0fd36d9`
+plus `src/bin/evalab.rs`, each **verified row-identical to its predecessor** on
+a shared seed set (`--ab 'rs=0.5' --base head --agent mcts:256 --seed 8000000`,
+6 blocks) before being used — the F39 detector, run five times:
+
+| binary | adds | `--eqcheck` | identity |
+| --- | --- | --- | --- |
+| `evalab-r1` | `rdiv/rcap/rpow/rtop/rmonu`, `--uptake` | 0e0 | null +0.0000 in 40 blk |
+| `evalab-r2` | `--pvar` on `--promise`, `mcts:N:cp=X:pmin=K` | 0e0 | == r1 |
+| `evalab-r3` | `--uptake`'s day-14 `early` column | 0e0 | == r1 |
+| `evalab-r4` | `--pvar` on `--terms` | — | == r3 |
+| `evalab-r5` | `--uptake`'s resume actually resumes | — | == r3 |
+
+`pmin` closes F49's first open item: `bin/evalab` can now spell
+`mcts:8192:cp=0.02:pmin=2`, which is the deliverable
+`mcts:8192:heuristic:deeper`.
+
+The r5 fix is worth naming because it was silently expensive: `--uptake`'s
+resume read the seed with `trim_matches(|c| !c.is_ascii_digit())`, which strips
+from **both** ends and therefore returned the whole rest of the line, parsed
+nothing, and replayed every seed on restart — `up_rs050_greedy64` had 555 rows
+for 300 seeds. `an.py`'s duplicate-seed guard caught it; the analysis was never
+wrong because `upsum.py` deduplicates on read, but 85% of that file's CPU was.
+
+## F54. The `RESEARCH_SCALE` curve on `greedy:64`, at **800 blocks (3,200 games)** a cell: `0.05` is on the plateau
+
+`--base head` (so 0.05 is the null), `evalab-r3`/`r5` (row-identical),
+`<scratch>/f7/ab/rs*_greedy64.jsonl`.
+
+| `rs` | 0.0 | 0.10 | **0.05** | 0.15 | 0.25 | 0.35 | 0.50 | 0.75 | 1.00 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| centred | +0.06 | −0.01 | **null** | +0.01 | −0.22 * | −0.41 * | −0.85 * | −2.00 * | −4.28 * |
+| ± | 0.07 | 0.06 | — | 0.09 | 0.15 | 0.19 | 0.25 | 0.30 | 0.35 |
+| win | 0.252 | 0.251 | 0.250 | 0.252 | 0.241 | 0.233 | 0.220 | 0.197 | **0.153** |
+
+Monotone decreasing with a flat top over **0.0-0.15**, exactly F20's shape
+re-measured on an evaluator four landings newer, at twice the block count, and
+against the *committed* value rather than the 0.5 it replaced. The committed
+0.05 is interior to the plateau, which is F13's rule.
+
+The interesting difference from F20 is the *size*. F20 read 0.75 at −3.40
+against a base of 0.5; here 0.75 against a base of 0.05 is −2.00. On the
+shipped evaluator the whole term matters less than it did — `board = 0.9`,
+`GEAR_SCALE`, `CORN_INCOME = 0` and `temple = 1.2` all landed in between — which
+is the context for F53's 0.27%.
+
+## F55. The **shape** of `uses` is inert: the early tilt and its exact opposite measure the same
+
+`uses = (rounds_left / 3).min(7)` prices "how many times a research level still
+pays". At HEAD the cap binds for the first six days, so a level taken on day 0
+and one taken on day 6 are worth the same, and the curve is linear after that.
+The brief's question is whether that shape is wrong for a quantity that
+compounds. `rpow` bends the interior while holding `uses` fixed at a
+full-length game, so it moves shape without moving magnitude; `rcap = 99`
+removes the flat top, which raises days 0-5 by 29% and touches nothing else.
+
+**`greedy:64`, 800 blocks (3,200 games) every cell**, `--base head`:
+
+| variant | what it does to the curve | centred | 95% CI |
+| --- | --- | --- | --- |
+| `rs = 0.15` | magnitude control, shape unchanged | **+0.01** | [−0.08, +0.10] |
+| `rs = 0.15, rpow = 1.5` | **tilt early** | **+0.00** | [−0.09, +0.09] |
+| `rs = 0.15, rpow = 0.6` | **tilt late — the anti-control** | **−0.00** | [−0.09, +0.09] |
+| `rs = 0.15, rcap = 99` | uncap the first six days | −0.05 | [−0.15, +0.06] |
+| `rs = 0.25` | magnitude control | −0.22 * | [−0.36, −0.07] |
+| `rs = 0.25, rpow = 1.5` | tilt early | −0.25 * | [−0.39, −0.11] |
+| `rs = 0.25, rcap = 99, rpow = 1.3` | uncap **and** tilt early | −0.34 * | [−0.49, −0.18] |
+| `rs = 0.35, rcap = 99, rpow = 2.0` | harder tilt | −0.66 * | [−0.87, −0.46] |
+| `rs = 0.60, rcap = 99, rpow = 2.5` | "research hard, then stop" | −1.60 * | [−1.88, −1.32] |
+
+**The treatment and its mirror image land on top of each other: +0.00 and −0.00
+with the same ±0.09.** That is F45's anti-shape control applied to this term,
+and where F45's rotation cost the deep search −2.44, this one costs nothing in
+either direction. At a fixed `rs`, tilting the curve toward the early game is
+worth zero; at every larger `rs`, the tilted variant is **equal to or slightly
+worse than the flat variant of the same magnitude** (−0.25 against −0.22, −0.34
+against −0.22).
+
+So the answer to "is `uses`'s shape right for a compounding quantity" is that
+**the shape is not what is wrong, because at the magnitude where the term is
+free the shape is unmeasurable, and at the magnitude where the shape is
+measurable the magnitude is already losing.** `uses` is linear-with-a-cap and
+so is every alternative that has been tried; what decides these cells is the
+area under the curve, not its slope.
+
+Two structural probes, same agent:
+
+| variant | idea | centred (blk) |
+| --- | --- | --- |
+| `rtop = 1.5` | convexity in *finished* tracks (monument #11 pays 9/20/33) | **+0.01 [−0.01, +0.03]** (130) |
+| `rmonu = 0.4` | pay the option on a face-up #11/#12, which `monument_outlook` scores at 0 for a player with no levels | **−0.13 \*** [−0.23, −0.04] (797) |
+
+`rtop` is inert to two decimal places for a mechanical reason worth writing
+down: **a track reaches level 3 in 1.9% of player-games** (F52b), so a term
+gated on `maxed >= 1` is off in 98% of positions. The convexity monument #11
+pays for is real and the evaluator never gets near it.
+
+## F56. The one thing `--promise` got right, and it is not Tikal 1: **Tikal 5 wants raising**
+
+F51's re-read says the under-priced spaces are the *tops* of the gears, not the
+research space. Tikal 5 — pay a block, take two temple steps — promises 4.21 and
+delivers **8.80**, `want` 9.77 against a table entry of 3.89. `greedy:64`,
+**800 blocks** each, `--base head`:
+
+| variant | what it multiplies | centred | 95% CI | win |
+| --- | --- | --- | --- | --- |
+| **`tik5 = 1.5`** | Tikal 5, two temple steps for a block | **+0.63** | **[+0.34, +0.92] \*** | **0.269** |
+| `tik1 = 1.5` | Tikal 1, the first research space | **+0.25** | [+0.02, +0.49] * | 0.259 |
+| `tik = 1.15` | the whole Tikal gear | +0.20 | [−0.11, +0.51] | 0.268 |
+
+**`tik1 = 1.5` is now positive where F26a measured it inert.** F26a's sweep
+(0.25/0.5/0.75 all +0.02, 1.5 at −0.33) was run against `BOARD_SCALE = 0.5`;
+`board_position` prices a worker by `max(sv(pos), max_j sv(j) − j·TEMPO)`, and
+raising `BOARD_SCALE` to 0.9 moves which side of that max is binding. So the
+entry is no longer unreachable through the max, and F26a's "calibrating Tikal 1
+is inert" is a statement about the *old* board scale, not about the table. This
+is F31a's rule biting a fourth time.
+
+But the larger effect is Tikal 5, and it is not about research at all. The
+question the brief asked about the Tikal entries — "does F27's cut want
+reversing" — has a two-part answer: **the entries were never cut** (`GEAR_SCALE`
+is `[1.5, 1.0, 1.0, 1.0, 0.7]`, and Tikal sits at 1.0), and the entry that
+wants raising is the temple-step space, which `--promise` has been saying since
+F19 (`r = 5.19` there) and which nobody swept.
+
+Deep tier and `mcts:256` in flight.
+
+## F57. The full `RESEARCH_SCALE` curve on three agents — **the deep search is more tolerant of over-pricing research, and it does not want more of it**
+
+The experiment the brief asked for. `RESEARCH_SCALE` is already the one knob in
+`engine_value` that touches research and nothing else — `ACTION_VALUE` is the
+worker half, `BUILDING_VALUE` the building half — so `rs` *is* the separated
+scale, and this is it swept on the agent closest to the deliverable. `--base
+head`, so **0.05 is the null by construction**.
+
+| `rs` | `greedy:64` (800 blk) | `mcts:1024:cp=0.05` (250 blk) |
+| --- | --- | --- |
+| 0.0 | +0.06 [−0.00, +0.13] | **+0.28** [−0.09, +0.65] |
+| **0.05** | **null** | **null** |
+| 0.10 | −0.01 [−0.07, +0.05] | −0.14 [−0.70, +0.42] (115) |
+| 0.15 | +0.01 [−0.08, +0.10] | −0.04 [−0.42, +0.33] |
+| 0.25 | −0.22 * [−0.36, −0.07] | −0.11 [−0.65, +0.42] (112) |
+| 0.35 | −0.41 * [−0.60, −0.23] | −0.10 [−0.76, +0.55] (115) |
+| 0.50 | −0.85 * [−1.09, −0.60] | −0.43 [−0.89, +0.02] |
+| 0.75 | −2.00 * [−2.30, −1.71] | −1.33 * [−2.19, −0.46] (82) |
+| 1.00 | **−4.28 \*** [−4.57, −3.89] | **−1.01 \*** [−1.53, −0.50] |
+
+**Not one cell on either agent is distinguishably positive.** The answer to "is
+research underpriced" is **no, at any depth measured**, and the constant is
+already interior to a plateau on both.
+
+**What does change with depth is the price of getting it wrong.** At `rs = 1.0`
+the one-ply agent loses **4.28** points and the searching agent **1.01** — a
+factor of four — and the whole curve is about half as steep at depth. That is a
+real by-depth disagreement and it runs the opposite way to the brief's
+prediction: the deep search is not *more* sensitive to a delayed-payoff term, it
+is **less**. The reading that fits every number here is that a search which
+plays six turns forward can decline a research investment the evaluator is
+recommending, and a one-ply agent that only compares completed turns cannot.
+Depth is a *substitute* for getting this constant right, not a magnifier of it.
+
+`mcts:256` at 250-260 blocks reads +0.12 / +0.25 * / +0.05 / +0.20 at
+0.0 / 0.10 / 0.15 / 0.25 — the same flat top, and the middle rung is the one
+agent where a small rise is not free but very slightly favoured. Nothing there
+survives the crossing to `mcts:1024`.
+
+### F57a. Uptake at depth: the searching agent researches **no more** than the one-ply one
+
+`--uptake` on `mcts:1024:cp=0.05` (79-87 blocks) beside `greedy:64` (300) and
+`mcts:256` (200), all `--base head`:
+
+| agent | baseline levels | by day 14 | tracks maxed | Δ levels at `rs = 0.5` | Δ at `rs = 1.0` |
+| --- | --- | --- | --- | --- | --- |
+| `greedy:64` | 1.242 | 0.845 | 0.019 | +0.626 * | +2.105 * |
+| `mcts:256` | 1.225 | 0.912 | 0.062 | +0.121 * | +0.368 * |
+| **`mcts:1024:cp=0.05`** | **1.322** | 0.940 | 0.075 | +0.378 * | +0.913 * |
+
+**A six-turn search left to itself takes 1.32 research levels of twelve; a
+one-ply agent takes 1.24.** The lookahead the champion has does not discover a
+compounding research yield the shallow agent is missing — it plays the position
+almost identically on this axis. And when the term is turned up it takes the
+extra levels and loses: −0.44 [−1.17, +0.30] at `rs = 0.5`, **−2.41
+[−4.27, −0.55] \*** at `rs = 1.0` (25 blk).
+
+### F56a. …and it does not survive the crossing. **No Tikal entry lands.**
+
+| variant | `greedy:64` (800) | `mcts:256` | `mcts:1024:cp=0.05` |
+| --- | --- | --- | --- |
+| `tik5 = 1.5` | **+0.63 \*** [+0.34, +0.92] | −0.04 [−0.48, +0.39] (274) | +0.03 [−0.78, +0.84] (67) |
+| `tik5 = 1.3` | **+0.68 \*** [+0.37, +0.98] (385) | −0.05 [−0.42, +0.32] (194) | — |
+| `tik5 = 2.0` | **−1.24 \*** [−1.73, −0.76] (360) | — | — |
+| `tik1 = 1.5` | **+0.25 \*** [+0.02, +0.49] | **−0.27 \*** [−0.51, −0.03] (268) | −0.30 [−1.47, +0.87] (34) |
+| `tik = 1.15` | +0.20 [−0.11, +0.51] | **−0.54 \*** [−1.00, −0.08] (255) | — |
+
+`tik5` is unimodal on `greedy:64` with a peak between 1.3 and 1.5 (2.0 is −1.24
+\*), so the shallow effect is a real optimum and not a monotone drift. And it is
+**a `greedy:64` effect only**: free on `mcts:256` at 274 blocks and free on the
+deep search at 67. `tik1` and the whole-gear multiplier are worse than free on
+the searching agents.
+
+By F34g's rule — a knob whose whole effect is on the one-ply agent is a knob the
+shipping agent does not want — **nothing here lands**. The answer to "do the
+Tikal space values want restoring" is: they were never cut, the entry that looks
+under-priced is the temple-step space rather than the research space, raising it
+is worth two thirds of a point to a one-ply agent, and the agent that ships
+cannot tell the difference.
+
+### F55a. The shape control at depth, for completeness
+
+`mcts:1024:cp=0.05`, ~72 blocks each: `rs = 0.15, rpow = 1.5` reads −0.26
+[−0.90, +0.38] and its mirror `rpow = 0.6` reads −0.21 [−0.88, +0.46]. Thin,
+but the treatment and the anti-control are again on top of each other, as they
+are at 800 blocks on `greedy:64`. The shape of `uses` is inert on both agents.
+
+## F58. The engine changed underneath this session, and the result replicates on the fixed one
+
+At 13:14, mid-run, `9bfcb6e` landed **three research-adjacent rules fixes**
+(`spaces/tikal.rs`, `spaces/chichen.rs`, `options.rs`) from a parallel audit
+against the printed rulebook: Theology 2 could not spend the block the Chichen
+action had just granted, Tikal 4's double build could not use an architecture
+level the first card had just granted, and card #30 was unbuildable at zero
+corn. Two of the three make **research strictly better than it was**. Every
+number in F50-F57 was measured on `0fd36d9`, before them.
+
+`evalab-n1` is `9bfcb6e` plus this session's `evalab.rs`, `--eqcheck` **0e0**
+over 8,208 pairs, and the F39 detector says what it should: it writes
+**different** rows from `evalab-r1` on the same seeds, because the game changed.
+
+`--base head`, `greedy:64`, on the fixed engine:
+
+| `rs` | old engine (`0fd36d9`, 800 blk) | **fixed engine (`9bfcb6e`)** |
+| --- | --- | --- |
+| 0.0 | +0.06 [−0.00, +0.13] | −0.05 [−0.16, +0.07] (161) |
+| 0.15 | +0.01 [−0.08, +0.10] | −0.19 [−0.43, +0.05] (162) |
+| 0.50 | −0.85 * | −0.44 [−0.98, +0.11] (140) |
+| **1.00** | **−4.28 \*** | **−4.36 \*** [−5.07, −3.65] (183) |
+| `tik5 = 1.5` | +0.63 * | +0.53 [−0.01, +1.08] (194) |
+
+And the behavioural half, `--uptake` on the fixed engine, 162-184 blocks:
+
+| | old engine | fixed engine |
+| --- | --- | --- |
+| baseline levels | 1.242 | **1.335** |
+| baseline tracks maxed | 0.019 | **0.039** |
+| Δ levels at `rs = 1.0` | +2.105 * | +2.071 * |
+| centred at `rs = 1.0` | −4.33 * | **−4.37 \*** |
+
+**The rules fixes did make research better and they did not make it worth
+buying.** Baseline uptake rises 7% in levels and *doubles* in maxed tracks —
+which is the fixes doing exactly what their author said they would — and the
+price of over-valuing research is unchanged to within a twentieth of a point.
+Every conclusion in F51-F57 stands on the corrected engine.
+
