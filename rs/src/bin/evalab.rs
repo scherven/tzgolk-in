@@ -318,6 +318,13 @@ pub mod v {
         pub held_scale: f32,
         pub monument_scale: f32,
         pub starve_scale: f32,
+        /// Post-multiplier on `liquidation`, the one `Components` term that had
+        /// no scale knob. F34 predicts a *concrete* term — corn and skulls the
+        /// player is already holding, priced at the rate the end-game will pay
+        /// for them — should hold or want raising at depth, and that cannot be
+        /// tested through `lc`/`sp`/`cp`, which also move `held_premium` and
+        /// `temple_outlook`. This moves nothing but the term.
+        pub liq_scale: f32,
         /// The three gates the hand table is missing: a Palenque space whose
         /// tiles are gone, a research space with no blocks to pay the advance,
         /// and the corn exchange with nothing to trade.
@@ -404,6 +411,7 @@ pub mod v {
         held_scale: 1.0,
         monument_scale: 1.0,
         starve_scale: 1.0,
+        liq_scale: 1.0,
         gates: false,
     };
 
@@ -454,7 +462,7 @@ pub mod v {
         if g.over {
             return c;
         }
-        c.liquidation = liquidation(g, p);
+        c.liquidation = liquidation(g, p) * vr.liq_scale;
         let rounds_left = (LAST_DAY.saturating_sub(g.day)) as f32;
         let horizon = rounds_left / LAST_DAY as f32;
         c.held = held_premium(vr, g, p, rounds_left) * vr.held_scale;
@@ -1424,6 +1432,7 @@ fn variant(name: &str) -> Option<v::V> {
                             "held" => out.held_scale = f,
                             "monu" => out.monument_scale = f,
                             "starve" => out.starve_scale = f,
+                            "liq" => out.liq_scale = f,
                             "tnear" => out.t_near = f,
                             "tfar" => out.t_far = f,
                             "thalf" => out.t_half = f,

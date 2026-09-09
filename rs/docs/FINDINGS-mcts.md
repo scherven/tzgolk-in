@@ -1635,3 +1635,207 @@ entry.
 Unchanged and not drifting: `v8-champ-vs-greedy - v8-oldchamp-vs-greedy` =
 **+10.40 (CI +9.29..+11.51, 110 paired blocks, p = 9e-77)**, and the champion
 takes **72.3%** of its games against three stateless greedy agents.
+
+---
+
+## Wave `w9` — 2026-09-08 evening, on a frozen binary at HEAD `48c39bd`
+
+### 2026-09-08 20:13 — `arena_v9` pinned, and it is **not** poolable with `v8`
+
+`mc/bin/arena_v9` + `mc/bin/sprobe_v9`, fingerprint in `mc/bin/arena_v9.rev`:
+HEAD `48c39bd`, working tree clean, `eval.rs` sha `cb56446`, `mcts.rs` sha
+`7d6bada`, arena binary sha `11bb90e9`.
+
+**Two commits moved the platform since `arena_v8`** (which was HEAD `5318276`):
+
+* `c949bcf` — `eval.rs` `BOARD_SCALE` 0.65 -> 0.80. The evaluator is MCTS's
+  prior *and* its leaf value (`mcts.rs:1573`), so this moves the agent on both
+  axes.
+* `5619893` — the `deeper` sugar in `mcts.rs` (`cp=0.02,pmin=2`).
+
+So every `w9-` row below has its own platform. **Never pool a `w9-` row with a
+`v8-` or `v6-` row.** This is the third platform in this file and the first one
+whose whole wave was measured with `eval.rs` frozen — which is the thing the
+brief asked for and the thing no previous number in this file had.
+
+`examples/nametest.rs` checked before racing, as the standing rule requires:
+`mcts:8192:heuristic:deeper` prints `mcts8192/heuristic:pt=1:pmin=2:cp=0.02`
+and `mcts:8192:heuristic:cp=0.02` prints `...:pmin=3:cp=0.02` — distinct, and
+`deeper` collides only with its own spelling `cp=0.02,pmin=2`. All 7 reported
+collisions are genuine aliases.
+
+### 2026-09-08 20:18 — **the 1.6 GB figure for a 32,768 game was wrong; it is ~850 MB**
+
+The 06:00 entry extrapolated ~1.6 GB per `mcts:32768:cp=0.02` game in flight
+from the 412 MB measured at 8,192, and concluded the rung was unrunnable. That
+extrapolation was linear in the budget and the truth is much flatter. Sampling
+RSS every 5 s through a real `arena_v9 --concurrency 1` block at 32,768:
+
+| t | 10 s | 20 s | 45 s | 60 s | 100 s | 120 s |
+|---|---|---|---|---|---|---|
+| RSS | 254 MB | 695 MB | 609 MB | 625 MB | **849 MB** | 523 MB |
+
+**Peak ~850 MB, and it oscillates rather than climbing** — `retain_subtree`
+carries a turn's tree forward and the arena is cleared whenever reuse misses,
+so the working set is a turn's tree, not a game's. `--concurrency 1` is one
+block in flight and `play_block` plays its four games *sequentially* on one
+agent instance (`bin/arena.rs:219`), so concurrency is the memory multiplier
+and the budget is very nearly not.
+
+**What actually killed the runs at 05:19-06:45 was the neighbours**, as that
+entry half-suspected: 42 `evalab` processes, not the size of one deep tree.
+The same thing recurred at 20:14 tonight — a 32,768 arm launched into a moment
+when three arenas had just started and free RAM was under 400 MB died in under
+60 s; the identical command launched at 20:21 with 2.5 GB free has been running
+since. **Gate the launch on free pages, not on the budget.**
+
+`mc/supervise.sh` now does that: it restarts any arm whose process has gone
+(every arm is `--resume`-safe, so a kill costs the blocks in flight and
+nothing else), refuses to start a second writer on one `--out`, and holds off
+whenever free RAM is under 250 MB.
+
+### 2026-09-08 20:19 — the machine is not idle; the eval workstream is live
+
+7+ `evalab-p25` processes at ~100% CPU each, i.e. half the machine, plus
+`xcodebuild`. `PhysMem: 22G used, 1481M unused` with 4.1 GB in the compressor
+and swap at 6.0 GB of 7.2. Load average read 69 while `top` reported 90% user
+and 0% idle on 14 cores — the load number is swap wait again, exactly as the
+05:53 entry warned. Every `w9` arm therefore runs at `--concurrency 1`.
+
+### 2026-09-08 20:37 — operational: **two 32,768 arenas cannot coexist here; one can**
+
+Refining the entry above. With the eval workstream holding half the machine:
+
+* a single foreground `mcts:32768:cp=0.02` block completes clean (`EXIT=0`,
+  one block written, ~3 min), twice;
+* **two** 32,768 arms started 25 s apart are both dead inside 90 s, every
+  cycle, at any reported "available" memory from 4.4 to 11.3 GB;
+* and at the same timestamps `searchd`, `healthd`, `profiled` and
+  `TypeToSiriWidgetExtension` all wrote crash reports. The arena wrote none.
+
+**So the killer is system-wide memory pressure and the arena is simply the
+largest resident process when it fires** — jetsam takes daemons and the arena
+in the same second. No amount of `vm_stat` arithmetic predicts it, because the
+pressure signal macOS acts on is the compressor and swap, not free pages: swap
+was 6.0 GB of 7.2 with 4.1 GB in the compressor while `vm_stat` reported
+several GB "available".
+
+`mc/serial.sh` is the answer: it runs the deep arms **one at a time**, in
+chunks of a few blocks, round-robin, so both arms grow along the *same seed
+prefix* and stay paired. `--resume` makes a chunk boundary free and a kill
+costs the blocks in flight. The lesson generalises past this machine: **when a
+sweep's arms are the largest processes on a shared box, serialise them rather
+than gating them on a memory reading.**
+
+### 2026-09-08 21:12 — the machine was never idle: **46 `evalab` processes, 844% of 1400%**
+
+The brief for this run said the machine was idle for the first time. It was, for
+about twenty minutes. Measured at 21:12:
+
+| | |
+|---|---|
+| `evalab` processes (eval workstream) | **46**, **844% CPU** |
+| my six `arena_v9` arms | **199% CPU between them**, i.e. **two cores of fourteen** |
+| swap | 9,446 MB used of 10,240 (it grew from 4 GB as the evening went on) |
+
+That is the whole explanation for every jetsam kill in this wave, and it caps
+what this run can measure: at ~2 cores, an `mcts:32768` block costs ~200 CPU-s,
+so the deep cell accrues ~18 blocks/hour *in total* across both of its arms.
+**Block counts below are what two cores bought, not what the question deserves.**
+Spreading those two cores over six arms measures six things badly, so the wave
+was cut to three: the headline against `heuristic:full`, and the `pmin` pair at
+8,192 and at 32,768.
+
+### 2026-09-08 21:20 — **the `v8` runs kept going after the session died, and they settle two questions**
+
+Nobody stopped them. `v8-8192cp002` and `v8-8192pmin2` are at **600 blocks
+each** and `v8-champ-vs-greedy` at 300. Read against `v8-null-greedy`
+(a stateless self-race, +0.00 with a zero-width interval over 90 blocks):
+
+| run | blk | centred | 95% CI | win |
+|---|---|---|---|---|
+| `v8-null-greedy` | 90 | **+0.00** | +0.00..+0.00 | **0.250** |
+| `v8-oldchamp-vs-greedy` | 203 | +3.31 | +2.66..+3.96 | 0.355 |
+| **`v8-champ-vs-greedy`** | **300** | **+13.57** | +13.07..+14.08 | **0.733** |
+| `v8-8192cp002` | 600 | +8.17 | +7.86..+8.48 | 0.518 |
+| `v8-8192pmin2` | 600 | +10.95 | +10.64..+11.26 | 0.619 |
+
+| paired contrast | centred | 95% CI | paired blk | p |
+|---|---|---|---|---|
+| **`pmin=2` - `pmin=3` at 8,192** | **+2.78** | **+2.39..+3.16** | **600** | 5e-46 |
+| champion - old champion vs `heuristic:full` | **+10.18** | +9.36..+11.00 | 203 | 1e-131 |
+
+**The `pmin` increment has stopped drifting.** The 07:12 entry watched it fall
++2.92 (28 blk) -> +3.06 (46) -> +2.99 (53) -> +2.33 (66) and said "quote it as
+two to three points, still tightening". At **600 paired blocks it is +2.78
+(+/-0.39)** — inside every one of those intervals, and now settled. Two to
+three points was right.
+
+### 2026-09-08 21:25 — **`c949bcf` moved the platform a long way, and not in MCTS's favour**
+
+`arena_v9` differs from `arena_v8` by one evaluator commit (`BOARD_SCALE`
+0.65 -> 0.80) and one sugar commit. Same specs, same seeds, same seat rotation,
+so the paired difference **is** what that commit did to each matchup:
+
+| matchup (candidate vs `heuristic:full`) | v9 - v8 | 95% CI | paired blk | p |
+|---|---|---|---|---|
+| `heuristic:full` vs itself (control) | +0.01 | -0.03..+0.06 | 90 | 0.48 |
+| `mcts:2048:heuristic:quality` | **-3.78** | -4.87..-2.68 | 104 | 8e-12 |
+| **`mcts:8192:heuristic:deeper`** | **-5.88** | -7.29..-4.47 | 65 | 1e-16 |
+
+On HEAD the **old champion is no longer better than one-ply greedy at all**:
+`mcts:2048:heuristic:quality` reads **-0.40 (-0.95..+0.16) with a win rate of
+0.222** against a null of 0.250, where on v8 it was +3.31 at 0.355.
+
+**This is not an absolute regression — the evaluator really did get better.**
+`random` is the only agent in the harness that never calls `eval::heuristic`,
+so it is the one opponent that means the same thing on both binaries:
+
+| | centred vs `random` | blk |
+|---|---|---|
+| `heuristic:full` on `arena_v8` | +60.32 | 100 |
+| `heuristic:full` on `arena_v9` | **+66.90** | 54 |
+| **paired, v9 - v8** | **+6.75 (+5.22..+8.28)** | 54, p=1e-18 |
+
+So `c949bcf` made the **one-ply agent** substantially stronger, and the
+searches did not gain as much — which is why every margin *over* greedy shrank.
+The honest one-line reading: **a better one-ply evaluator does more of the work
+itself, and the search's marginal contribution falls.** (Do not add the two
+numbers: a point against `random` and a point against `heuristic:full` are not
+the same unit.)
+
+**Consequence for this file: `w9-` rows are the numbers that describe HEAD, and
+they are smaller than the `v8-` rows for a reason that is not about the search.**
+
+### 2026-09-09 01:20 — the `w9` headline on HEAD, and the `pmin` increment on three platforms
+
+`arena_v9`, HEAD `48c39bd`, `eval.rs` frozen for the whole wave. Solo, seed
+3000000. `w9-null-greedy` (`heuristic:full` against itself) returns **+0.00
+with a win rate of exactly 0.250 over 237 blocks**, so rows against
+`heuristic:full` read directly against zero with no null correction.
+
+| run | candidate | baseline | blk | centred | 95% CI | win |
+|---|---|---|---|---|---|---|
+| `w9-null-greedy` | `heuristic:full` | itself | 237 | **+0.00** | -0.03..+0.03 | **0.250** |
+| `w9-oldchamp-vs-greedy` | `mcts:2048:heuristic:quality` | `heuristic:full` | 243 | **-0.40** | -0.95..+0.16 | **0.222** |
+| **`w9-champ-vs-greedy`** | **`mcts:8192:heuristic:deeper`** | `heuristic:full` | **186** | **+7.45** | **+6.86..+8.04** | **0.509** |
+
+**Champion minus old champion, paired on seed against the same stateless
+opponent: +7.94 (95% CI +6.98..+8.90, 129 paired blocks, p = 3e-59.)**
+
+The champion takes **50.9%** of its games against three copies of a stateless
+one-ply agent where an equal player takes 25%. **The old champion takes 22.2%,
+i.e. it is no longer better than one-ply greedy at all** — see the `c949bcf`
+entry above for why, and note this is a statement about HEAD's evaluator, not
+about the search.
+
+**`prior_min_edges = 2` now reproduces on three independent platforms:**
+
+| platform | `pmin=2` - `pmin=3` at 8,192 sims | 95% CI | paired blk |
+|---|---|---|---|
+| `v6` | +4.73 | +3.22..+6.24 | 50 |
+| **`v8`** | **+2.78** | **+2.39..+3.16** | **600** |
+| **`v9` (HEAD)** | **+3.12** | **+2.23..+4.00** | **117** |
+
+Three evaluators, three block sets, same sign, all three intervals clear of
+zero and mutually overlapping. This is the most-replicated result in the file.

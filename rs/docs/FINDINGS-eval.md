@@ -3612,3 +3612,514 @@ touches zero, so the strong reading ("raising the projected term actively hurts
 at depth") is not yet earned; the weak reading is enough to kill the confound,
 because the rival explanation predicted `temple = 1.6` would be *positive* and
 of at least `board = 0.8`'s size.
+
+---
+
+# Session: the concrete-versus-projected hypothesis, tested against the shipped evaluator
+
+HEAD is `48c39bd`; `BOARD_SCALE = 0.8` is committed (F35), so **`--base head`
+is now the shipped evaluator** and every cell below is a head-to-head against
+what ships, F31a's rule satisfied by construction rather than by reconstruction.
+
+**Binary: `<scratch>/f6/evalab-p25`, rev `48c39bd`, `--eqcheck` 0e0 over 24,352
+(position, seat) pairs.** It was built from a *pristine* `git archive HEAD`
+export into `<scratch>/f6/tree`, not from the live working tree, because the
+live tree does not compile — two other agents are mid-edit in `ui.rs` and
+`mcts.rs`, and `cargo build --release` fails on `uidump.rs` and on `lib`. That
+is worth recording as a method: **when the repo is shared, `git archive HEAD |
+tar -x` into a private tree is a stronger form of the pinned-binary rule than
+`cp target/release/...`, because it also pins the *source* the binary claims to
+be.** The one deviation from HEAD is in `bin/evalab.rs`, which I own:
+
+* new `V::liq_scale` (knob `liq`), a post-multiplier on `liquidation`. It was
+  the one `Components` term with no scale knob, and F34's prediction list names
+  `liquidation` explicitly. `lc`/`sp`/`cp` cannot stand in for it: they also
+  move `held_premium` and `temple_outlook`.
+
+Agents, with F34k's translation: `greedy:64` is one ply; `mcts:256` is 256 sims
+at the committed `c_puct = 2.0`, about one turn of descent; `mcts:1024:cp=0.05`
+is the only one that searches, and F37 measures it at about **twice**
+`mcts:256:cp=0.05`'s effect on the same variant.
+
+## F38. The prediction battery on `greedy:64` — the shallow half of the table
+
+Every cell `--ab X --base head` on `evalab-p25`, **800 blocks** (3,200 games),
+`<scratch>/f6/ab/w1_*_greedy64.jsonl`. `w1_null` is `--ab head --base head` and
+reads `+0.00 [+0.00, +0.00]` in all 117 blocks it reached, which is the harness
+check: identical arms are bit-identical, so a non-zero cell is the variant.
+
+| variant | term it moves | `greedy:64`, 800 blk | win (null 0.250) |
+| --- | --- | --- | --- |
+| `board = 0.90` | board (concrete) | −0.21 [−0.46, +0.04] | 0.249 |
+| `board = 1.00` | board | **−1.00** [−1.28, −0.71] * | 0.229 |
+| `temple = 1.0` | temple (projected) | **−0.59** [−0.87, −0.31] * | 0.255 |
+| `temple = 1.2` | temple | −0.13 [−0.35, +0.09] | 0.252 |
+| `monu = 0.0` (deletion) | monument (projected) | +0.07 [−0.07, +0.22] | 0.245 |
+| `monu = 0.5` | monument | **+0.11** [+0.02, +0.21] * | 0.247 |
+| `held = 1.3` | held (concrete) | −0.26 [−0.50, −0.02] * | 0.247 |
+| `held = 0.7` | held | −0.18 [−0.42, +0.06] | 0.234 |
+| `liq = 1.3` | liquidation (concrete) | −0.32 [−0.58, −0.06] * | 0.242 |
+| `liq = 0.7` | liquidation | +0.16 [−0.10, +0.42] | 0.257 |
+| `engine = 1.3` | engine (projected) | +0.11 [−0.05, +0.26] | 0.250 |
+| `engine = 0.7` | engine | −0.34 [−0.47, −0.20] * | 0.241 |
+| `starve = 0.7` | starvation (projected) | **−0.91** [−1.19, −0.63] * | 0.224 |
+| `ci = 0.3` | `CORN_INCOME_PER_ROUND` 0 → 0.3 | **−1.49** [−1.77, −1.21] * | 0.213 |
+
+Read on its own this is the familiar picture: **the shallow agent likes the
+evaluator it was fitted on.** Nine of the fourteen cells are negative, the two
+largest losses are the two constants F23 and F30 landed on `greedy:64`
+(`CORN_INCOME_PER_ROUND = 0` and the starvation scale), and both directions of
+`held` and of `liquidation` are worse than the committed value, which is what
+being at an optimum looks like. The two positive cells are both
+`monument_outlook` shrinking.
+
+The deep tier of the same fourteen variants is running at 400 blocks on
+`mcts:1024:cp=0.05` (`w1_*_mcts1024cp005`). The hypothesis's content is entirely
+in the *difference* between these two columns, so nothing is concluded here.
+
+## F39. Every deep number in F34-F37 was measured on a **different search**, and that is why they must be re-run
+
+Not a base-spec mistake and not a stale binary in the F36 sense — a third
+variety of the F31a failure, and the one this file had no rule for.
+
+`evalab-p23` is rev `6afe5fc`. HEAD is `48c39bd`. Between them:
+
+```
+  git diff 6afe5fc HEAD --stat -- src/mcts.rs src/record.rs
+    src/mcts.rs    830 +++++...
+    src/record.rs  113 +++...
+```
+
+`MctsConfig::default().c_puct_init` is still 2.0, so `mcts:256` still means what
+it meant; but the selection formula changed (the FPU term went from `fpu` to
+`fpu + edge.q0`) and `pmin` arrived. **`--agent mcts:...` on p23 and on p25 are
+not the same agent.** Demonstrated, not inferred:
+
+* A block is **exactly reproducible** from its seed: the same binary, spec,
+  agent and `--seed` writes byte-identical rows, on `greedy:64` and on
+  `mcts:256:cp=0.05` alike, and `RAYON_NUM_THREADS` changes only the *order* in
+  which rows are appended, never a value. So two files that disagree row-by-row
+  at a shared seed disagree about the platform, full stop.
+* p25's `w1_temple10_mcts256cp005` and p23's `dq_temple10_mcts256cp005` are the
+  same candidate, the same base and the same 44 shared seeds, and **not one of
+  the 44 rows matches**, on either column.
+
+The `base`-column detector still says the two runs share an *evaluator*, which
+is the useful half of the news:
+
+| pair (shared seeds) | base-column difference |
+| --- | --- |
+| p25 `--base head` − p23 `dq_*` (`--base board=0.8`) | **−0.05 [−1.24, +1.15]**, n=41 |
+| p25 `--base head` − p23 `dp_*` (`--base head`, board 0.65) | **+1.74 [+0.55, +2.92]** *, n=41 |
+| p25 `--base head` − p23 `n_*` (`--base head`, board 0.65) | **+1.53 [+0.61, +2.46]** *, n=74 |
+
+So `dq_*` was indeed run against `board = 0.8` and `evalab-p25 ≡ evalab-p23 +
+board=0.8` *as an evaluator* — the F35 landing reproduces — while the search
+underneath moved. Two consequences:
+
+1. **F34's headline table, F34l, F35's deep row, F36 and F37 are all statements
+   about a search that no longer exists.** Their evaluator conclusions are not
+   thereby wrong, but no deep cell in them can be quoted as a fact about what
+   ships. Everything this session reports is re-measured on `evalab-p25`.
+2. The rule in F31a needs its third clause. Re-measure X against the evaluator
+   it will ship in (F31a); check the binary's rev against `eval.rs` (F36); and
+   **check it against `mcts.rs` too, because on this project `--agent` names a
+   configuration, not an implementation.** The cheap detector is the one used
+   here: identical seed, identical spec, and ask whether the rows are equal.
+   They should be. When they are not, the platform moved.
+
+## F40. Operational: the machine is shared, and jetsam took thirteen deep jobs at once
+
+Recorded because it changes what a run on this machine has to look like, not
+because it is interesting. At 00:08:23 **thirteen** `evalab` processes across
+three independent driver process groups were `Killed: 9` in the same second.
+Cause, from `vm_stat` and `ps` a minute later: a co-tenant agent is running nine
+`./bin/arena_v9` processes (529% CPU, 2.3 GB resident) and swap was at
+**8.95 GB of 10 GB**. This is the same failure `docs/OVERNIGHT.md` records for
+deep trees — memory, not CPU, is the binding constraint — arriving from the
+*other* tenant's side.
+
+Three things follow, and the third is the one worth keeping:
+
+* Deep-tier concurrency on this box is a memory budget, not a core count. 14
+  concurrent `mcts:1024` jobs do not survive; five do.
+* "The machine is idle" is a claim with a short half-life when other agents are
+  live. `ps aux | grep arena` before sizing a wave.
+* **`--resume` was already lossless; what was missing was something to do the
+  resuming.** `<scratch>/f6/rq.sh` wraps a job in a retry loop that re-invokes
+  it until its JSONL has the target number of rows. A SIGKILL now costs the
+  in-flight block and nothing else. Every long run on this file should be
+  wrapped this way; three of the eight agent deaths this workstream has
+  survived were not usage limits at all.
+
+## F41. The prediction battery, four rungs of search depth — the hypothesis is **half right, and the half that fails is the half it was named for**
+
+All cells `--ab X --base head` on `evalab-p25`, so the field is the shipped
+evaluator throughout. `<scratch>/f6/ab/w1_*`. Block counts in brackets; `*` =
+interval excludes zero. The four agents are F34k's ladder plus its missing rung:
+`greedy:64` (one ply), `mcts:256` (256 sims at the committed `c_puct = 2.0`,
+about one turn), `mcts:256:cp=0.05` (F37's cheap deep proxy), and
+`mcts:1024:cp=0.05` (the only one that really searches).
+
+| variant | term | `greedy:64` | `mcts:256` | `mcts:256:cp=.05` | **`mcts:1024:cp=.05`** |
+| --- | --- | --- | --- | --- | --- |
+| `temple = 1.0` | temple ↓ | **−0.59** * [800] | +0.16 [400] | **+1.49** * [400] | **+1.33** * [+0.84, +1.82] |
+| `temple = 1.2` | temple ↓ | −0.13 [800] | +0.19 [400] | **+0.94** * [400] | **+1.42** * [+0.96, +1.88] |
+| `board = 0.90` | board ↑ | −0.21 [800] | −0.09 [400] | — | +0.37 [−0.04, +0.78] |
+| `board = 1.00` | board ↑ | **−1.00** * [800] | **−0.70** * [184] | — | **+0.93** * [+0.47, +1.39] |
+| `liq = 1.3` | liquidation ↑ | **−0.32** * [800] | −0.19 [400] | — | **+0.52** * [+0.08, +0.96] |
+| `liq = 0.7` | liquidation ↓ | +0.16 [800] | −0.15 [400] | — | −0.32 [−0.75, +0.11] |
+| `engine = 1.3` | engine ↑ | +0.11 [800] | −0.22 [181] | — | −0.41 [−0.87, +0.05] |
+| `engine = 0.7` | engine ↓ | **−0.34** * [800] | −0.17 [168] | — | +0.11 [−0.28, +0.50] |
+| `monu = 0.0` | monument ↓ | +0.07 [800] | −0.05 [400] | +0.09 [400] | +0.24 [−0.18, +0.66] |
+| `monu = 0.5` | monument ↓ | **+0.11** * [800] | −0.02 [400] | +0.03 [400] | +0.21 [−0.18, +0.60] |
+| `held = 1.3` | held ↑ | **−0.26** * [800] | **−0.35** * [400] | — | −0.17 [−0.62, +0.28] |
+| `held = 0.7` | held ↓ | −0.18 [800] | −0.01 [400] | — | −0.04 [−0.51, +0.43] |
+| `starve = 0.7` | starvation ↓ | **−0.91** * [800] | −1.32 [25] | — | −0.19 [−0.62, +0.24] |
+| `ci = 0.3` | corn income ↑ | **−1.49** * [800] | −0.88 [26] | — | +0.06 [−0.40, +0.52] |
+
+**Every deep cell is 250 blocks** (1,000 games) and every `greedy:64` cell is
+800. The two `mcts:256:cp=0.05` cells that reached 400 blocks are shown; the
+others were stopped by F40's jetsam kill at 6-20 blocks and are not quoted.
+
+### Verdict on each of F34's five untested predictions
+
+1. **`liquidation` (concrete) should hold or want raising at depth** —
+   **CONFIRMED, and it is the hypothesis's one clean scalp outside the two terms
+   it was built on.** `liq = 1.3` is **−0.32 \*** on `greedy:64` at 800 blocks
+   and **+0.52 \* [+0.08, +0.96]** on the deep search at 250; `liq = 0.7` runs
+   the other way, +0.16 shallow and −0.32 deep. Both directions flip sign with
+   depth, on the term F34 named as the most concrete thing in the evaluator.
+2. **`held_premium` (concrete) should hold or want raising** — *"hold" only.*
+   Deep: −0.17 [−0.62, +0.28] up, −0.04 [−0.51, +0.43] down. Where `greedy:64`
+   has it at a two-sided optimum (−0.26 \* and −0.18), the deep search cannot
+   tell the three apart. The term is not mispriced at depth, it is **unused** at
+   depth. Nothing to raise.
+3. **`monument_outlook` (projected) should want shrinking** — *weakly
+   supported, nothing landable.* Both shrink variants are positive deep (+0.24,
+   +0.21) and neither excludes zero. What changed is that F34e's −0.20 \*, the
+   reason the deletion was refused, does not reproduce anywhere. See F42.
+4. **`starvation_risk`'s forecast should want shrinking** — **no.** −0.19
+   [−0.62, +0.24] deep against **−0.91 \*** on `greedy:64`. The *cost* of
+   shrinking it vanishes with depth; the *gain* the hypothesis predicted never
+   appears. `starvation_risk` is a forecast about a day up to eight rounds out —
+   further than this search descends — and the search neither verifies it nor
+   objects to it.
+5. **`CORN_INCOME_PER_ROUND = 0.0` should be more right at depth** — **the
+   prediction with the slope backwards.** `ci = 0.3` reads −1.49 \* on
+   `greedy:64`, −0.88 on `mcts:256`, −0.46 on the proxy, **+0.06 [−0.40, +0.52]
+   deep**: monotone *increasing* in depth over four rungs. F23 landed
+   `CORN_INCOME = 0` on a shallow agent for the reason F34 restates, and at
+   depth the constant simply stops mattering. The landing is not endangered —
+   0.0 is still the best value anyone has measured and the deep cell cannot
+   distinguish it from 0.3 — but "more right deep" is false, and the direction
+   of the error is the interesting part: **this is the same collapse-to-zero the
+   other four middle terms show, not a reversal.**
+
+### What the hypothesis gets, what it does not, and the sharper statement
+
+Score: **two of five predictions confirmed** (`liquidation`, and `monument` in
+sign only), one "hold, not raise" (`held`), two failed (`starvation_risk`,
+`CORN_INCOME`) — plus the two terms it was built on, both of which behave
+exactly as advertised and are the two largest effects in the table:
+
+* `temple_outlook` **down**: −0.59 \* at one ply, **+1.33 \*** deep, and the
+  cheap proxy predicted the deep number to within a fifth of a point on both
+  `temple = 1.0` and `temple = 1.2` — the first time in this file the proxy rung
+  has forecast a deep cell rather than merely agreed in sign.
+* `board_position` **up**: −1.00 \* at one ply, **+0.93 \*** deep, at 1.00.
+* And unpredicted but in the same direction, `engine_value` — the other pure
+  projection — **down**: `engine = 1.3` is +0.11 shallow and −0.41 deep,
+  `engine = 0.7` is −0.34 \* shallow and +0.11 deep. A fourth term whose sign
+  flips with depth, and the flip is projected-term-quieter.
+
+The four terms that do **not** order themselves by concreteness — `held`,
+`starve`, `ci`, and `monu` — share one signature instead: **their deep intervals
+straddle zero while their shallow ones do not.** They do not reverse; they
+*fade*. That is F34d's inert-knob signature arriving one rung later, and it is a
+different phenomenon from the sign flip that `temple`, `board`, `engine` and
+`liquidation` show.
+
+So the honest restatement, narrower than F34's and more useful:
+
+> **A deeper search disagrees with a shallow one about four terms and is
+> indifferent to the rest.** It wants `temple_outlook` and `engine_value` — the
+> two terms that price a future that has not happened — *quieter*, and
+> `board_position` and `liquidation` — the two that price what is on the board
+> and in the hand *now* — *louder*. On `held_premium`, `starvation_risk`,
+> `monument_outlook` and `CORN_INCOME_PER_ROUND` it has no opinion at all,
+> including where the shallow agent has a strong one.
+
+"Concrete versus projected" therefore survives as a **classifier of which terms
+the two agent classes will fight over**, and fails as a **predictor of the
+direction on every term**: `starvation_risk` is a projection that wants to stay,
+and the corn-income forecast's error shrinks with depth instead of growing. Four
+of the eight terms have now flipped sign between one ply and six turns of
+descent, all four in the direction F34 predicted; the other four went quiet.
+
+## F42. `monument_outlook`: the deletion is free on four agents, and F34e's −0.20 does not reproduce
+
+The brief carried "+0.19 [−0.01, +0.39] on `mcts:256` at 400 blocks" as the case
+for deleting the term; F33a retracted that number as measured on `evalab-p21`
+against a `board = 0.5` field, and F34e replaced it with **−0.20 [−0.39, −0.00]
+\*** on `mcts:256` against the then-shipped `board = 0.65` evaluator, and refused
+the deletion on that basis. Re-measured on `evalab-p25`, against `board = 0.8`:
+
+| variant | `greedy:64` | `mcts:256` | `mcts:256:cp=.05` | `mcts:1024:cp=.05` |
+| --- | --- | --- | --- | --- |
+| `monu = 0.0` (delete) | +0.07 [−0.07, +0.22] (800) | −0.05 [−0.26, +0.16] (400) | +0.09 [−0.21, +0.39] (400) | +0.24 [−0.18, +0.66] (250) |
+| `monu = 0.5` | **+0.11** [+0.02, +0.21] * (800) | −0.02 (400) | +0.03 (400) | +0.21 (250) |
+
+1,850 blocks across four agents, and the deletion is inside its interval on
+every one of them; the only cell in the whole set that excludes zero is
+`monu = 0.5` on `greedy:64` at **+0.11**, which is positive. **F34e's −0.20 was
+a `board = 0.65` result and does not survive the board landing** — a fifth
+instance of F31a, and this one cost a *refusal* rather than a landing.
+
+**Where that leaves it.** The number to beat is zero, and the deletion beats it
+nowhere and loses to it nowhere. This is not a win, it is a *simplification with
+no measured price*: `monument_outlook` is 33 lines and a constant
+(`MONUMENT_SHARE`) and a gate (`monument_gate`), it is 0.159 points of mean
+magnitude against the next-smallest term's 1.79 (F28d), and after this session
+it has been measured inert on `greedy:64` (F4, F18, twice more here),
+`mcts:256`, `mcts:256:cp=0.05` and `mcts:1024:cp=0.05`. **It is not deleted
+here** — the deep tier is the agent that ships, its cell is +0.24 with a ±0.42
+interval, and deleting a term on four nulls is a judgement about code, not a
+measurement. It is recorded as the cheapest simplification available with the
+strongest evidence any inert term in this file has: nothing above.
+
+## F43. The F31a cancelling-pair audit, re-run against `board = 0.8` — `greedy:64` half
+
+Brief item 3: every constant whose doc comment justifies it as correcting or
+damping another was swept against an evaluator that no longer exists, and
+`BOARD_SCALE` 0.65 → 0.8 moved the very term they all cancel against. Re-run,
+`--ab X --base head` on `evalab-p25`, **800 blocks** a cell,
+`<scratch>/f6/ab/w3_*_greedy64.jsonl`:
+
+| knob | pair it is supposed to cancel | value | `greedy:64`, 800 blk |
+| --- | --- | --- | --- |
+| `av` (`ACTION_VALUE`) | `board_position` already prices the placed worker's action | 0.0 | **+0.01 [−0.02, +0.05]** |
+| | | 0.4 | −0.02 [−0.06, +0.02] |
+| `acap` (`ROUNDS_PER_ACTION` cap) | the same double count, from the other side | 3.0 | **−0.00 [−0.03, +0.02]** |
+| `tempo` (`TEMPO_PER_ROUND`) | scales the ride `BOARD_SCALE` then rescales | 0.44 | −1.30 [−1.56, −1.04] * |
+| | | 0.60 | **+1.17 [+0.89, +1.46] \*** |
+| `chi` (`GEAR_SCALE[Chichen]`) | `SKULL_PREMIUM`'s `dead` column | 0.6 | −0.75 [−0.97, −0.54] * |
+| | | 0.8 | −0.51 [−0.71, −0.31] * |
+| `pal` (`GEAR_SCALE[Palenque]`) | `HUNGRY_CORN` (F34i: one d.o.f., not two) | 1.35 | +0.14 [−0.15, +0.44] |
+| | | 1.65 | −1.89 [−2.14, −1.64] * |
+| `ufl` (`urgency` floor) | damps a distant shortfall | 0.1 | **+0.0000 in all 656 blocks** |
+| | | 0.5 | −0.15 [−0.45, +0.15] |
+| `sn2` (`starve_next2`) | the *second* food day | 0.75 | **+1.39 [+1.12, +1.65] \*** |
+
+**Nothing in the cancelling set moved when the term it cancels grew by 23%.**
+`ACTION_VALUE`'s plateau is still a plateau and still reaches zero (+0.01 ± 0.04
+at `av = 0`, on 800 blocks); `action_cap` is still exactly inert; `chi = 0.7` and
+`pal = 1.5` are still unimodal optima with the same cliff above Palenque. The
+audit's conclusion is therefore the dull one, and it is the answer to item 3:
+**these constants are not coupled to `BOARD_SCALE` at all.** F34a measured them
+on `board = 0.65` and this measures them on `board = 0.8`, and the two tables
+agree cell for cell.
+
+### F43a. `URGENCY_FLOOR` is unreachable — dead code, proved rather than measured
+
+`ufl = 0.1` reading **+0.0000 in every one of 656 blocks** is not a small
+effect, it is an identity, and the arithmetic says why. `starvation_risk` uses
+
+```rust
+let urgency = (1.0 / (1.0 + rounds * 0.25)).max(0.3);
+```
+
+where `rounds = next - g.day` and `next` is the next of
+`RESOURCE_DAYS = [8, 21]` / `POINT_DAYS = [14, 27]`. The largest gap a live
+position can have is the run-up to day 8, so `rounds ≤ 8`, and
+
+    1 / (1 + 0.25 × 8) = 0.3333 > 0.3
+
+**The floor can never bind.** It is one `.max()` and one constant that no
+position in any game reaches, and `ufl = 0.5` — the first value that *does*
+bind — reads −0.15 [−0.45, +0.15], so the mechanism it was written for is worth
+nothing either. This is the cheapest deletion in the file after
+`monument_outlook` and, unlike that one, it cannot change a single evaluation.
+
+### F43b. `TEMPO_PER_ROUND` and `starve_next2` are the two live shallow disagreements
+
+Both are large, both are `greedy:64`, and F34g already established that the
+`tempo` peak is a one-ply artefact that `mcts:256` reads with the opposite sign.
+`sn2 = 0.75` at **+1.39 \*** on 800 blocks is the biggest single-knob shallow
+gain measured this session and has never had a deep number; F26g fitted it on
+`greedy:64` and it was never landed. Both are in the deep queue (`w3_tempo060`,
+`w3_sn2_075` at 250 blocks on `mcts:1024:cp=0.05`). **Neither lands on a
+`greedy:64` number**, for exactly F34g's reason.
+
+## F44. The board and temple curves on `greedy:64`, and the shape package's shallow price
+
+`--base head` on `evalab-p25`, **800 blocks** a cell, `<scratch>/f6/ab/w4_*`,
+`w5_*`. This is the column the deep tier has to be worth paying.
+
+```
+  board     0.80    0.90    1.00     1.10     1.20
+  greedy:64  null   -0.21   -1.00*   -1.53*   -2.43*
+
+  temple    0.90    1.00    1.10    1.20    1.40
+  greedy:64 -1.25*  -0.59*  -0.43*  -0.13    null
+
+  liq       0.70    1.00    1.30    1.50
+  greedy:64 +0.16    null   -0.32*  -0.70*
+```
+
+All three curves are monotone away from the committed value, which is what a
+constant sitting at its shallow optimum looks like — `BOARD_SCALE = 0.8` is the
+last value on the flat part of `greedy:64`'s curve and everything above falls
+off at about a point per 0.1. Packages:
+
+| package | `greedy:64`, 800 blk |
+| --- | --- |
+| `board = 0.9, temple = 1.1` | −0.71 [−1.00, −0.41] * |
+| `board = 0.9, temple = 1.2, liq = 1.3` | −1.03 [−1.33, −0.74] * |
+| `board = 1.0, temple = 1.1, liq = 1.3` | −1.95 [−2.27, −1.64] * |
+| `board = 0.7, temple = 1.7` (the anti-shape control) | −0.25 [−0.51, +0.01] |
+
+**The shallow cost is roughly additive** (−0.21 + −0.43 = −0.64 against −0.71
+measured; −0.21 + −0.13 + −0.32 = −0.66 against −1.03; −1.00 + −0.43 + −0.32 =
+−1.75 against −1.95), so on `greedy:64` these terms do not interact — which
+makes the deep cells a clean test of whether they interact *there*.
+
+## F45. The anti-shape control: rotating the evaluator the wrong way costs the deep search **−2.44** and the shallow one nothing
+
+This is the measurement that decides whether "shape" is a real axis or a story
+told about two independent tunings. `--base head` on `evalab-p25`, ~250 blocks a
+cell on each agent:
+
+| package | what it does | `greedy:64` (800) | **`mcts:1024:cp=0.05`** (250) | deep win |
+| --- | --- | --- | --- | --- |
+| `board = 0.9, temple = 1.1` | concrete **up**, projected **down** | **−0.71** [−1.00, −0.41] * | **+1.70** [+1.23, +2.17] * | 0.306 |
+| `board = 0.7, temple = 1.7` | concrete **down**, projected **up** | −0.25 [−0.51, +0.01] | **−2.44** [−2.93, −1.95] * | **0.174** |
+
+**A 4.1-point spread on the deep search between two packages that are 0.5 points
+apart on the shallow one**, and the shallow agent cannot distinguish the
+anti-shape package from the evaluator it was fitted on. The deep win rate falls
+to **0.174** against a null of 0.250 — the anti-shape evaluator loses more than a
+quarter of the games it should win.
+
+Two things this settles that F37a could only gesture at:
+
+* **It is not magnitude.** F37a's `temple = 1.6` control had one arm; this has
+  both, and they are symmetric about the committed point in the two constants
+  that matter. The rival explanation — a deep search rewards a wider spread in
+  `margin` because `eval::heuristic` is its prior — predicts the same sign for
+  both packages, since both change the spread. They have opposite signs.
+* **It is not `board` alone or `temple` alone.** Deep, the parts are +0.37
+  (`board = 0.9`) and +1.30 (`temple = 1.1`), summing to +1.67 against +1.70
+  measured; shallow they are −0.21 and −0.43, summing to −0.64 against −0.71
+  measured. **The package is additive in both regimes and changes sign between
+  them**, which is what "one axis, two agents disagreeing about its direction"
+  looks like and is not what two unrelated constants look like.
+
+`temple = 1.1` on its own is **+1.30 [+0.84, +1.75] \*** deep and −0.43 * on
+`greedy:64`: three temple values (1.0, 1.1, 1.2) now read +1.33, +1.30, +1.42
+deep and −0.59, −0.43, −0.13 shallow, so the deep tier has a **flat top from 1.0
+to 1.2** and the shallow cost is smallest at the top of that range.
+
+### F45a. The three-agent table for the shape packages, at full block count
+
+`--base head` on `evalab-p25`. Deep cells are **400 blocks** now, not 250.
+
+| package | `greedy:64` (800) | `mcts:256` (400) | **`mcts:1024:cp=0.05`** (400) | deep win |
+| --- | --- | --- | --- | --- |
+| **`board = 0.9, temple = 1.1`** | −0.71 [−1.00, −0.41] * | **−0.09 [−0.47, +0.30]** | **+1.67 [+1.29, +2.06] \*** | **0.318** |
+| `temple = 1.1` alone | −0.43 [−0.67, −0.18] * | +0.27 [−0.17, +0.70] (255) | **+1.40 [+1.03, +1.77] \*** | 0.273 |
+| `board = 0.7, temple = 1.7` (anti) | −0.25 [−0.51, +0.01] | **−0.62 [−0.98, −0.27] \*** | **−2.23 [−2.61, −1.85] \*** | 0.185 |
+
+**`mcts:256` is the tell.** On the anti-shape package it is −0.62 \*, on the
+shape package it is −0.09 — the middle rung already prefers the shape direction
+by half a point, with the sign of the deep result and none of its size. The
+ladder is monotone in depth for all three rows, in both directions.
+
+### F45b. The curves at depth, and where each one turns over
+
+```
+  board       0.80   0.90    1.00    1.10    1.20
+  greedy:64   null  -0.21   -1.00*  -1.53*  -2.43*      (800 blk)
+  deep        null  +0.37   +0.93*  +1.01*  +0.43       (250-400 blk)
+
+  temple      0.70   0.90    1.00    1.10    1.20   1.40
+  greedy:64  -4.02* -1.25*  -0.59*  -0.43*  -0.13   null   (800 blk)
+  deep       (run)  +1.74*  +1.33*  +1.40*  +1.42*  null   (250-400 blk)
+
+  liq         0.70   1.00    1.30    1.50
+  greedy:64  +0.16   null   -0.32*  -0.70*             (800 blk)
+  deep       -0.32   null   +0.52*  +0.37              (250 blk)
+```
+
+* **`BOARD_SCALE` has a deep peak at about 1.0-1.1** (+0.93 and +1.01, both \*)
+  and turns over by 1.2 (+0.43, interval touches zero). The shallow curve is
+  monotone down from 0.8. So the two optima are 0.8 and ~1.05, and the gap
+  between them is what F34c called "the one axis still moving".
+* **`TEMPLE_SCALE`'s deep curve is flat from 0.9 to 1.2** at +1.3 to +1.7 while
+  the shallow one falls the whole way, and falls off a **cliff** at 0.7:
+  −4.02 \* on `greedy:64`, the largest single-knob loss measured this session.
+  So there is a floor under how far the projected term can be quietened, and
+  `greedy:64` finds it long before the search does.
+* **`liquidation` is the small one**: +0.52 \* deep at 1.3, +0.37 at 1.5, so it
+  is rising then flattening, and it costs −0.32 \* shallow.
+
+**Combining more than two of them stops paying.** `board = 1.0, temple = 1.1,
+liq = 1.3` is +1.44 \* deep (250) where the parts sum to +2.75, and it costs
+−1.95 \* on `greedy:64`; `board = 0.9, temple = 1.2, liq = 1.3` is +0.88 \* deep
+(149) against a −1.03 \* shallow cost. **The two-knob package
+`board = 0.9, temple = 1.1` is the best deep gain per unit of shallow cost in
+the set, and it is the only one that costs `mcts:256` nothing.**
+
+## F46. The deepest rung reachable in `evalab`: `mcts:4096:cp=0.02`, and the effect keeps growing
+
+`--base head` on `evalab-p25`. The deliverable is `mcts:8192:heuristic:deeper`
+(`cp=0.02, pmin=2`), which `bin/evalab` cannot spell (F27d); `mcts:4096:cp=0.02`
+is the closest it reaches, at 45.6 s of user CPU a block against
+`mcts:1024:cp=0.05`'s 9.3.
+
+| package | `mcts:1024:cp=0.05` (400) | **`mcts:4096:cp=0.02`** | deep win |
+| --- | --- | --- | --- |
+| `board = 0.9, temple = 1.1` | +1.67 [+1.29, +2.06] * | **+2.32 [+0.84, +3.80] \*** (22) | **0.375** |
+| `board = 0.7, temple = 1.7` | −2.23 [−2.61, −1.85] * | **−2.68 [−4.44, −0.92] \*** (22) | **0.108** |
+
+22 blocks is far under F30e's bar and these are quoted as *sign and direction
+only* — but the direction is the one that matters: **the effect does not level
+off between 1,024 and 4,096 simulations, it grows**, in both directions, and the
+win rates at the deeper rung (0.375 and 0.108 against a null of 0.250) are the
+most extreme in this file. Running to 150.
+
+### F46a. `temple_outlook`'s deep plateau reaches all the way down to 0.7
+
+| `temple` | 0.7 | 0.9 | 1.0 | 1.1 | 1.2 | 1.4 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `greedy:64` (800) | **−4.02** * | −1.25 * | −0.59 * | −0.43 * | −0.13 | null |
+| `mcts:1024:cp=0.05` | +1.36 * (190) | +1.74 * (250) | +1.33 * (250) | +1.40 * (400) | +1.42 * (250) | null |
+
+**Five values spanning half the term's weight, every one of them worth about
++1.4 to the deep search, and the shallow agent's loss over the same range grows
+to four points.** That is not a peak the two agents disagree about the location
+of; it is a *plateau* for one agent and a *cliff* for the other. The deep search
+is close to indifferent to `TEMPLE_SCALE` anywhere below 1.2 and strictly
+prefers all of it to the committed 1.4.
+
+### F46b. The cancelling-pair audit's deep half: nothing survives the crossing
+
+`--base head`, ~90 blocks each so far, `mcts:1024:cp=0.05`, against the
+`greedy:64` cell for the identical variant (800 blocks):
+
+| variant | `greedy:64` | `mcts:1024:cp=0.05` |
+| --- | --- | --- |
+| `av = 0.0` (`ACTION_VALUE` deleted) | +0.01 [−0.02, +0.05] | −0.03 [−0.47, +0.41] (88) |
+| `tempo = 0.60` | **+1.17 [+0.89, +1.46] \*** | +0.05 [−0.91, +1.00] (67) |
+| `sn2 = 0.75` (second food day) | **+1.39 [+1.12, +1.65] \*** | −0.43 [−1.23, +0.37] (91) |
+| `climb = 0.2` | +0.13 * (F34h) | −0.08 [−0.73, +0.57] (93) |
+| `rs = 0.5` (`RESEARCH_SCALE` x10) | (F20: −ve) | −0.13 [−0.81, +0.55] (92) |
+
+**Both of F43b's live shallow gains die at depth.** `TEMPO_PER_ROUND = 0.60` is
++1.17 \* at one ply and +0.05 on the search; `starve_next2 = 0.75` is +1.39 \*
+at one ply and −0.43 on the search. Neither lands, for F34g's reason, now
+measured on the deep tier rather than argued from `mcts:256`. `TEMPLE_CLIMB`'s
++0.13 — the one positive cell in F34's whole audit — is also a `greedy:64`
+effect. And `ACTION_VALUE = 0` is inert on the deep tier too, which makes it
+inert on all four agents: **it is a deletion candidate on every agent measured,
+and the only reason not to take it is that deleting it changes nothing.**
