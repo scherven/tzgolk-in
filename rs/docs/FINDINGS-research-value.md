@@ -213,3 +213,23 @@ consults the evaluator.
 Dose-response arms (`res=A1` vs `res=A3`, `temple=6` vs `temple=10`, `build=3`
 vs `build=5`) are in the main wave so the per-turn slope is measured rather than
 divided out of one point.
+
+## The main wave — `bin/rlab-r3`, `heuristic:full`, seeds 700000+
+
+### R4. The null, at 48 blocks: **+0.079 [−0.108, +0.267]**
+
+`--force none`, 48 rotation blocks (192 games), `<scratch>/rv/out/w_null.jsonl`.
+Win rate 0.250 against a null of 0.250. Every arm below is read against this.
+
+What a seat of `heuristic:full` does when nobody is forcing it, per game — this
+is the baseline every treatment column moves away from:
+
+| research levels (of 12) | tracks maxed | buildings | monuments | temple sum | workers placed | corn paid to place | corn held (integral) | turns begged | score |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1.27 | 0.11 | 2.80 | 0.07 | 12.95 | 19.36 | 12.71 | 108.1 | 2.07 | 49.7 |
+
+The monument column is the one to keep in view: **a seat takes 0.07 monuments a
+game**, and monuments #11 and #12 — the two that pay for research — are
+constructed at **Tikal 4**, the same gear whose spaces 1 and 3 sell the research
+in the first place, off the same six-space ride. The payoff and its price
+compete for one worker on one gear.

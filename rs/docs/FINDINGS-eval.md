@@ -4723,26 +4723,114 @@ over 8,208 pairs, and the F39 detector says what it should: it writes
 
 `--base head`, `greedy:64`, on the fixed engine:
 
-| `rs` | old engine (`0fd36d9`, 800 blk) | **fixed engine (`9bfcb6e`)** |
+| `rs` | old engine (`0fd36d9`, 800 blk) | **fixed engine (`9bfcb6e`, ~500 blk)** |
 | --- | --- | --- |
-| 0.0 | +0.06 [−0.00, +0.13] | −0.05 [−0.16, +0.07] (161) |
-| 0.15 | +0.01 [−0.08, +0.10] | −0.19 [−0.43, +0.05] (162) |
-| 0.50 | −0.85 * | −0.44 [−0.98, +0.11] (140) |
-| **1.00** | **−4.28 \*** | **−4.36 \*** [−5.07, −3.65] (183) |
-| `tik5 = 1.5` | +0.63 * | +0.53 [−0.01, +1.08] (194) |
+| 0.0 | +0.06 [−0.00, +0.13] | −0.02 [−0.09, +0.05] |
+| 0.15 | +0.01 [−0.08, +0.10] | −0.12 [−0.25, +0.01] |
+| 0.50 | −0.85 * | −0.77 * [−1.07, −0.46] |
+| **1.00** | **−4.28 \*** | **−4.19 \*** [−4.62, −3.75] |
+| `tik5 = 1.5` | +0.63 * | +0.43 * [+0.09, +0.78] |
+
+and `mcts:1024:cp=0.05` on the fixed engine, thin at 24-25 blocks but the right
+sign: `rs = 0.5` −0.15 [−1.51, +1.20], `rs = 1.0` **−1.64 \*** [−3.25, −0.04],
+against −0.43 and −1.01 * at 250 blocks on the old one.
 
 And the behavioural half, `--uptake` on the fixed engine, 162-184 blocks:
 
 | | old engine | fixed engine |
 | --- | --- | --- |
-| baseline levels | 1.242 | **1.335** |
-| baseline tracks maxed | 0.019 | **0.039** |
-| Δ levels at `rs = 1.0` | +2.105 * | +2.071 * |
-| centred at `rs = 1.0` | −4.33 * | **−4.37 \*** |
+| baseline levels | 1.242 | **1.311** |
+| baseline tracks maxed | 0.019 | **0.033** |
+| Δ levels at `rs = 1.0` | +2.105 * | +2.099 * |
+| centred at `rs = 1.0` | −4.33 * | **−4.43 \*** |
+
+(both at 300 blocks)
 
 **The rules fixes did make research better and they did not make it worth
 buying.** Baseline uptake rises 7% in levels and *doubles* in maxed tracks —
 which is the fixes doing exactly what their author said they would — and the
 price of over-valuing research is unchanged to within a twentieth of a point.
 Every conclusion in F51-F57 stands on the corrected engine.
+
+## F59. What landed
+
+**No constant moved.** `RESEARCH_SCALE` stays at 0.05, `GEAR_SCALE` stays at
+`[1.5, 1.0, 1.0, 1.0, 0.7]`, `uses` stays `(rounds_left / 3).min(7)`. Nine
+candidates were swept and every one of them is null or negative on the agent
+that ships. What landed is the evidence and the guard rails.
+
+**`src/eval.rs` — comment-only, verified: `git diff src/eval.rs` contains no
+non-comment line.**
+
+1. **`RESEARCH_SCALE`'s doc comment**, rewritten. It carried the claim that
+   `--promise` located the over-pricing, which F51 shows the diagnostic cannot
+   do for this term. It now carries the three-agent curve, the uptake numbers,
+   the circularity measurement, and the statement that depth is a *substitute*
+   for getting this constant right rather than a magnifier of it.
+2. **A note on `uses`** in `engine_value` recording that the shape was tested
+   and that the treatment and its anti-control land on top of each other
+   (+0.00 / −0.00 at ±0.09, 800 blocks each). The cap is deliberate.
+3. **A note on the `lvl == 2` bonus** recording *why* it and every convexity
+   term are inert: a track reaches level 3 in 1.9% of player-games.
+4. **A note on `monument_outlook`'s `pays <= 0` gate**, which makes monuments
+   #11 and #12 invisible to a player with an empty research row. Paying that
+   option explicitly is −0.13 * / −0.43 * at 0.4 / 0.8.
+
+**`tests/rules.rs` —
+`evaluator_prices_a_whole_research_row_at_about_two_and_a_half_points`.** Pins
+the quantity the sweeps varied: twelve research levels on day 0 are worth about
+2.6 points; `uses` is flat over days 0..=6, strictly decreasing after, and
+linear in `rounds_left`. Four separate things can move that silently — the
+twelve `research_step_value` entries, `RESEARCH_SCALE`, the horizon, and the
+`lvl == 2` bonus — and any of them invalidates F54 and F57.
+
+**`src/bin/evalab.rs` — four new tools, all of which earned their keep here.**
+
+* **`--uptake`** — plays the same rotation blocks and reports **final research
+  levels** per seat plus a day-14 snapshot, not only score. This is the tool
+  that answers "did behaviour change or only the number", and it is the one that
+  turned "the champion never researches" from an observation into a measurement.
+  Generalises: any term whose claim is behavioural can be checked this way.
+* **`--pvar`** on `--promise` and `--terms` — runs a diagnostic under a
+  *different* evaluator. On `--promise` it is what makes the diagnostic
+  falsifiable (F51); on `--terms` the difference of two runs is a term's exact
+  contribution (F53).
+* **`mcts:N:cp=X:pmin=K`** — closes F49's first open item. `bin/evalab` can now
+  spell `mcts:8192:cp=0.02:pmin=2`, which is the deliverable.
+* **`rdiv` / `rcap` / `rpow` / `rtop` / `rmonu`** — the research shape and
+  convexity knobs, all inert at HEAD's values (null +0.0000 in 40 blocks).
+
+**State.** `cargo test --release` in a pristine export of `9bfcb6e` plus this
+landing: **194 passed, 0 failed** (186 at the brief's `0fd36d9`, +7 from the
+rules audit, +1 mine). Note that the shared working tree does **not** build
+right now: `src/bin/rlab.rs`, an untracked file from a third workstream, fails
+on `AgentSpec`'s private `name` field. Nothing of mine touches it.
+
+## F60. What did not work, with the number that killed each
+
+* **`RESEARCH_SCALE` up.** Every value above the 0.0-0.15 plateau loses on both
+  `greedy:64` (800 blk) and `mcts:1024:cp=0.05` (250 blk). Not one cell on
+  either agent is distinguishably positive. F57.
+* **`RESEARCH_SCALE = 0.0`.** The largest positive cell on both agents (+0.06,
+  +0.28) and neither interval excludes zero. Not taken: deleting the term is the
+  only way to make a research track worth literally nothing to the search, and
+  the tie-break costs nothing.
+* **Every alternative shape for `uses`** — uncap, convex tilt, concave tilt,
+  and two "research hard then stop" curves. The tilt reads +0.00 and its mirror
+  −0.00 at ±0.09 over 800 blocks; at larger magnitudes the tilted variant is
+  always slightly *worse* than the flat one of the same magnitude. F55.
+* **`rtop`** (convexity in finished tracks, for monument #11's 9/20/33):
+  +0.01 [+0.00, +0.02] at 800 blocks. Distinguishable and worth a hundredth of a
+  point, because tracks reach level 3 in 1.9% of games.
+* **`rmonu`** (pay the option on a face-up research monument): −0.13 * at 0.4,
+  −0.43 * at 0.8, while raising final levels +0.23 *. F55.
+* **`tik5 = 1.5`** — the one candidate that looked real: **+0.63 \*** on
+  `greedy:64` at 800 blocks with a genuine optimum (1.3 is +0.68 *, 2.0 is
+  −1.24 *), and **free on both search agents** (−0.04 at 274 blocks on
+  `mcts:256`, +0.03 at 67 deep). A one-ply-only gain. F56a.
+* **`tik1 = 1.5`** — +0.25 * greedy, **−0.27 \*** `mcts:256`. F56a.
+* **`tik = 1.15`** (the whole gear) — +0.20 greedy, **−0.54 \*** `mcts:256`.
+* **The hypothesis that a deeper search wants research priced higher.** It wants
+  it priced the same, and it is hurt about a quarter as much when it is priced
+  wrong. F57.
 

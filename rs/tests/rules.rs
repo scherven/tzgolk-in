@@ -1334,6 +1334,7 @@ fn ui_renders_at_many_sizes() {
                         source,
                         autoplay: false,
                         status: "x".repeat(200),
+                        focus: None,
                     };
                     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
                     term.draw(|f| ui::draw(f, &app))
@@ -1407,6 +1408,7 @@ fn ui_renders_while_thinking_and_after_a_search() {
                         source,
                         autoplay: false,
                         status: "x".repeat(200),
+                        focus: None,
                     };
                     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
                     term.draw(|f| ui::draw(f, &app))
@@ -1440,6 +1442,7 @@ fn selection_stays_on_a_real_row() {
         last_played: None,
         selected: 0,
         source: tzolkin::ui::MoveSource::Full,
+        focus: None,
         autoplay: false,
         status: String::new(),
     };

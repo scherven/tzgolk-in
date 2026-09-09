@@ -423,7 +423,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     // need five interior rows, and there is no half a ring, so below fourteen
     // it keeps the flat rows and the two panels under it keep their height.
     let lh = body[0].height;
-    let bh = if lh >= 14 { (lh * 4 / 9).clamp(9, 13).min(lh) } else { 7.min(lh) };
+    // Five rings in five rows are no taller than the five flat rows they
+    // replace, so the panel asks for its ring height at every size and only
+    // *width* sends it back to rows.
+    let bh = (lh / 2).clamp(7, 13).min(lh);
     let rest = lh - bh;
     // Players is a five-row table plus its border and never wants more; the
     // remainder falls through to Cards.
@@ -1094,7 +1097,13 @@ fn ring(gear: Gear) -> (usize, usize, &'static [(usize, usize)]) {
 /// rate. Only the glyph survives a screen dump, which is the one form of this
 /// panel that gets reviewed.
 fn space_cell(g: &GameState, gear: Gear, pos: Pos, marks: &Marks, cw: usize) -> Span<'static> {
-    let pad = |s: String, st: Style| Span::styled(format!("{s:^cw$}"), st);
+    // Truncated, not just padded: `10*` in a two-column cell shifted every
+    // space to its right by one and the ring stopped lining up with its own
+    // header.
+    let pad = |s: String, st: Style| {
+        let s: String = s.chars().take(cw).collect();
+        Span::styled(format!("{s:^cw$}"), st)
+    };
     if let Some((arriving, c)) = marks.at(gear, pos) {
         let body = if cw >= 3 {
             format!("{}{c}{}", if arriving { '+' } else { '-' }, if arriving { '+' } else { '-' })
@@ -1122,8 +1131,15 @@ fn space_cell(g: &GameState, gear: Gear, pos: Pos, marks: &Marks, cw: usize) -> 
             )
         }
         // A spent Chichen skull space, a free-choice space, or an empty one.
-        None if gear == Gear::Chichen && g.chichen_is_full(pos) => pad("x".into(), dim()),
-        None if crate::spaces::is_free_choice(gear, pos) => pad("*".into(), label()),
+        // The marker never replaces the number: the space list under the rings
+        // is indexed by it, and `*` alone left two rows of that list with
+        // nothing on the ring to match them to.
+        None if gear == Gear::Chichen && g.chichen_is_full(pos) => {
+            pad(format!("{}x", pos.0), dim())
+        }
+        None if crate::spaces::is_free_choice(gear, pos) => {
+            pad(format!("{}*", pos.0), label())
+        }
         None => pad(pos.0.to_string(), dim()),
     }
 }
@@ -1134,19 +1150,23 @@ fn board(f: &mut Frame, area: Rect, app: &App, marks: &Marks, focus: Gear) {
     let g = &app.game.state;
     let w = area.width.saturating_sub(2) as usize;
     let h = area.height.saturating_sub(2) as usize;
+    // Nothing below this can lay anything out, and `clamp(16, w)` panics
+    // outright once `w` drops under its floor.
+    if w < 8 || h == 0 {
+        f.render_widget(boxed("Board"), area);
+        return;
+    }
 
-    // Five rings side by side: four three-wide plus Chichen's four, and a gap
-    // between each. Three columns per space fits `+Y+`; two fits `+Y` and
-    // Chichen's `10`; below that there is no ring and the rows come back.
-    let gaps = 4;
-    let cw = if 16 * 3 + gaps * 2 <= w {
-        3
-    } else if 16 * 2 + gaps <= w {
-        2
-    } else {
-        0
-    };
-    let gap = if cw >= 3 { 2 } else { 1 };
+    // Five rings side by side: four three columns wide plus Chichen's four, and
+    // a gap between each. Three columns per space fits `+Y+` and `10*`; two
+    // fits `+Y` and `10`; below that there is no ring and the flat rows come
+    // back. The gap is given up before the cell is, because a narrower cell
+    // costs a marker and a narrower gap costs only air — at a hundred columns
+    // that one character is the difference between `+Y+` and `+Y7*`.
+    let (cw, gap) = [(3, 2), (3, 1), (2, 1), (2, 0)]
+        .into_iter()
+        .find(|&(c, g)| 16 * c + 4 * g <= w)
+        .unwrap_or((0, 0));
 
     let mut lines: Vec<Line> = Vec::new();
     if cw > 0 && h >= 5 {
@@ -1159,7 +1179,10 @@ fn board(f: &mut Frame, area: Rect, app: &App, marks: &Marks, focus: Gear) {
             // Short names below sixty columns: `Yaxchilan` alone is wider than
             // its two-column ring.
             let name = if cw >= 3 { gear.name() } else { &gear.name()[..3] };
-            let name = fit(name, width);
+            // Bracketed rather than only bolded: which gear the list below
+            // describes has to be readable in a screen dump, which carries no
+            // colour and no weight.
+            let name = fit(&if on { format!("[{name}]") } else { name.to_string() }, width);
             names.push(Span::styled(
                 format!("{name:^width$}{:gap$}", ""),
                 if on {
@@ -1196,10 +1219,20 @@ fn board(f: &mut Frame, area: Rect, app: &App, marks: &Marks, focus: Gear) {
         }
     } else {
         // No room for rings. The flat rows this panel always drew, which carry
-        // the move markers just the same.
+        // the move markers just the same — shortened rather than clipped, since
+        // clipping cut Chichen's five highest spaces off the right edge and
+        // those are the ones worth points.
+        let mut nw = 13;
+        let mut fcw = 3;
+        if nw + 11 * fcw > w {
+            nw = 4;
+        }
+        if nw + 11 * fcw > w {
+            fcw = 2;
+        }
         for gear in Gear::ALL {
             let mut spans = vec![Span::styled(
-                format!("{:<13}", gear.name()),
+                format!("{:<nw$}", fit(gear.name(), nw - 1)),
                 if gear == focus {
                     Style::default().fg(ratatui::style::Color::White).add_modifier(Modifier::BOLD)
                 } else {
@@ -1207,54 +1240,119 @@ fn board(f: &mut Frame, area: Rect, app: &App, marks: &Marks, focus: Gear) {
                 },
             )];
             for pos in 0..gear.size() {
-                spans.push(space_cell(g, gear, Pos(pos), marks, 3));
+                spans.push(space_cell(g, gear, Pos(pos), marks, fcw));
             }
             lines.push(Line::from(spans));
         }
     }
 
-    // One line for the Palenque stacks and the two markers. The stacks are the
-    // one thing the labels cannot say: `choices_at` reports that space 3 still
-    // offers wood, not that it offers it twice more.
-    let tiles: String = (2..=5)
+    // The focused gear's spaces. Columns are sized by the longest label rather
+    // than by a fixed count: two columns of thirty-four print a small gear's
+    // labels whole, and squeezing them into three to save a row turned
+    // `research+1 ×1-2, -blk` into `research+1 …2, -blk`, which is the middle
+    // of the panel's whole job.
+    let n = focus.size() as usize;
+    let cur = g.current;
+    let cells: Vec<(String, bool)> = (0..n)
         .map(|i| {
-            let t = g.palenque[i];
-            format!("{i}:{}w{}c ", t.wood, t.corn)
+            let info = space_info(g, cur, focus, Pos(i as u8));
+            (format!("{i:>2} {}", info.label), info.live)
         })
         .collect();
-    let key = format!("+ placed  - taken   Palenque tiles {tiles}");
-    if lines.len() < h {
-        lines.push(Line::from(Span::styled(fit(&key, w), dim())));
-    }
+    let want = (cells.iter().map(|(t, _)| t.chars().count()).max().unwrap_or(10) + 2).clamp(16, w);
+    let cols = (w / want).clamp(1, n);
+    // The key line comes out of the table's budget, not the other way round:
+    // with one spare row and eight spaces, sizing the columns to fit the table
+    // instead produced eight six-column cells reading `…ter  …blk  …orn`.
+    let room = h.saturating_sub(lines.len() + 1);
+    let rows = n.div_ceil(cols);
+    // A table is only shown whole. A partial one looks complete — there is
+    // nothing on a truncated column to say four more spaces exist — so a panel
+    // that cannot hold all of them flows the labels as a sentence instead,
+    // which ends in an ellipsis when it runs out of room.
+    let tbl = if rows <= room { rows } else { 0 };
+    let colw = w / cols;
 
-    // The focused gear's spaces, in as many columns as the rows left over
-    // need. Chichen's eleven go three across; a small gear's eight go two.
-    let left = h.saturating_sub(lines.len());
-    if left > 0 {
-        let n = focus.size() as usize;
-        let cols = n.div_ceil(left).max(1);
-        let rows = n.div_ceil(cols);
-        let colw = (w / cols).max(6);
-        let cur = g.current;
-        let cells: Vec<(String, bool)> = (0..n)
+    // Two reference lines, taken only out of what the table did not want. The
+    // Palenque stacks are the one thing the labels cannot say: `choices_at`
+    // reports that space 3 still offers wood, not that it offers it twice more.
+    let spare = h.saturating_sub(lines.len() + tbl);
+    if spare >= 1 {
+        let tiles: String = (2..=5)
             .map(|i| {
-                let info = space_info(g, cur, focus, Pos(i as u8));
-                (fit(&format!("{i:>2} {}", info.label), colw - 1), info.live)
+                let t = g.palenque[i];
+                let _ = i;
+                format!("{}w{}c ", t.wood, t.corn)
             })
             .collect();
-        for r in 0..rows.min(left) {
+        // Terse because at a hundred columns the long form elided its own
+        // middle and took two of the four Palenque stacks with it. The stacks
+        // are spaces 2-5 in order, which is what the ring above shows.
+        let key = format!("+placed -taken  Palenque 2-5 {tiles}");
+        lines.push(Line::from(Span::styled(fit(&key, w), dim())));
+    }
+    // Where the workers on the focused gear are in their lap. A gear advances
+    // one space a day and a worker riding off the end goes back to its owner's
+    // hand, so `size - pos` is exactly how many more days it has on the board —
+    // deterministic, and the thing a player is actually planning around.
+    if spare >= 2 {
+        let rides: Vec<Span> = (0..focus.size())
+            .filter_map(|i| {
+                let w = g.gears[focus.idx()].at(Pos(i))?;
+                let c = g.players[w.owner().idx()].color;
+                Some(Span::styled(
+                    format!("{c}@{i} {}d  ", focus.size() - i),
+                    Style::default().fg(colour(c)),
+                ))
+            })
+            .collect();
+        let head = if rides.is_empty() {
+            "rides  nobody on this gear".to_string()
+        } else {
+            "rides  ".to_string()
+        };
+        let mut spans = vec![Span::styled(head, dim())];
+        spans.extend(rides);
+        spans.push(Span::styled("(1 space a day, then off)", dim()));
+        lines.push(Line::from(spans));
+    }
+
+    if tbl > 0 {
+        for r in 0..tbl {
             let mut spans = Vec::new();
             for c in 0..cols {
-                let Some((text, live)) = cells.get(c * rows + r) else { continue };
+                let Some((text, live)) = cells.get(c * tbl + r) else { continue };
                 spans.push(Span::styled(
-                    format!("{text:<w$} ", w = colw - 1),
-                    // Dim where the space offers the player nothing right now —
+                    format!("{:<w$} ", fit(text, colw - 1), w = colw - 1),
+                    // Dim where the space offers this player nothing right now —
                     // no skull for Chichen, no tile left on Palenque. The label
                     // still says what the space is for; see `space_info`.
                     if *live { label() } else { dim() },
                 ));
             }
             lines.push(Line::from(spans));
+        }
+    } else {
+        let mut flow: Vec<String> = vec![String::new()];
+        for (text, _) in &cells {
+            let last = flow.last_mut().expect("seeded with one line");
+            if !last.is_empty() && last.chars().count() + text.chars().count() + 3 > w {
+                flow.push(text.clone());
+            } else {
+                if !last.is_empty() {
+                    last.push_str(" · ");
+                }
+                last.push_str(text);
+            }
+        }
+        let room = h.saturating_sub(lines.len());
+        let cut = flow.len() > room;
+        for (i, l) in flow.into_iter().take(room).enumerate() {
+            let last = cut && i + 1 == room;
+            lines.push(Line::from(Span::styled(
+                if last { fit(&format!("{l} …"), w) } else { l },
+                label(),
+            )));
         }
     }
 

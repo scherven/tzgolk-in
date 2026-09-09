@@ -159,6 +159,7 @@ fn main() -> io::Result<()> {
         ranking: Ranking::default(),
         selected: 0,
         source,
+        focus: None,
         autoplay: false,
         status: format!("seed {seed}"),
     };
@@ -275,6 +276,9 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
                     KeyCode::Char('j') | KeyCode::Down => app.step_selection(1),
                     KeyCode::Char('k') | KeyCode::Up => app.step_selection(-1),
                     KeyCode::Char('a') => app.autoplay = !app.autoplay,
+                    // Pinning the Board panel's gear reads nothing the search
+                    // owns, so it is allowed mid-search like `j`/`k`.
+                    KeyCode::Char('g') => app.step_focus(),
                     _ if busy => {
                         app.status = "still searching — that key is refused until it lands".into()
                     }
