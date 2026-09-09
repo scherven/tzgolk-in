@@ -61,6 +61,37 @@ fn build_two(g: &GameState, p: PlayerId, depth: u8) -> Vec<Choice> {
         }
     }
 
+    // "If the first building gives you a new architecture technology, you may
+    // apply that effect (and any others) to the second building, as long as you
+    // applied no architecture effects to the first one."
+    //
+    // Enumerating both orders covers the *other* half of that rule -- picking
+    // which card spends a level the player already holds -- because the two
+    // orders differ only in who gets the discount. It cannot cover this half:
+    // building #6 is one gold for a free architecture advance, and the level it
+    // hands over is not in `g`, only in the probe. So the plain-first pairing is
+    // generated a second time here, with the bonus on the second card and read
+    // off the state the first card left behind.
+    //
+    // Guarded on the level actually moving, so this adds nothing to the width of
+    // an ordinary double build: without the guard every pair would appear a
+    // third time, spelled the way the loop above already spells its mirror.
+    let arch = g.research[p.idx()][Science::Architecture.idx()];
+    for first in building_choices(g, p, None, false, depth) {
+        let mut probe = *g;
+        first.apply(&mut probe, p);
+        if probe.research[p.idx()][Science::Architecture.idx()] <= arch {
+            continue;
+        }
+        let built = first.0.iter().find_map(|e| match e {
+            Effect::Build(id) => Some(*id),
+            _ => None,
+        });
+        for second in building_choices(&probe, p, built, true, 0) {
+            pairs.push(first.clone().chain(&second));
+        }
+    }
+
     // Both orders of every pair are enumerated above, and the two orders reach
     // the same position whenever the architecture discount is not in play --
     // which is most of the game. See `options::dedup_by_position` for why the

@@ -95,16 +95,25 @@ fn spot(g: &GameState, p: PlayerId, pos: Pos, can_foresee: bool) -> Vec<Choice> 
 
     // A devout player *may* pay a block for one more step. Go made this
     // mandatory once the track was reached, which removed the plain placement.
+    //
+    // The block is checked against the position the *core* reaches, not the one
+    // the turn started in, because the rule says so in as many words: "If you
+    // gained a resource block from your Chichen Itza action, it is available
+    // for you to spend in this way." Spaces 6, 8 and 9 hand out a block of the
+    // player's choice, so reading the pre-action stock denied the step to
+    // exactly the player the sentence was written for -- one who arrives with
+    // none. The temple test already probed the post-core state, since the
+    // core's own step can be the one that reaches the top.
     out.extend(cores.iter().cloned());
     if g.devout(p) {
-        for b in Resource::BLOCKS {
-            if g.players[p.idx()].get(b) == 0 {
-                continue;
-            }
-            for core in &cores {
+        for core in &cores {
+            let mut probe = *g;
+            core.apply(&mut probe, p);
+            for b in Resource::BLOCKS {
+                if probe.players[p.idx()].get(b) == 0 {
+                    continue;
+                }
                 for t in Temple::ALL {
-                    let mut probe = *g;
-                    core.apply(&mut probe, p);
                     if !probe.can_temple_step(p, t, 1) {
                         continue;
                     }

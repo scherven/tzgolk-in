@@ -153,6 +153,278 @@ fn two_advances_cannot_double_spend() {
     }
 }
 
+/// The best a space offers along one axis, over every choice it generates.
+fn best_at<F: Fn(&Choice) -> i32>(g: &GameState, p: PlayerId, gear: Gear, pos: u8, f: F) -> i32 {
+    choices_at(g, p, gear, Pos(pos))
+        .iter()
+        .map(|c| f(c))
+        .max()
+        .unwrap_or(0)
+}
+
+/// How much better that best gets when the player holds `levels` and nothing
+/// else about the position moves. Zero means the space never asked.
+fn research_delta<F: Fn(&Choice) -> i32>(
+    g: &mut Game,
+    p: PlayerId,
+    levels: [u8; 4],
+    gear: Gear,
+    pos: u8,
+    f: F,
+) -> i32 {
+    g.state.research[p.idx()] = [0; 4];
+    let before = best_at(&g.state, p, gear, pos, &f);
+    g.state.research[p.idx()] = levels;
+    let after = best_at(&g.state, p, gear, pos, &f);
+    g.state.research[p.idx()] = [0; 4];
+    after - before
+}
+
+fn net_points(c: &Choice) -> i32 {
+    c.0.iter()
+        .filter_map(|e| match e {
+            Effect::Points(n) => Some(*n as i32),
+            _ => None,
+        })
+        .sum()
+}
+
+/// A bonus computed correctly and never read is invisible, so these four tests
+/// pin the *reading* half of every track: the payoff measured as a delta in the
+/// best a space offers, at the space the rulebook names and at every route that
+/// repeats it -- the free-choice spaces at the top of each gear, and Uxmal 5's
+/// mirror -- and pinned at zero everywhere the rulebook excludes.
+///
+/// Agriculture, rulebook p.12: "+1 corn any time you harvest corn from the
+/// jungle (Palenque action 2, 3, 4, or 5; **but not action 1**)" at level 1,
+/// "+1 corn every time you fish (Palenque action 1)" at level 2, and "+2 more"
+/// -- cumulative, so +3 in total -- at level 3.
+#[test]
+fn agriculture_reaches_every_palenque_space_and_nothing_else() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    // A corn face showing over the wood at every tiled space, so both harvests
+    // are live and neither irrigation nor a burn is needed to reach the corn.
+    for i in 2..=5 {
+        g.state.palenque[i] = tzolkin::state::TileStack { corn: 2, wood: 1 };
+    }
+    // Exactly one corn: enough to buy Uxmal's mirror, not enough for the market
+    // at Uxmal 2, which would otherwise out-earn every mirrored harvest and
+    // swallow the delta.
+    g.state.players[p.idx()].corn = 1;
+    g.state.players[p.idx()].res = [0; 4];
+
+    let corn = |c: &Choice| c.net_corn();
+
+    // Fishing is the level-2 bonus. Level 1 must not reach it.
+    assert_eq!(research_delta(&mut g, p, [1, 0, 0, 0], Gear::Palenque, 1, corn), 0);
+    assert_eq!(research_delta(&mut g, p, [2, 0, 0, 0], Gear::Palenque, 1, corn), 1);
+
+    for pos in 2..=5u8 {
+        assert_eq!(
+            research_delta(&mut g, p, [1, 0, 0, 0], Gear::Palenque, pos, corn),
+            1,
+            "Palenque {pos} at agriculture 1"
+        );
+        assert_eq!(
+            research_delta(&mut g, p, [3, 0, 0, 0], Gear::Palenque, pos, corn),
+            3,
+            "Palenque {pos} at agriculture 3"
+        );
+    }
+
+    // Every route that repeats a Palenque action: the gear's own free-choice
+    // spaces, Uxmal's mirror, and the two Uxmal spaces that repeat the mirror.
+    for pos in [6u8, 7] {
+        assert_eq!(
+            research_delta(&mut g, p, [3, 0, 0, 0], Gear::Palenque, pos, corn),
+            3,
+            "Palenque {pos}"
+        );
+    }
+    for pos in [5u8, 6, 7] {
+        assert_eq!(
+            research_delta(&mut g, p, [3, 0, 0, 0], Gear::Uxmal, pos, corn),
+            3,
+            "Uxmal {pos}"
+        );
+    }
+
+    // Corn from Yaxchilan is not corn from the jungle.
+    for pos in [2u8, 3, 5] {
+        assert_eq!(
+            research_delta(&mut g, p, [3, 0, 0, 0], Gear::Yaxchilan, pos, corn),
+            0,
+            "Yaxchilan {pos}"
+        );
+    }
+}
+
+/// Extraction, rulebook p.12: wood from Yaxchilan 1 and Palenque 3-5, stone
+/// from Yaxchilan 2 and 5, gold from Yaxchilan 3 and 5 -- and "these
+/// technologies only apply to Yaxchilan and Palenque. They do not give you
+/// extra resources when you acquire resources in other ways (e.g., from
+/// buildings, from the gods, from the Chichen Itza actions, or from the
+/// market)."
+#[test]
+fn extraction_reaches_every_harvest_and_nothing_else() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    for i in 2..=5 {
+        g.state.palenque[i] = tzolkin::state::TileStack { corn: 2, wood: 1 };
+    }
+    g.state.players[p.idx()].corn = 1;
+    g.state.players[p.idx()].res = [0, 0, 0, 1]; // one skull, for Chichen
+
+    let wood = |c: &Choice| c.net_res(Resource::Wood);
+    let stone = |c: &Choice| c.net_res(Resource::Stone);
+    let gold = |c: &Choice| c.net_res(Resource::Gold);
+
+    assert_eq!(research_delta(&mut g, p, [0, 1, 0, 0], Gear::Yaxchilan, 1, wood), 1);
+    assert_eq!(research_delta(&mut g, p, [0, 2, 0, 0], Gear::Yaxchilan, 2, stone), 1);
+    assert_eq!(research_delta(&mut g, p, [0, 3, 0, 0], Gear::Yaxchilan, 3, gold), 1);
+    assert_eq!(research_delta(&mut g, p, [0, 3, 0, 0], Gear::Yaxchilan, 5, gold), 1);
+    assert_eq!(research_delta(&mut g, p, [0, 3, 0, 0], Gear::Yaxchilan, 5, stone), 1);
+    for pos in 3..=5u8 {
+        assert_eq!(
+            research_delta(&mut g, p, [0, 1, 0, 0], Gear::Palenque, pos, wood),
+            1,
+            "Palenque {pos}"
+        );
+    }
+
+    // The repeats.
+    for pos in [6u8, 7] {
+        assert_eq!(research_delta(&mut g, p, [0, 1, 0, 0], Gear::Yaxchilan, pos, wood), 1);
+        assert_eq!(research_delta(&mut g, p, [0, 1, 0, 0], Gear::Palenque, pos, wood), 1);
+    }
+    for pos in [5u8, 6, 7] {
+        assert_eq!(
+            research_delta(&mut g, p, [0, 1, 0, 0], Gear::Uxmal, pos, wood),
+            1,
+            "Uxmal {pos}"
+        );
+    }
+
+    // Chichen 6 hands over a block of the player's choice. It is not a harvest.
+    assert_eq!(best_at(&g.state, p, Gear::Chichen, 6, wood), 1, "Chichen 6 gives a block");
+    assert_eq!(research_delta(&mut g, p, [0, 3, 0, 0], Gear::Chichen, 6, wood), 0);
+
+    // Neither is the market.
+    g.state.players[p.idx()].corn = 10;
+    assert_eq!(best_at(&g.state, p, Gear::Uxmal, 2, wood), 5, "ten corn buys five wood");
+    assert_eq!(research_delta(&mut g, p, [0, 3, 0, 0], Gear::Uxmal, 2, wood), 0);
+}
+
+/// Architecture, rulebook p.12: 1 corn and 2 victory points "any time you
+/// construct a building (Tikal action 2 or 4, Uxmal action 4)", and p.9: "you
+/// can construct a monument only with Tikal action 4 and the architecture bonus
+/// doesn't apply to it."
+#[test]
+fn architecture_reaches_every_construction_and_no_monument() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    // Three cards, none of which touches a technology track: a card that hands
+    // over an architecture level would move the baseline under the test.
+    g.state.buildings_up = [None; tzolkin::state::N_DISPLAY];
+    g.state.buildings_up[0] = Some(BuildingId(1)); // 1 wood
+    g.state.buildings_up[1] = Some(BuildingId(2)); // 1 wood 2 stone
+    g.state.buildings_up[2] = Some(BuildingId(8)); // 2 wood 1 stone
+    g.state.players[p.idx()].corn = 30;
+    g.state.players[p.idx()].res = [4, 4, 4, 0];
+
+    // Measured over the choices that actually construct something: the
+    // free-choice spaces also reach Tikal 3, where an architecture track at
+    // level 2 can be pushed to 3 and then cashed for the top-of-track 3 points,
+    // which is research paying out but not the build bonus.
+    let builds = |c: &Choice| c.0.iter().any(|e| matches!(e, Effect::Build(_)));
+    let build_corn = |c: &Choice| if builds(c) { c.net_corn() } else { 0 };
+    let build_points = |c: &Choice| if builds(c) { net_points(c) } else { 0 };
+
+    for (gear, pos) in [(Gear::Tikal, 2u8), (Gear::Tikal, 4), (Gear::Uxmal, 4)] {
+        assert_eq!(
+            research_delta(&mut g, p, [0, 0, 1, 0], gear, pos, build_corn),
+            1,
+            "{gear:?} {pos} should pay a corn for the building"
+        );
+    }
+    for (gear, pos) in [
+        (Gear::Tikal, 2u8),
+        (Gear::Tikal, 4),
+        (Gear::Tikal, 6),
+        (Gear::Tikal, 7),
+        (Gear::Uxmal, 4),
+        (Gear::Uxmal, 5),
+        (Gear::Uxmal, 6),
+        (Gear::Uxmal, 7),
+    ] {
+        assert_eq!(
+            research_delta(&mut g, p, [0, 0, 2, 0], gear, pos, build_points),
+            2,
+            "{gear:?} {pos} should pay two points for the building"
+        );
+    }
+
+    // A monument is not a building: no corn, no points, and no block off.
+    g.state.research[p.idx()] = [0, 0, 3, 0];
+    let mut seen = 0;
+    for c in choices_at(&g.state, p, Gear::Tikal, Pos(4)) {
+        let Some(Effect::TakeMonument(id)) = c.0.iter().copied().find(|e| matches!(e, Effect::TakeMonument(_)))
+        else {
+            continue;
+        };
+        seen += 1;
+        let listed: i32 = Resource::BLOCKS
+            .iter()
+            .map(|&r| mdef(id).cost[r.idx()] as i32)
+            .sum();
+        let paid: i32 = -Resource::BLOCKS.iter().map(|&r| c.net_res(r)).sum::<i32>();
+        assert_eq!(paid, listed, "a builder was discounted on a monument: {c}");
+        assert_eq!(c.net_corn(), 0, "architecture paid corn for a monument: {c}");
+        assert_eq!(net_points(&c), 0, "architecture scored for a monument: {c}");
+    }
+    assert!(seen > 0, "no affordable monument to check");
+}
+
+/// Theology 3, rulebook p.12: "Take 1 more crystal skull any time you get a
+/// crystal skull from Yaxchilan (action 4). (Note that this does not apply to
+/// crystal skulls you get elsewhere by other means.)"
+#[test]
+fn theology_three_reaches_only_yaxchilan_four() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.players[p.idx()].corn = 1;
+    g.state.players[p.idx()].res = [0; 4];
+
+    let skull = |c: &Choice| c.net_res(Resource::Skull);
+
+    assert_eq!(research_delta(&mut g, p, [0, 0, 0, 3], Gear::Yaxchilan, 4, skull), 1);
+    for pos in [6u8, 7] {
+        assert_eq!(
+            research_delta(&mut g, p, [0, 0, 0, 3], Gear::Yaxchilan, pos, skull),
+            1,
+            "Yaxchilan {pos}"
+        );
+    }
+    for pos in [5u8, 6, 7] {
+        assert_eq!(
+            research_delta(&mut g, p, [0, 0, 0, 3], Gear::Uxmal, pos, skull),
+            1,
+            "Uxmal {pos}"
+        );
+    }
+
+    // "elsewhere by other means" includes the track's own top-of-track bonus.
+    g.state.research[p.idx()] = [0, 0, 0, 3];
+    g.state.players[p.idx()].res = [1, 0, 0, 0];
+    for c in tzolkin::options::research_choices(&g.state, p, 1, false) {
+        assert!(
+            c.net_res(Resource::Skull) <= 1,
+            "the top-of-track skull was doubled: {c}"
+        );
+    }
+}
+
 // ---- board spaces ------------------------------------------------------
 
 /// Go discarded foresight options with `return Skip()` exactly when the
@@ -191,6 +463,38 @@ fn devout_keeps_the_plain_placement() {
             && !c.0.iter().any(|e| matches!(e, Effect::Res(r, n) if *n < 0 && *r != Resource::Skull))
     });
     assert!(plain, "a devout player must still be able to just place a skull");
+}
+
+/// Theology level 2, rulebook p.12, in full: "After performing an action on the
+/// Chichen Itza gear, you may immediately spend 1 resource block to move up 1
+/// step on the temple of your choice. **(If you gained a resource block from
+/// your Chichen Itza action, it is available for you to spend in this way.)**"
+///
+/// The parenthetical is the whole rule: Chichen spaces 6, 8 and 9 hand out a
+/// block of your choice, and the block-availability guard read the holding
+/// *before* the action, so a devout player with an empty stock could not spend
+/// the block the space had just given them.
+#[test]
+fn devout_may_spend_the_block_the_chichen_action_granted() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.research[p.idx()] = [0, 0, 0, 2]; // theology 2: devout
+    // One skull and not a single block in hand.
+    g.state.players[p.idx()].res = [0, 0, 0, 1];
+
+    // Chichen space 6 pays 8 points, a green temple step, and a block of the
+    // player's choice -- the rulebook's own worked example on p.9.
+    let choices = choices_at(&g.state, p, Gear::Chichen, Pos(6));
+    let devout = choices.iter().any(|c| {
+        c.0.contains(&Effect::FillChichen(Pos(6)))
+            && c.0
+                .iter()
+                .any(|e| matches!(e, Effect::Res(r, n) if *r != Resource::Skull && *n < 0))
+    });
+    assert!(
+        devout,
+        "a devout player must be able to spend the block Chichen 6 just granted"
+    );
 }
 
 /// Tikal's top action advances one step on each of two *different* temples.
@@ -2245,6 +2549,73 @@ fn a_richer_action_at_the_same_price_retires_the_leaner_one() {
     }
 }
 
+/// Building #30's payoff is Uxmal's mirror, and the mirror costs a corn. A
+/// player who cannot pay that corn does not thereby lose the right to construct
+/// the card -- the privilege is simply unusable, like a temple step on a temple
+/// you have already topped. `expand_payoff` returned an empty list for an
+/// unusable mirror and `building_choices` reads an empty payoff as "no way to
+/// build this", so at zero corn the card fell out of the game.
+///
+/// Architecture level 1 masked this: the corn the build itself pays arrives
+/// before the payoff is expanded, and one corn is exactly the mirror's price.
+#[test]
+fn a_card_whose_payoff_is_unusable_is_still_buildable() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.buildings_up = [None; tzolkin::state::N_DISPLAY];
+    g.state.buildings_up[0] = Some(BuildingId(30)); // 2w 1s 1g, the mirror + 2 VP
+    g.state.research[p.idx()] = [0; 4]; // no architecture corn to pay the mirror
+    g.state.players[p.idx()].res = [4, 4, 4, 0];
+    g.state.players[p.idx()].corn = 0;
+
+    let ways: Vec<_> = tzolkin::options::building_choices(&g.state, p, None, true, 1)
+        .into_iter()
+        .filter(|c| c.0.contains(&Effect::Build(BuildingId(30))))
+        .collect();
+    assert!(!ways.is_empty(), "a penniless player may still construct #30");
+    assert!(
+        ways.iter().all(|c| c.0.contains(&Effect::Points(2))),
+        "the card's two points do not depend on the mirror"
+    );
+}
+
+/// Tikal action 4, rulebook p.9: "If you construct two buildings, you can apply
+/// your architecture technologies to either the first or the second, but one of
+/// them must be built without architecture technologies. **If the first
+/// building gives you a new architecture technology, you may apply that effect
+/// (and any others) to the second building, as long as you applied no
+/// architecture effects to the first one.**"
+///
+/// `build_two` gave the bonus to the first build and nothing to the second, and
+/// relied on enumerating both orders to cover "either the first or the second".
+/// That covers the choice of *which* card gets a level the player already has,
+/// and misses the sentence in bold entirely: building #6 is a gold for a free
+/// architecture advance, and the level it hands over is meant to pay for the
+/// card built beside it.
+#[test]
+fn architecture_won_by_the_first_build_pays_for_the_second() {
+    let mut g = fresh();
+    let p = PlayerId(0);
+    g.state.research[p.idx()] = [0; 4]; // no architecture yet
+    // #6 costs 1 gold and gives a free architecture advance; #1 costs 1 wood.
+    g.state.buildings_up = [None; tzolkin::state::N_DISPLAY];
+    g.state.buildings_up[0] = Some(BuildingId(6));
+    g.state.buildings_up[1] = Some(BuildingId(1));
+    g.state.players[p.idx()].res = [1, 0, 1, 0];
+
+    let paid = choices_at(&g.state, p, Gear::Tikal, Pos(4)).into_iter().any(|c| {
+        c.0.contains(&Effect::Build(BuildingId(6)))
+            && c.0.contains(&Effect::Build(BuildingId(1)))
+            && c.0.contains(&Effect::AdvanceResearch(Science::Architecture))
+            // Architecture level 1 is the only source of corn in this position.
+            && c.0.iter().any(|e| matches!(e, Effect::Corn(n) if *n > 0))
+    });
+    assert!(
+        paid,
+        "the architecture level #6 hands over must be usable on the second building"
+    );
+}
+
 /// Building A then B and B then A are the same pair of cards at the same price
 /// unless the architecture discount is in play, and `build_two` enumerates both
 /// orders. The discount is what makes the orders differ, so this checks the
@@ -2866,3 +3237,4 @@ fn evaluator_pays_more_for_corn_when_the_food_day_is_unpaid() {
     let (h, f) = (worker_worth(bill - 1, Gear::Yaxchilan), worker_worth(bill, Gear::Yaxchilan));
     assert!((h - f).abs() < 1e-4, "the resource gear moved too: {h} against {f}");
 }
+

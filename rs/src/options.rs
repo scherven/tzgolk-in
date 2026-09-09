@@ -346,10 +346,24 @@ pub fn expand_payoff(
             .into_iter()
             .map(|c| c.chain(&Choice::of(tail.iter().copied())))
             .collect(),
-        Payoff::Mirror(tail) => crate::spaces::uxmal::mirror_choices(g, p, depth)
-            .into_iter()
-            .map(|c| c.chain(&Choice::of(tail.iter().copied())))
-            .collect(),
+        Payoff::Mirror(tail) => {
+            let mut out: Vec<Choice> = crate::spaces::uxmal::mirror_choices(g, p, depth)
+                .into_iter()
+                .map(|c| c.chain(&Choice::of(tail.iter().copied())))
+                .collect();
+            // The mirror is a privilege, not a cost. A player who cannot pay
+            // its corn -- or a chain already at its depth bound -- still
+            // constructs the card and still takes the tail. `mirror_choices`
+            // returns an empty list in both cases and `building_choices` reads
+            // an empty payoff as "no way to build this", so card #30 dropped
+            // out of the game entirely at zero corn. Architecture level 1
+            // masked it: the corn the build itself pays lands before the payoff
+            // is expanded, and one corn is exactly the mirror's price.
+            if out.is_empty() {
+                out.push(Choice::of(tail.iter().copied()));
+            }
+            out
+        }
     }
 }
 
