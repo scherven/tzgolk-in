@@ -1130,7 +1130,12 @@ fn lookahead_line(rows: &[Row], unit: ScoreUnit, selected: usize) -> Option<Line
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.margin.total_cmp(&b.1.margin))?;
-    if i == 0 {
+    // A gap this small is the two columns agreeing, not the search seeing
+    // something. Claiming lookahead over 0.0 points made the line read as
+    // boilerplate -- it fired on 7 of 10 sampled positions, two of them at
+    // 0.0 and 0.1, so a reader learned nothing from seeing it.
+    const MEANINGFUL: f32 = 0.5;
+    if i == 0 || best.margin - top.margin < MEANINGFUL {
         return Some(Line::from(vec![
             Span::styled("why ", label()),
             Span::styled(
