@@ -166,17 +166,182 @@ impl Thinking {
     }
 }
 
+/// Who is playing each seat.
+///
+/// Four seats and not one because the question this viewer was built to answer
+/// is "what does *that* agent do differently", and the honest way to ask it is
+/// to sit two of each down at the same table. A seat with no agent falls back
+/// to the rollout policy, which is what the viewer did before checkpoints
+/// could be loaded.
+///
+/// `Arc`, not `Box`: `Agent` is `Send + Sync`, and the viewer hands a clone of
+/// one to a worker thread so a multi-second turn does not block the draw loop.
+#[derive(Clone)]
+pub struct Seats {
+    agents: [Option<std::sync::Arc<dyn crate::record::Agent>>; N_PLAYERS],
+    names: [String; N_PLAYERS],
+}
+
+impl Default for Seats {
+    fn default() -> Seats {
+        Seats {
+            agents: [const { None }; N_PLAYERS],
+            names: std::array::from_fn(|_| String::new()),
+        }
+    }
+}
+
+impl Seats {
+    /// Seats that know the names and hold no agents: for a screen that is
+    /// being *rendered* rather than played — `bin/uidump`, and the tests that
+    /// sweep every terminal size. Everything the panels draw comes from the
+    /// names, so this renders identically to the real thing.
+    pub fn named(names: [&str; N_PLAYERS]) -> Seats {
+        Seats {
+            agents: [const { None }; N_PLAYERS],
+            names: std::array::from_fn(|i| names[i].to_string()),
+        }
+    }
+
+    /// Seat `p`'s agent gets replaced, and its name with it. The name is read
+    /// off the agent rather than off the spec string, for the reason
+    /// `mcts_label` gives: a label taken from what was typed cannot be trusted
+    /// to say what the agent is doing.
+    pub fn set(&mut self, p: PlayerId, a: std::sync::Arc<dyn crate::record::Agent>) {
+        self.names[p.idx()] = a.name();
+        self.agents[p.idx()] = Some(a);
+    }
+
+    pub fn of(&self, p: PlayerId) -> Option<&std::sync::Arc<dyn crate::record::Agent>> {
+        self.agents[p.idx()].as_ref()
+    }
+
+    pub fn name(&self, p: PlayerId) -> &str {
+        &self.names[p.idx()]
+    }
+
+    /// True when any seat has an agent at all.
+    pub fn any(&self) -> bool {
+        self.agents.iter().any(|a| a.is_some())
+    }
+
+    /// True when every seat is playing the same agent — the case the screen
+    /// says nothing extra about, because the header already names it.
+    pub fn uniform_seating(&self) -> bool {
+        self.names.iter().all(|n| *n == self.names[0])
+    }
+
+    /// Seat -> key letter, one per *distinct* agent, in seat order.
+    ///
+    /// `None` everywhere when the seating is uniform: four `a`s down the side
+    /// of the Players panel would be four columns spent saying nothing.
+    pub fn keys(&self) -> [Option<char>; N_PLAYERS] {
+        if self.uniform_seating() {
+            return [None; N_PLAYERS];
+        }
+        let mut distinct: Vec<&str> = Vec::new();
+        std::array::from_fn(|i| {
+            let n = self.names[i].as_str();
+            let k = match distinct.iter().position(|d| *d == n) {
+                Some(k) => k,
+                None => {
+                    distinct.push(n);
+                    distinct.len() - 1
+                }
+            };
+            Some((b'a' + k as u8) as char)
+        })
+    }
+
+    /// One line decoding [`Seats::keys`], or `None` when there is nothing to
+    /// decode.
+    ///
+    /// It prints the part of each name that **differs**. Two of the champion
+    /// against two of a variant of the champion share forty characters of
+    /// prefix, and the eighteen that differ are the entire reason the game is
+    /// being watched; a panel forty columns wide that spends them all on the
+    /// shared half says nothing at all.
+    pub fn legend(&self) -> Option<String> {
+        if self.uniform_seating() {
+            return None;
+        }
+        let keys = self.keys();
+        let mut distinct: Vec<(char, String, String)> = Vec::new();
+        for p in PlayerId::ALL {
+            let k = keys[p.idx()]?;
+            let c = self.game_colour(p);
+            match distinct.iter_mut().find(|(dk, _, _)| *dk == k) {
+                Some((_, seats, _)) => seats.push(c),
+                None => distinct.push((k, c.to_string(), self.names[p.idx()].clone())),
+            }
+        }
+        let shared = common_prefix(&distinct.iter().map(|(_, _, n)| n.as_str()).collect::<Vec<_>>());
+        Some(
+            distinct
+                .iter()
+                .map(|(k, seats, name)| {
+                    let tail = name[shared..].trim_start_matches(':');
+                    let tail = if tail.is_empty() {
+                        // Nothing of its own: it *is* the shared name, which
+                        // the header spells out in full whenever it is this
+                        // seat's turn.
+                        if name.is_empty() {
+                            "rollout policy".to_string()
+                        } else {
+                            "none".to_string()
+                        }
+                    } else {
+                        short_agent(tail)
+                    };
+                    format!("{k} {seats} {tail}")
+                })
+                .collect::<Vec<_>>()
+                .join("   "),
+        )
+    }
+
+    /// The seat's colour letter. Here rather than on `GameState` because the
+    /// legend is drawn from the seating, and the seating is what this owns.
+    fn game_colour(&self, p: PlayerId) -> char {
+        // Seat order is colour order in `GameState::new`, and the Players panel
+        // draws them in the same order, so the letter is the seat.
+        ['R', 'G', 'B', 'Y'][p.idx()]
+    }
+}
+
+/// How many bytes the front of every one of `names` agrees on, cut back to a
+/// flag boundary so that a tail never starts in the middle of one.
+///
+/// `:tiltk=12` against `:tiltk=16` agrees through `:tiltk=1`, and a legend
+/// reading `2` and `6` would be worse than useless. It only cuts back when the
+/// agreement really does end mid-flag: two names that diverge exactly where
+/// one of them stops keep the whole shared part, which is the common case —
+/// an agent and the same agent with one flag more.
+fn common_prefix(names: &[&str]) -> usize {
+    let Some(first) = names.first() else {
+        return 0;
+    };
+    let mut n = first.len();
+    for other in &names[1..] {
+        n = n.min(
+            first
+                .bytes()
+                .zip(other.bytes())
+                .take_while(|(a, b)| a == b)
+                .count(),
+        );
+    }
+    // A boundary is where every name either ends or starts a new flag.
+    if names.iter().all(|s| s.len() == n || s.as_bytes().get(n) == Some(&b':')) {
+        return n;
+    }
+    first[..n].rfind(':').unwrap_or(0)
+}
+
 pub struct App {
     pub game: crate::game::Game,
-    /// The agent driving `n` and autoplay, if one was named. `None` falls back
-    /// to the rollout policy, which is what the viewer did before checkpoints
-    /// could be loaded.
-    ///
-    /// `Arc`, not `Box`: `Agent` is `Send + Sync`, and the viewer hands a clone
-    /// of this to a worker thread so a multi-second turn does not block the
-    /// draw loop.
-    pub agent: Option<std::sync::Arc<dyn crate::record::Agent>>,
-    pub agent_name: String,
+    /// Who is playing which seat. See [`Seats`].
+    pub seats: Seats,
     /// Set while a search is running on the worker thread. The screen must
     /// never simply stop redrawing: at the champion's budget a turn is ~200 ms,
     /// and the deliverable may be run at a budget where it is seconds.
@@ -205,6 +370,17 @@ pub struct App {
 }
 
 impl App {
+    /// The agent for the seat whose turn it is — the one `n` and autoplay
+    /// drive, and the one whose ranking the `agent` view shows.
+    pub fn agent(&self) -> Option<&std::sync::Arc<dyn crate::record::Agent>> {
+        self.seats.of(self.game.state.current)
+    }
+
+    /// That agent's name, or `""` for a seat playing the rollout policy.
+    pub fn agent_name(&self) -> &str {
+        self.seats.name(self.game.state.current)
+    }
+
     /// The raw ranking, spellings and all.
     ///
     /// Almost never what a caller wants: the panel, the selection and the
@@ -994,10 +1170,13 @@ fn header(f: &mut Frame, area: Rect, app: &App, marks: &Marks) {
     spans.push(Span::raw(format!("{} corn", g.accumulated_corn)));
     spans.push(Span::styled("   skull bank ", label()));
     spans.push(Span::raw(g.skulls_remaining.to_string()));
-    if !app.agent_name.is_empty() {
+    if !app.agent_name().is_empty() {
+        // The seat to move, not "the agent": with four seats there may be two
+        // different ones at the table, and the one worth naming here is the one
+        // that is about to think.
         spans.push(Span::styled("   agent ", label()));
         spans.push(Span::styled(
-            short_agent(&app.agent_name),
+            short_agent(app.agent_name()),
             Style::default().fg(ratatui::style::Color::Cyan),
         ));
     }
@@ -1672,7 +1851,13 @@ fn players(f: &mut Frame, area: Rect, app: &App) {
     // tail, so keeping the heading at six rows cost a *player* to keep a column
     // key — and the columns are guessable from four rows of numbers in a way
     // that a missing player is not.
-    let terse = area.height < 8;
+    // Four rows, plus up to two more: the column key above them and the
+    // seating below. Which of the two a squeezed panel keeps is decided by
+    // what is on the screen — see the title and the footnote below.
+    let interior = area.height.saturating_sub(2) as usize;
+    let terse = interior < 6;
+    let keys = app.seats.keys();
+    let legend = app.seats.legend();
     let mut lines = Vec::new();
     if !terse {
         lines.push(Line::from(vec![Span::styled(
@@ -1691,10 +1876,17 @@ fn players(f: &mut Frame, area: Rect, app: &App) {
 
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{marker}{c} "),
+                format!("{marker}{c}"),
                 Style::default()
                     .fg(colour(c))
                     .add_modifier(if is_turn { Modifier::BOLD } else { Modifier::empty() }),
+            ),
+            // Which agent is in this seat, in the space the row already spent
+            // on padding — so a mixed table is readable at every width the
+            // panel is drawn at, and a uniform one looks exactly as it did.
+            Span::styled(
+                keys[p.idx()].map(String::from).unwrap_or_else(|| " ".into()),
+                Style::default().fg(ratatui::style::Color::Cyan),
             ),
             Span::raw(format!("{:>4}  ", pl.corn)),
             Span::raw(format!(
@@ -1717,15 +1909,32 @@ fn players(f: &mut Frame, area: Rect, app: &App) {
             ),
         ]));
     }
-    if !terse {
-        lines.push(Line::from(vec![Span::styled(
+    // One spare row is enough for the seating, and the seating is what a
+    // viewer opened a mixed game to read: which agent is in which seat. The
+    // `wk` note is the lesser line and only gets the row when there is nothing
+    // to explain — and a panel one row taller than the four players now says
+    // *something* where it used to leave the row blank.
+    match (&legend, terse) {
+        (Some(l), _) if interior >= 5 => {
+            lines.push(Line::from(vec![Span::styled(format!(" {l}"), dim())]))
+        }
+        (None, false) => lines.push(Line::from(vec![Span::styled(
             "   wk = in hand + on gears",
             dim(),
-        )]));
+        )])),
+        _ => {}
     }
 
-    let title = if terse { "Players — corn W S G sk pts wk" } else { "Players" };
-    f.render_widget(Paragraph::new(lines).block(boxed(title)), area);
+    let title = match &legend {
+        // No row to spare and a seating to explain: it takes the title. A key
+        // letter nothing decodes is worse than a column whose meaning is
+        // guessable from four rows of numbers — which is the same reasoning
+        // that put the column key in the title when the panel went terse.
+        Some(l) if interior < 5 => format!("Players — {l}"),
+        _ if terse => "Players — corn W S G sk pts wk".to_string(),
+        _ => "Players".to_string(),
+    };
+    f.render_widget(Paragraph::new(lines).block(boxed(&title)), area);
 }
 
 fn cards(f: &mut Frame, area: Rect, app: &App) {
@@ -1994,7 +2203,7 @@ fn units(f: &mut Frame, area: Rect, app: &App) {
     let note = app
         .ranking
         .note
-        .strip_prefix(&app.agent_name)
+        .strip_prefix(app.agent_name())
         .map(|s| s.trim_start_matches(" ·").trim())
         .unwrap_or(&app.ranking.note);
 
@@ -2229,7 +2438,7 @@ fn lookahead_line(rows: &[Row], unit: ScoreUnit, selected: usize) -> Option<Line
 /// how many, and — the part that carries the reasoning — the best thing it
 /// declined. A 51/49 row is where the game was actually close.
 fn search_pane(f: &mut Frame, area: Rect, app: &App) {
-    let short = short_agent(&app.agent_name);
+    let short = short_agent(app.agent_name());
     let d = &app.last_decisions;
     // The value at the first node is the value of the position the turn started
     // from, which is the search's one-number verdict on how the game is going.
@@ -2400,7 +2609,7 @@ fn thinking(f: &mut Frame, area: Rect, app: &App, t: &Thinking) {
 
     f.render_widget(
         Paragraph::new(out)
-            .block(boxed(&format!("Thinking — {}", short_agent(&app.agent_name))))
+            .block(boxed(&format!("Thinking — {}", short_agent(app.agent_name()))))
             .wrap(Wrap { trim: true }),
         area,
     );

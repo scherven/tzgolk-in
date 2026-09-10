@@ -30,14 +30,26 @@ const HELP: &str = "\
 tui -- watch a game
 
 USAGE
-  cargo run --release --bin tui -- [SEED] [--agent SPEC] [--view VIEW]
+  cargo run --release --bin tui -- [SEED] [--agent SPEC] [--seat N SPEC]... [--view VIEW]
 
 OPTIONS
   --agent SPEC   who plays when you press `n` or turn on autoplay, and whose
-                 ranking the `agent` view shows. Without it the rollout policy
-                 plays and the move list is scored by the built-in evaluator.
+                 ranking the `agent` view shows. Every seat, unless a --seat
+                 overrides one. Without it the rollout policy plays and the
+                 move list is scored by the built-in evaluator.
+  --seat N SPEC  put SPEC in seat N (0=R 1=G 2=B 3=Y), overriding --agent.
+                 Repeatable. Two of one agent against two of another is
+                 exactly what this is for:
+
+                   tui 7 --agent 'mcts:8192:heuristic:deeper' \\
+                     --seat 0 'mcts:8192:heuristic:deeper,tilt=agri' \\
+                     --seat 1 'mcts:8192:heuristic:deeper,tilt=agri'
+
+                 The Players panel then carries a key letter per seat and a
+                 line under it saying which agent each key is, spelling out
+                 only the part of the two names that differs.
   --view VIEW    which move list to open on: sampled | full | agent.
-                 Defaults to `agent` with --agent, `full` without.
+                 Defaults to `agent` with an agent, `full` without.
 
 AGENT SPECS  (the same ones arena and selfplay take)
   random                              the rollout policy
@@ -48,6 +60,11 @@ AGENT SPECS  (the same ones arena and selfplay take)
   mcts:SIMS[:EVAL][:FLAGS]            tree search; FLAGS is a comma-separated
                                       key=value list over MctsConfig, e.g.
                                       mcts:2048:pri=1ply,ptemp=4
+  ...:tilt=agri|causal[,tiltk=K]      the same search over an evaluator that
+                                      values research higher early, per track.
+                                      agri favours Agriculture by far the most;
+                                      causal is proportional to the measured
+                                      value of each track. docs/FINDINGS-tilt.md
   PATH.safetensors                    shorthand for mcts on a trained net
 
 VIEWS  (cycle with `t`)
@@ -84,19 +101,59 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let seed: u64 = std::env::args()
-        .skip(1)
-        .find_map(|v| v.parse().ok())
-        .unwrap_or(7);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `--seat N SPEC` takes two words, so the seed can no longer be "the first
+    // thing that parses as a number" -- seat indices parse as numbers too.
+    // Walked in order instead, which also means a mistyped flag is an error
+    // rather than a silently ignored word.
+    let mut seed: u64 = 7;
+    let mut agent_spec: Option<String> = None;
+    let mut seat_specs: [Option<String>; 4] = [const { None }; 4];
+    let mut view: Option<String> = None;
+    let mut i = 0;
+    let next = |i: &mut usize, what: &str| -> String {
+        *i += 1;
+        match argv.get(*i) {
+            Some(v) => v.clone(),
+            None => {
+                eprintln!("tui: {what} needs a value");
+                std::process::exit(2);
+            }
+        }
+    };
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--agent" => agent_spec = Some(next(&mut i, "--agent")),
+            "--view" => view = Some(next(&mut i, "--view")),
+            "--seat" => {
+                let n = next(&mut i, "--seat");
+                let spec = next(&mut i, "--seat N SPEC");
+                match n.parse::<usize>() {
+                    Ok(n) if n < 4 => seat_specs[n] = Some(spec),
+                    _ => {
+                        eprintln!("tui: --seat takes a seat 0..3 then a spec, got {n:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            a => match a.parse::<u64>() {
+                Ok(v) => seed = v,
+                Err(_) => {
+                    eprintln!("tui: unknown option {a}; --help lists them");
+                    std::process::exit(2);
+                }
+            },
+        }
+        i += 1;
+    }
 
-    // `--agent SPEC` uses the same specs as the arena and self-play:
+    // The specs are the arena's and self-play's:
     //   heuristic:32                          the one-ply baseline
     //   mcts:800                              search on the heuristic evaluator
-    //   mcts:800:ckpt/gen0007.safetensors     search on a trained net
-    //   ckpt/gen0007.safetensors              shorthand for the above
-    let spec = std::env::args()
-        .position(|a| a == "--agent")
-        .and_then(|i| std::env::args().nth(i + 1));
+    //   mcts:8192:heuristic:deeper            the champion
+    //   mcts:8192:heuristic:deeper,tilt=agri  the champion, research-tilted
+    //   ckpt/gen0007.safetensors              shorthand for mcts on a net
+    //
     // Records its decision nodes — that is what fills the search panel, and
     // with plain `parse_agent(s, false)` the panel came up empty the first
     // time. It does **not** explore: `record` used to imply self-play, so this
@@ -104,26 +161,34 @@ fn main() -> io::Result<()> {
     // its root priors and playout-cap randomisation dropping seven turns in
     // eight to an eighth of the budget. Noise is a replay-buffer device; a
     // human watching wants the policy the search actually believes.
-    // `Arc`, not `Box`: the viewer hands a clone to a worker thread so a
-    // multi-second turn does not block the draw loop.
-    let agent: Option<std::sync::Arc<dyn tzolkin::record::Agent>> = match &spec {
-        Some(s) => match tzolkin::record::parse_analysis_agent(s) {
-            Ok(a) => Some(std::sync::Arc::from(a)),
+    let build = |what: &str, spec: &str| -> Arc<dyn tzolkin::record::Agent> {
+        match tzolkin::record::parse_analysis_agent(spec) {
+            Ok(a) => Arc::from(a),
             Err(e) => {
-                eprintln!("tui: --agent {s}: {e}");
+                eprintln!("tui: {what} {spec}: {e}");
                 std::process::exit(2);
             }
-        },
-        None => None,
+        }
     };
-    let agent_name = agent.as_ref().map(|a| a.name()).unwrap_or_default();
+    // `--seat N` first, `--agent` for the rest. Each seat gets its **own
+    // instance**, never a shared one, even where two seats were named the same
+    // spec: `AgentSpec` hands every instance a distinct MCTS seed, and four
+    // seats sharing one would search identically off one reused tree and
+    // contend on the single `Mutex` inside `SearchAgent`.
+    let mut seats = ui::Seats::default();
+    for p in PlayerId::ALL {
+        let (what, spec) = match &seat_specs[p.idx()] {
+            Some(s) => (format!("--seat {}", p.idx()), Some(s)),
+            None => ("--agent".to_string(), agent_spec.as_ref()),
+        };
+        if let Some(spec) = spec {
+            seats.set(p, build(&what, spec));
+        }
+    }
 
     // Opening on the agent's own ranking is the point of passing `--agent`;
     // without one there is nothing to ask, so the built-in exhaustive scoring
     // is the default instead.
-    let view = std::env::args()
-        .position(|a| a == "--view")
-        .and_then(|i| std::env::args().nth(i + 1));
     let source = match view.as_deref() {
         Some("sampled") => MoveSource::Sampled,
         Some("full") => MoveSource::Full,
@@ -132,27 +197,31 @@ fn main() -> io::Result<()> {
             eprintln!("tui: --view {other}: try sampled, full or agent");
             std::process::exit(2);
         }
-        None if agent.is_some() => MoveSource::Agent,
+        None if seats.any() => MoveSource::Agent,
         None => MoveSource::Full,
     };
 
-    // With an agent named, let it draft its own starting tiles — otherwise the
-    // board you are watching it play was set up by a coin flip.
+    // With an agent named, let each seat draft its own starting tiles —
+    // otherwise the board you are watching them play was set up by a coin
+    // flip. Per seat, so a tilted agent's draft is its own: the tiles include
+    // a research level, and that is the first decision the tilt touches.
     let mut game = Game::new(seed);
-    if let Some(a) = &agent {
+    if seats.any() {
         let (fresh, deal) = Game::new_undrafted(seed);
         game = fresh;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0xD8AF7);
         for p in PlayerId::ALL {
-            let kept = a.draft(&game.state, p, deal[p.idx()], &mut rng);
+            let kept = match seats.of(p) {
+                Some(a) => a.draft(&game.state, p, deal[p.idx()], &mut rng),
+                None => [deal[p.idx()][0], deal[p.idx()][1]],
+            };
             game.keep_tiles(p, kept);
         }
     }
 
     let mut app = App {
         game,
-        agent,
-        agent_name,
+        seats,
         thinking: None,
         last_decisions: Vec::new(),
         last_played: None,
@@ -370,7 +439,7 @@ fn step(app: &mut App, bg: &mut Option<Bg>, cost: &Cost) {
         app.status = "game over".into();
         return;
     }
-    if app.agent.is_some() {
+    if app.agent().is_some() {
         begin_turn(app, bg, cost);
         return;
     }
@@ -396,7 +465,8 @@ fn step(app: &mut App, bg: &mut Option<Bg>, cost: &Cost) {
 /// what lets the draw loop keep running while it happens.
 fn begin_turn(app: &mut App, bg: &mut Option<Bg>, cost: &Cost) {
     use rand::SeedableRng;
-    let Some(agent) = app.agent.clone() else { return };
+    // The seat to move, so a mixed table plays each seat with its own agent.
+    let Some(agent) = app.agent().cloned() else { return };
     let p = app.game.state.current;
     let state = app.game.state;
     let seed = state.day as u64 * 977 + p.0 as u64;
@@ -413,7 +483,7 @@ fn begin_turn(app: &mut App, bg: &mut Option<Bg>, cost: &Cost) {
         what: format!("searching {colour}'s turn"),
         detail: format!(
             "{} · one search per sub-decision, then one more to rank the alternatives",
-            ui::short_agent(&app.agent_name)
+            ui::short_agent(app.agent_name())
         ),
         elapsed: Duration::ZERO,
         stage: Some((1, 2)),
@@ -461,7 +531,7 @@ fn begin_rank(
     }
 
     let state = app.game.state;
-    let agent = app.agent.clone();
+    let agent = app.agent().cloned();
     let source = app.source;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -475,9 +545,9 @@ fn begin_rank(
             None => format!("scoring {colour}'s options"),
         },
         detail: match source {
-            MoveSource::Agent if app.agent.is_some() => format!(
+            MoveSource::Agent if app.agent().is_some() => format!(
                 "{} · one search over whole turns, for the shortlist only",
-                ui::short_agent(&app.agent_name)
+                ui::short_agent(app.agent_name())
             ),
             _ => format!("eval::margin over every legal move, capped at {FULL_VIEW_BUDGET:?}"),
         },

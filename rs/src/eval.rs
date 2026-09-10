@@ -423,7 +423,21 @@ pub fn components(g: &GameState, p: PlayerId) -> Components {
     // "this term is mis-priced by k" stays one number, in the same place
     // `plan::Schedule` applies its weights and `bin/evalab` measured them.
     c.temple = temple_outlook(g, p) * TEMPLE_SCALE;
+    // `engine_value` prices the research block the way the shipping evaluator
+    // always has. A seat that has installed a tilt pays a *multiple* of that
+    // block on the tracks it favours, while the calendar is still long enough
+    // for a level to be worth having — and nothing at all if it has not, which
+    // is what keeps `heuristic` the function it was. See "The early-game
+    // research tilt" below.
     c.engine = engine_value(g, p, rounds_left, horizon);
+    // Guarded rather than added unconditionally so that "no tilt installed" is
+    // the *same expression* this line has always been, rather than that
+    // expression plus a float zero. Bit-identity is then structural and does
+    // not rest on an argument about signed zeroes.
+    let tilt = research_tilt(g, p, rounds_left, horizon);
+    if tilt != 0.0 {
+        c.engine += tilt;
+    }
     c.board = board_position(g, p, rounds_left) * BOARD_SCALE;
     c.monument = monument_outlook(g, p, horizon);
     c.starvation = starvation_risk(g, p);
@@ -666,6 +680,281 @@ fn research_step_value(s: Science, level: u8) -> f32 {
         (Science::Theology, 3) => 0.90,
         _ => 0.0,
     }
+}
+
+// =======================================================================
+// The early-game research tilt
+// =======================================================================
+//
+// `research_step_value` prices the four tracks within **1.12x** of each other,
+// and prices a level on day 24 exactly as it prices one on day 0.
+// `docs/FINDINGS-research-value.md` R13 measured the causal value of a maxed
+// track — Architecture +23.52, Theology +15.96, Agriculture +7.49, Extraction
+// +4.51, a **5.2x** spread — and R14 measured the same grant given later:
+// **1.000 / 1.023 / 0.483 / 0.302** on days 0 / 7 / 14 / 21, flat to day 7 and
+// then falling away, because the temples score on `POINT_DAYS = [14, 27]`.
+//
+// The tilt is how one *agent* can hold that opinion without the shipping
+// evaluator moving under everyone else. It is off — all zeros — unless a seat
+// installs one, and with it off `heuristic` is the same function, to the bit.
+// `docs/FINDINGS-tilt.md`.
+//
+// # Why this is a property of the seat and not an injected `Evaluator`
+//
+// `mcts.rs` calls `crate::eval::heuristic` **directly** in three places, and
+// only one of them goes through the `Evaluator` trait:
+//
+// | call site | reached by a custom `Evaluator`? |
+// | --- | --- |
+// | the leaf value (`HeuristicEvaluator::evaluate`) | yes |
+// | the prior over edges (`Priors::OnePly`, `mcts.rs:2269`) | **no** |
+// | the edge ordering (`EdgeOrder::Gradient`, `mcts.rs:953`) | **no** |
+//
+// The two hard-coded ones are where *which action the search even considers*
+// is decided — `Gradient` prices `Effect::AdvanceResearch(s)` by probing
+// `heuristic` — so an injected evaluator would move the leaf value and leave
+// the research opinion on the shipping weights. All three pass the player
+// whose position is being estimated, so a per-seat table is read by all three
+// for free. `docs/FINDINGS-track-shape.md` §1.1 settled this and proved the
+// null arm bit-identical to HEAD; this is the same vehicle without a patch.
+//
+// # Why thread-local, and what that means
+//
+// `arena` and `selfplay` play many games at once in one process and rotate the
+// seating between them, and `cargo test` runs its tests in parallel threads: a
+// process-global table would have two games' seats writing over each other. A
+// thread-local is per *game*, because a game is one thread — `mcts.rs` spawns
+// none, and the heuristic backend is never batched (`Backend::batchable`), so
+// every `heuristic` call a seat's search makes runs on the thread that
+// installed the tilt. `record::tilted` installs it at the top of each `Agent`
+// call and drops the guard on the way out, which is also why the TUI's worker
+// thread sees it: the thread that installs is the thread that searches.
+//
+// The one place it does *not* reach is `NetBatch::mix`, which computes the
+// heuristic half of a blended leaf on a batcher thread. A tilted spec over a
+// network evaluator would tilt the prior and the ordering and not the blend.
+// Nothing here uses one; `docs/FINDINGS-tilt.md` records it.
+
+/// One seat's per-track tilt, in `Science::ALL` order, already multiplied by
+/// the strength. All zeros — the default — is "no tilt", and `heuristic` then
+/// runs the arithmetic it always did.
+pub type TiltRow = [f32; 4];
+
+/// The plateau in `tilt_early`: full strength while `horizon >= 1/1.4`, which
+/// is through day 7, then linear to zero on the last day.
+///
+/// This is a **second** decay, and it is deliberate. `engine_value`'s `uses`
+/// ramp already fades the research block itself — R14 reads it at 1.000 /
+/// 0.952 / 0.619 / 0.286 on days 0 / 7 / 14 / 21 against a measured causal
+/// 1.000 / 1.023 / 0.483 / 0.302, which is the best-fitting piece of the whole
+/// block. What `tilt_early` fades is the **premium**: the brief is an agent
+/// that values research more *in the early game*, not one that values it more
+/// throughout.
+///
+/// `1.4 * horizon` clamped at 1 keeps the premium flat exactly where R14 says
+/// a granted track is genuinely worth the same (day 0 and day 7 are within
+/// each other's error bars) and takes it to zero on the last day: 1.00 / 1.00
+/// / 0.67 / 0.31 on its own, and 1.00 / 0.95 / 0.42 / 0.09 once `uses` is
+/// counted too. So the tilt is spent in the first half of the calendar and the
+/// agent finishes the game as the champion it started from. A steeper knee
+/// that fits day 14 exactly misses day 21 by as much in the other direction,
+/// and four measured points do not support a curve with more than one
+/// parameter in it.
+const TILT_KNEE: f32 = 1.4;
+
+/// How much of the tilt is paid at `horizon` (1.0 on day 0, 0.0 on the last).
+///
+/// Public because the TUI and the tests both want to say what fraction of the
+/// tilt is live on the day on screen, and a second copy of the curve is a
+/// second thing to get wrong.
+#[inline]
+pub fn tilt_early(horizon: f32) -> f32 {
+    (horizon * TILT_KNEE).clamp(0.0, 1.0)
+}
+
+/// A named per-track shape for the tilt. The weights are normalised so the
+/// most-favoured track is 1.0, which makes `strength` mean the same thing —
+/// "the top track is worth `1 + strength` times what the evaluator says" —
+/// whichever shape is chosen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TiltShape {
+    /// Agriculture by far the most, the rest much smaller and descending.
+    ///
+    /// The order of "the rest" is R13's measured causal order (Architecture,
+    /// Theology, Extraction); nothing else here is measured, and a tie broken
+    /// by preference would be a number with no evidence behind it.
+    Agri,
+    /// Proportional to R13's measured causal value of a maxed track —
+    /// Architecture 23.52, Theology 15.96, Agriculture 7.49, Extraction 4.51 —
+    /// divided through by the largest.
+    Causal,
+}
+
+impl TiltShape {
+    pub const ALL: [TiltShape; 2] = [TiltShape::Agri, TiltShape::Causal];
+
+    /// Per-track weights in `Science::ALL` order: Agriculture, Extraction,
+    /// Architecture, Theology.
+    pub fn weights(self) -> TiltRow {
+        match self {
+            TiltShape::Agri => [1.00, 0.10, 0.30, 0.20],
+            // 7.49 / 4.51 / 23.52 / 15.96, over 23.52.
+            TiltShape::Causal => [0.318, 0.192, 1.000, 0.679],
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TiltShape::Agri => "agri",
+            TiltShape::Causal => "causal",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<TiltShape> {
+        TiltShape::ALL.into_iter().find(|t| t.name() == s)
+    }
+}
+
+/// A seat's whole opinion about research: which shape, and how hard.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ResearchTilt {
+    pub shape: TiltShape,
+    pub strength: f32,
+}
+
+impl ResearchTilt {
+    /// The default multiple. It is 12, not 0.1, and not 4 either.
+    ///
+    /// **The anchor.** A maxed Agriculture track is priced by the research
+    /// block at `1.55 * 7 * 0.05 = 0.5425` points on day 0, and moves the
+    /// whole estimate by about 1.2. R13 measured what one is causally worth:
+    /// **+7.49**. Solving `(1 + k) * 0.5425 + 0.66 = 7.49` — the block
+    /// re-priced, plus the ~0.66 of a track's value that lives in terms the
+    /// tilt does not touch — gives `k = 11.6`; pricing the block alone at 7.49
+    /// gives 12.8. Twelve is in the middle of that band. At level 1, where the
+    /// agent actually decides, it prices Agriculture 1 at 1.6 points: one more
+    /// corn on every green Palenque gather for the rest of the game, which is
+    /// about five corn, which is about 1.25 points plus what a spendable corn
+    /// is worth. The shipping evaluator says 0.12.
+    ///
+    /// **The measurement.** `calibrate_the_strength`, 16 paired games of
+    /// `mcts:256:heuristic:deeper` (seat 0 tilted, the same seeds, the same
+    /// opponents), research levels held on day 14 — the end of the tilt's own
+    /// window — and the share of 100 fixed early decisions answered with a
+    /// move that advances research:
+    ///
+    /// ```text
+    ///     k       day 14   final   research moves
+    ///     champion  0.94    1.38     8 / 100
+    ///     8         1.25    1.69     8 / 100
+    ///     12        1.56    2.25    12 / 100
+    ///     16        1.88    2.38    14 / 100
+    /// ```
+    ///
+    /// A tilt of 4 — the first guess, and "several-fold" on the face of it —
+    /// is **not distinguishable from the champion** on either endpoint. That
+    /// is the whole reason this constant is documented rather than picked:
+    /// research is priced so far below what it is worth that a several-fold
+    /// correction is still not enough to move a decision.
+    pub const DEFAULT_STRENGTH: f32 = 12.0;
+
+    pub fn new(shape: TiltShape, strength: f32) -> ResearchTilt {
+        ResearchTilt { shape, strength }
+    }
+
+    /// The row to install: the shape's weights, scaled by the strength.
+    pub fn row(self) -> TiltRow {
+        self.shape.weights().map(|w| w * self.strength)
+    }
+
+    /// The suffix every name this tilt appears in carries, in the spelling the
+    /// spec parser accepts back.
+    ///
+    /// One function, because the label an `AgentSpec` prints and the label its
+    /// instance prints are two different code paths, and a race in which both
+    /// sides print the same name is a bug this project has already paid for
+    /// once (`examples/nametest.rs`, `mcts_label`).
+    pub fn suffix(self) -> String {
+        format!(":tilt={}:tiltk={}", self.shape.name(), self.strength)
+    }
+}
+
+thread_local! {
+    /// Seat -> tilt, for the game this thread is playing. Zeros everywhere
+    /// until something installs one.
+    static TILT: std::cell::Cell<[TiltRow; N_PLAYERS]> =
+        const { std::cell::Cell::new([[0.0; 4]; N_PLAYERS]) };
+}
+
+/// Install `row` as seat `p`'s tilt on this thread until the guard drops.
+///
+/// Only the seat that is *acting* installs one, so a tilted agent tilts its
+/// estimate of its own position and nothing else: it does not model its
+/// opponents as sharing its opinion, and an opponent's search never sees it.
+#[must_use = "the tilt is uninstalled when the guard drops"]
+pub fn tilt_seat(p: PlayerId, row: TiltRow) -> TiltGuard {
+    let prev = TILT.with(|t| t.get());
+    let mut next = prev;
+    next[p.idx()] = row;
+    TILT.with(|t| t.set(next));
+    TiltGuard { prev }
+}
+
+/// Restores the table that was there before, so an analysis view drawn between
+/// two turns is never accidentally scored through somebody's tilt.
+pub struct TiltGuard {
+    prev: [TiltRow; N_PLAYERS],
+}
+
+impl Drop for TiltGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        TILT.with(|t| t.set(prev));
+    }
+}
+
+/// This thread's tilt table, for tests and for anything that wants to say on
+/// screen what is installed.
+pub fn tilt_table() -> [TiltRow; N_PLAYERS] {
+    TILT.with(|t| t.get())
+}
+
+/// What seat `p`'s tilt adds to `engine_value`'s research block.
+///
+/// The block `engine_value` computes is `sum_l research_step_value(s, l) *
+/// uses * RESEARCH_SCALE` over each track's held levels; this is that same sum
+/// times `strength * w[s] * early(horizon)`, so the two together are the block
+/// re-priced by `1 + strength * w[s] * early`. It is written as a delta rather
+/// than folded into the loop for one reason and it is worth stating: every one
+/// of the six unapplied arm patches in `docs/FINDINGS-track-shape.md` has a
+/// hunk inside `engine_value`, and that experiment is pinned and unrun.
+///
+/// The cost of that is the duplicated `uses` ramp below. It is the only line
+/// here that has to be kept in step with `engine_value` by hand, and
+/// `tests/tilt.rs::the_tilt_is_the_research_block_re_priced` pins it.
+fn research_tilt(g: &GameState, p: PlayerId, rounds_left: f32, horizon: f32) -> f32 {
+    let w = TILT.with(|t| t.get())[p.idx()];
+    if w == [0.0; 4] {
+        return 0.0;
+    }
+    let early = tilt_early(horizon);
+    if early <= 0.0 {
+        return 0.0;
+    }
+    // Kept in step with `engine_value` by hand. See above.
+    let uses = (rounds_left / 3.0).min(7.0);
+    let mut v = 0.0;
+    for s in Science::ALL {
+        if w[s.idx()] == 0.0 {
+            continue;
+        }
+        let mut track = 0.0;
+        for l in 1..=g.level(p, s) {
+            track += research_step_value(s, l);
+        }
+        v += track * uses * RESEARCH_SCALE * w[s.idx()] * early;
+    }
+    v
 }
 
 /// What this player's workers are standing on, **over and above** the generic

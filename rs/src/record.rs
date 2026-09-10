@@ -62,7 +62,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::rngs::StdRng;
 use rand::Rng;
 
-use crate::eval::Ranking;
+use crate::eval::{Ranking, ResearchTilt, TiltRow, TiltShape};
 use crate::ids::*;
 use crate::moves::{apply_move, sample_legal_move, Move};
 use crate::mcts::{EdgeOrder, Mcts, MctsConfig, Priors, RootPick, SearchResult};
@@ -2248,7 +2248,7 @@ impl SearchAgent {
         if explore == Exploration::Off {
             cfg.dirichlet_eps = 0.0;
         }
-        let label = mcts_label(full_sims, &ev.name(), &cfg);
+        let label = mcts_label(full_sims, &ev.name(), &cfg, None);
         SearchAgent {
             mcts: Mutex::new(Mcts::new(SharedEval(ev), cfg)),
             full_sims: full_sims.max(1),
@@ -2290,7 +2290,12 @@ impl SearchAgent {
 /// flags, and an arena run racing two variants printed the *same* name on both
 /// sides — a result file nobody can attribute. A label read off the config
 /// cannot drift from what the agent is actually doing.
-pub fn mcts_label(sims: u32, evaluator: &str, cfg: &MctsConfig) -> String {
+pub fn mcts_label(
+    sims: u32,
+    evaluator: &str,
+    cfg: &MctsConfig,
+    tilt: Option<ResearchTilt>,
+) -> String {
     let d = MctsConfig::default();
     let mut s = format!("mcts{sims}/{evaluator}");
     let mut f = |x: String| s.push_str(&x);
@@ -2359,6 +2364,14 @@ pub fn mcts_label(sims: u32, evaluator: &str, cfg: &MctsConfig) -> String {
     }
     if cfg.virtual_loss != d.virtual_loss {
         f(format!(":vl={}", cfg.virtual_loss));
+    }
+    // Last, so an untilted agent's name is a prefix of its tilted variant's
+    // and the two sort together in a results table. `ResearchTilt::suffix` is
+    // the only place this is spelled: `tilted` appends the same string to the
+    // inner agent's own name, and the two paths are pinned to each other by
+    // `tests/tilt.rs`'s `the_spec_and_its_instance_agree_on_the_name`.
+    if let Some(t) = tilt {
+        f(t.suffix());
     }
     s
 }
@@ -2574,6 +2587,86 @@ impl Agent for SearchAgent {
     fn name(&self) -> String {
         self.label.clone()
     }
+}
+
+// =======================================================================
+// The research tilt
+// =======================================================================
+
+/// Any agent, playing through an early-game research tilt on its own seat.
+///
+/// # Why a wrapper and not a field on `SearchAgent`
+///
+/// The tilt is not a search knob. It is what the *evaluator* says about
+/// research, and it has to reach the three places `mcts.rs` calls
+/// `eval::heuristic` **directly** — the one-ply prior and the `Gradient` edge
+/// ordering, neither of which goes through the injected `Evaluator` — which it
+/// can only do as a property of the seat. `eval::tilt_seat` is that property;
+/// this is what installs it.
+///
+/// # Why it installs per call rather than once per game
+///
+/// The table is thread-local (see `eval`), so it has to be written on the
+/// thread that will do the searching. Installing at the top of every `Agent`
+/// method makes that true on every driver there is without any of them
+/// knowing: `arena` and `selfplay` play many games at once on many threads and
+/// rotate the seating between them, and `bin/tui` spawns a fresh worker thread
+/// for every single search. The guard restores the previous table on the way
+/// out, so a viewer's own `eval::margin` scoring between two turns is never
+/// quietly computed through somebody's tilt.
+///
+/// Only the acting seat's row is installed, so a tilted agent tilts its
+/// estimate of **its own** position and nothing else. It does not model its
+/// opponents as sharing its opinion, and an opponent's search never sees it —
+/// including a second tilted agent's, which installs its own row on its own
+/// turn.
+struct TiltedAgent {
+    inner: Box<dyn Agent>,
+    tilt: ResearchTilt,
+    /// `tilt.row()`, folded once. Every call installs it.
+    row: TiltRow,
+}
+
+impl Agent for TiltedAgent {
+    fn play_turn(&self, g: &GameState, p: PlayerId, temp: f32, rng: &mut StdRng) -> Option<TurnOutcome> {
+        let _tilt = crate::eval::tilt_seat(p, self.row);
+        self.inner.play_turn(g, p, temp, rng)
+    }
+
+    fn extra_day(&self, g: &GameState, p: PlayerId, rng: &mut StdRng) -> (bool, Option<Node>) {
+        let _tilt = crate::eval::tilt_seat(p, self.row);
+        self.inner.extra_day(g, p, rng)
+    }
+
+    fn draft(&self, g: &GameState, p: PlayerId, dealt: [u8; 4], rng: &mut StdRng) -> [u8; 2] {
+        let _tilt = crate::eval::tilt_seat(p, self.row);
+        self.inner.draft(g, p, dealt, rng)
+    }
+
+    fn ranked_moves(&self, g: &GameState, p: PlayerId, keep: usize) -> Option<Ranking> {
+        let _tilt = crate::eval::tilt_seat(p, self.row);
+        self.inner.ranked_moves(g, p, keep)
+    }
+
+    /// The inner agent's name plus the tilt, in the spelling the spec parser
+    /// takes back. `mcts_label` appends the identical string from the identical
+    /// function, which is what keeps the two sides of a race distinguishable.
+    fn name(&self) -> String {
+        format!("{}{}", self.inner.name(), self.tilt.suffix())
+    }
+}
+
+/// `inner`, playing through `tilt` on whichever seat it is asked to act for.
+///
+/// Public so a test or a tool can tilt an agent that has no `FLAGS` field to
+/// spell it in — `heuristic:32`, say, which is the cheap way to see what the
+/// tilt does to a decision without paying for a tree.
+pub fn tilted(inner: Box<dyn Agent>, tilt: ResearchTilt) -> Box<dyn Agent> {
+    Box::new(TiltedAgent {
+        row: tilt.row(),
+        inner,
+        tilt,
+    })
 }
 
 // =======================================================================
@@ -2803,6 +2896,13 @@ impl Agent for MinimaxAgent {
 ///   `pri=eval|1ply`, `ptemp=`, `pmin=`, `cp=`, `cpb=`, `fpu=`, `k=`, `wc=`,
 ///   `wa=`, `wcap=`, `vl=`, `reuse`, `noreuse`. Every one of them appears in
 ///   the agent's name — see [`mcts_label`].
+///
+///   `tilt=agri|causal` and `tiltk=STRENGTH` are the odd ones out: they
+///   configure the *evaluator's* opinion of research rather than the search,
+///   and they leave `MctsConfig` untouched and wrap the agent instead (see
+///   [`tilted`] and [`crate::eval::ResearchTilt`]). They are spelled and
+///   printed here with the rest because that is where an agent is written
+///   down: `mcts:8192:heuristic:deeper,tilt=agri`.
 /// * `net-random` / `net-random:small` / `net-random:main` — an untrained
 ///   network. Not a player: it exists so the batched pipeline can be measured
 ///   at its real cost before any weights are trained.
@@ -2823,7 +2923,12 @@ pub struct AgentSpec {
 enum SpecKind {
     Random,
     Greedy { cands: Candidates },
-    Search { sims: u32, cfg: MctsConfig },
+    Search {
+        sims: u32,
+        cfg: MctsConfig,
+        /// The seat's research tilt, or `None` for the shipping evaluator.
+        tilt: Option<ResearchTilt>,
+    },
     Minimax { cfg: crate::search::Config },
 }
 
@@ -3012,8 +3117,12 @@ fn parse_minimax(rest: Option<&str>) -> Result<crate::search::Config, String> {
 /// `eval.rs` and `moves.rs` are being edited by other agents: legal moves per
 /// position moved 184 -> 644 mid-session during the last run, so two numbers
 /// from two processes are not comparable even an hour apart.
-fn parse_mcts_flags(flags: &str) -> Result<MctsConfig, String> {
+fn parse_mcts_flags(flags: &str) -> Result<(MctsConfig, Option<ResearchTilt>), String> {
     let mut cfg = MctsConfig::default();
+    // Not part of `MctsConfig`, and deliberately: it is not a search knob but
+    // what the evaluator says about research, and `mcts.rs` never sees it.
+    // See `eval::ResearchTilt` and `tilted`.
+    let mut tilt: Option<ResearchTilt> = None;
     for f in flags.split(',').filter(|f| !f.is_empty()) {
         let (k, v) = f.split_once('=').unwrap_or((f, ""));
         let num = |what: &str| -> Result<f32, String> {
@@ -3140,13 +3249,44 @@ fn parse_mcts_flags(flags: &str) -> Result<MctsConfig, String> {
                     }
                 }
             }
+            // The early-game research tilt: `tilt=agri` (the default shape)
+            // or `tilt=causal`, with `tiltk=` for the strength. Both are
+            // properties of the *seat's evaluator*, not of the search, so
+            // they end up on a wrapper around the agent rather than in
+            // `MctsConfig` -- but they are parsed, defaulted and printed here
+            // beside `cp=` and `pmin=` because that is where an agent spec is
+            // written. `mcts_label` prints them back in this spelling.
+            //
+            // Order-independent: either flag keeps whatever the other set, so
+            // `tiltk=6,tilt=causal` and `tilt=causal,tiltk=6` are one agent.
+            "tilt" => {
+                let shape = TiltShape::parse(v).ok_or_else(|| {
+                    format!(
+                        "mcts tilt= is {}, got {v:?}",
+                        TiltShape::ALL
+                            .iter()
+                            .map(|t| t.name())
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    )
+                })?;
+                let strength = tilt.map_or(ResearchTilt::DEFAULT_STRENGTH, |t| t.strength);
+                tilt = Some(ResearchTilt::new(shape, strength));
+            }
+            "tiltk" => {
+                let strength = num("tiltk")?;
+                tilt = Some(ResearchTilt::new(
+                    tilt.map_or(TiltShape::Agri, |t| t.shape),
+                    strength,
+                ));
+            }
             "vl" => cfg.virtual_loss = int("vl")? as u32,
             "reuse" => cfg.tree_reuse = true,
             "noreuse" => cfg.tree_reuse = false,
             other => return Err(format!("mcts flag {other:?} unknown")),
         }
     }
-    Ok(cfg)
+    Ok((cfg, tilt))
 }
 
 fn parse_backend(spec: &str) -> Result<Backend, String> {
@@ -3216,7 +3356,9 @@ impl AgentSpec {
                 Candidates::Sampled(k) => format!("{}:{k}", backend.name()),
                 Candidates::All => format!("{}:full", backend.name()),
             },
-            SpecKind::Search { sims, cfg } => mcts_label(*sims, &backend.name(), cfg),
+            SpecKind::Search { sims, cfg, tilt } => {
+                mcts_label(*sims, &backend.name(), cfg, *tilt)
+            }
             SpecKind::Minimax { cfg } => minimax_label(cfg),
         };
         Ok(AgentSpec {
@@ -3312,18 +3454,14 @@ impl AgentSpec {
                 if sims == 0 {
                     return Err("mcts:SIMS needs SIMS >= 1".into());
                 }
-                Ok((
-                    SpecKind::Search {
-                        sims,
-                        cfg: parse_mcts_flags(flags)?,
-                    },
-                    parse_backend(ev)?,
-                ))
+                let (cfg, tilt) = parse_mcts_flags(flags)?;
+                Ok((SpecKind::Search { sims, cfg, tilt }, parse_backend(ev)?))
             }
             "net-random" => Ok((
                 SpecKind::Search {
                     sims: DEFAULT_SIMS,
                     cfg: MctsConfig::default(),
+                    tilt: None,
                 },
                 parse_backend(spec)?,
             )),
@@ -3334,6 +3472,7 @@ impl AgentSpec {
                 SpecKind::Search {
                     sims: DEFAULT_SIMS,
                     cfg: MctsConfig::default(),
+                    tilt: None,
                 },
                 parse_backend(spec)?,
             )),
@@ -3363,6 +3502,16 @@ impl AgentSpec {
     pub fn mcts_config(&self) -> Option<&MctsConfig> {
         match &self.kind {
             SpecKind::Search { cfg, .. } => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// The seat tilt behind an `mcts:...:tilt=` spec, for tests that check a
+    /// flag reached it and for the TUI, which says on screen which seats are
+    /// playing which agent.
+    pub fn research_tilt(&self) -> Option<ResearchTilt> {
+        match &self.kind {
+            SpecKind::Search { tilt, .. } => *tilt,
             _ => None,
         }
     }
@@ -3424,19 +3573,23 @@ impl AgentSpec {
                 cands: *cands,
                 record: self.record,
             }),
-            SpecKind::Search { sims, cfg } => {
+            SpecKind::Search { sims, cfg, tilt } => {
                 let ev: Arc<dyn Evaluator> = match &self.queue {
                     Some(q) => Arc::new(q.handle()),
                     None => self.backend.evaluator(),
                 };
-                Box::new(SearchAgent::with_config(
+                let agent: Box<dyn Agent> = Box::new(SearchAgent::with_config(
                     ev,
                     *sims,
                     self.record,
                     self.explore,
                     *cfg,
                     seed,
-                ))
+                ));
+                match tilt {
+                    Some(t) => tilted(agent, *t),
+                    None => agent,
+                }
             }
             SpecKind::Minimax { cfg } => Box::new(MinimaxAgent::new(cfg.clone(), self.record)),
         }

@@ -1320,8 +1320,7 @@ fn ui_renders_at_many_sizes() {
                 for exhaustive in [true, false] {
                     let app = App {
                         game: Game::new(3),
-                        agent: None,
-                        agent_name: "net".into(),
+                        seats: ui::Seats::named(["net"; 4]),
                         thinking: None,
                         last_decisions: Vec::new(),
                         last_played: None,
@@ -1395,8 +1394,9 @@ fn ui_renders_while_thinking_and_after_a_search() {
                 for source in [MoveSource::Full, MoveSource::Agent] {
                     let app = App {
                         game: Game::new(3),
-                        agent: None,
-                        agent_name: "mcts8192/heuristic:pt=1:pmin=2:cp=0.02".into(),
+                        seats: ui::Seats::named(
+                            ["mcts8192/heuristic:pt=1:pmin=2:cp=0.02"; 4],
+                        ),
                         thinking: busy.clone(),
                         last_decisions: decs.clone(),
                         last_played: Some("R played ".to_string() + &"z".repeat(200)),
@@ -1435,8 +1435,7 @@ fn selection_stays_on_a_real_row() {
     let mut app = tzolkin::ui::App {
         ranking: tzolkin::eval::rank_all(&game.state, p, 10),
         game,
-        agent: None,
-        agent_name: String::new(),
+        seats: Default::default(),
         thinking: None,
         last_decisions: Vec::new(),
         last_played: None,
@@ -1611,8 +1610,7 @@ fn the_board_marks_placed_and_retrieved_workers_without_colour() {
         let state = game.state;
         let mut app = App {
             game,
-            agent: None,
-            agent_name: String::new(),
+            seats: Default::default(),
             thinking: None,
             last_decisions: Vec::new(),
             last_played: None,
@@ -1701,8 +1699,7 @@ fn the_board_always_says_what_at_least_one_space_does() {
             let ranking = tzolkin::eval::rank_all(&game.state, p, 10);
             let mut app = App {
                 game,
-                agent: None,
-                agent_name: String::new(),
+                seats: Default::default(),
                 thinking: None,
                 last_decisions: Vec::new(),
                 last_played: None,
@@ -1741,6 +1738,145 @@ fn the_board_always_says_what_at_least_one_space_does() {
 
 /// Temples never hides a player.
 ///
+/// A viewer watching two agents play two others must be able to tell, from the
+/// Players panel alone, which two seats are which.
+///
+/// The command line is not on screen and nobody remembers it. Two of the
+/// champion against two of a variant of the champion is the case this is built
+/// for, and it is the hard one: the two names share forty characters of prefix,
+/// the panel is between forty and seventy columns wide depending on the
+/// terminal, and the eighteen characters that differ are the entire reason the
+/// game is being watched. So the row carries a key letter — in the padding it
+/// already had, so no column moves and no width is lost — and the footnote
+/// under the four rows decodes the keys with only the part of each name that
+/// **differs**.
+#[test]
+fn the_players_panel_says_which_agent_is_in_which_seat() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tzolkin::ui::{self, App, MoveSource};
+
+    const CHAMP: &str = "mcts8192/heuristic:pt=1:pmin=2:cp=0.02";
+    const TILTED: &str = "mcts8192/heuristic:pt=1:pmin=2:cp=0.02:tilt=agri:tiltk=12";
+
+    // Every size the panel draws at, including the two where it is squeezed
+    // to four rows and the legend has to take the title instead.
+    for &(w, h) in &[
+        (100u16, 30u16),
+        (132, 44),
+        (150, 40),
+        (200, 60),
+        (110, 26),
+        (120, 25),
+        (90, 28),
+        (80, 24),
+    ] {
+        let game = Game::new(7);
+        let p = game.state.current;
+        let ranking = tzolkin::eval::rank_all(&game.state, p, 10);
+        let app = App {
+            game,
+            // Seats 0 and 1 (R and G) tilted, 2 and 3 (B and Y) the champion.
+            seats: ui::Seats::named([TILTED, TILTED, CHAMP, CHAMP]),
+            thinking: None,
+            last_decisions: Vec::new(),
+            last_played: None,
+            ranking,
+            selected: 0,
+            source: MoveSource::Full,
+            autoplay: false,
+            status: String::new(),
+            focus: None,
+        };
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        // The panel's own columns only. Sliced by *cell* and bounded on the
+        // right by its own corner: the box-drawing characters are multi-byte,
+        // and the panel beside this one closes first at several sizes, so a
+        // byte-sliced row read the neighbour's border as this panel's end.
+        let sym = |x: u16, y: u16| buf[(x, y)].symbol().to_string();
+        let spells = |x: u16, y: u16, what: &str| {
+            what.chars().enumerate().all(|(i, c)| {
+                x + (i as u16) < w && sym(x + i as u16, y) == c.to_string()
+            })
+        };
+        let Some((x0, top)) = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .find(|&(x, y)| spells(x, y, "┌ Players"))
+        else {
+            continue; // too short to draw at all; that is a layout choice
+        };
+        let x1 = (x0 + 1..w).find(|&x| sym(x, top) == "┐").unwrap_or(w - 1);
+        let bot = (top + 1..h).find(|&y| sym(x0, y) == "└").unwrap_or(h - 1);
+        let panel: Vec<String> = (top + 1..bot)
+            .map(|y| (x0..=x1).map(|x| sym(x, y)).collect::<String>())
+            .collect();
+        let title: String = (x0..=x1).map(|x| sym(x, top)).collect();
+        let whole = format!("{title}\n{}", panel.join("\n"));
+
+        // Every seat's row carries its key, and the two agents get two keys.
+        for (colour, key) in [('R', 'a'), ('G', 'a'), ('B', 'b'), ('Y', 'b')] {
+            assert!(
+                panel.iter().any(|l| l.contains(&format!("{colour}{key}"))),
+                "seat {colour} must be marked {key} at {w}x{h}:\n{whole}"
+            );
+        }
+        // And the footnote says what the keys mean, in the part that differs.
+        assert!(
+            whole.contains("a RG") && whole.contains("b BY"),
+            "the legend must map each key to its seats at {w}x{h}:\n{whole}"
+        );
+        assert!(
+            whole.contains("tilt=agri"),
+            "and must spell the difference between the two agents at {w}x{h}:\n{whole}"
+        );
+        // The shared forty characters are exactly what it must not spend the
+        // panel's width on.
+        assert!(
+            !whole.contains("mcts8192"),
+            "the legend must not repeat the shared prefix at {w}x{h}:\n{whole}"
+        );
+    }
+}
+
+/// One agent in every seat is the case the screen says nothing extra about:
+/// the header already names it, and four identical key letters down the side
+/// of the panel would be four columns spent saying nothing.
+#[test]
+fn a_table_of_one_agent_keeps_the_column_key() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tzolkin::ui::{self, App, MoveSource};
+
+    let game = Game::new(7);
+    let p = game.state.current;
+    let ranking = tzolkin::eval::rank_all(&game.state, p, 10);
+    let app = App {
+        game,
+        seats: ui::Seats::named(["mcts8192/heuristic:cp=0.02"; 4]),
+        thinking: None,
+        last_decisions: Vec::new(),
+        last_played: None,
+        ranking,
+        selected: 0,
+        source: MoveSource::Full,
+        autoplay: false,
+        status: String::new(),
+        focus: None,
+    };
+    let mut term = Terminal::new(TestBackend::new(132, 44)).unwrap();
+    term.draw(|f| ui::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen: String = (0..44u16)
+        .map(|y| (0..132u16).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+        .collect();
+    assert!(
+        screen.contains("wk = in hand + on gears"),
+        "a uniform table keeps the column key:\n{screen}"
+    );
+}
+
 /// `Paragraph` truncates its tail and this panel's tail is step 0, which is
 /// where everybody starts — so one row short of the tallest track, the row it
 /// dropped was the most-occupied one on the board. At 132x44 that was exactly
@@ -1767,8 +1903,7 @@ fn the_temple_panel_never_truncates_away_an_occupied_step() {
                 PlayerId::ALL.iter().map(|q| game.state.players[q.idx()].color.letter()).collect();
             let app = App {
                 game,
-                agent: None,
-                agent_name: String::new(),
+                seats: Default::default(),
                 thinking: None,
                 last_decisions: Vec::new(),
                 last_played: None,

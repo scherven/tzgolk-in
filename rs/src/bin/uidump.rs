@@ -159,8 +159,10 @@ fn main() {
         .map(|m| format!("{} played {m}", game.state.players[played_by.idx()].color));
     let app = App {
         game,
-        agent: None,
-        agent_name,
+        // One agent in every seat, so the dump renders the screen the
+        // single-`--agent` viewer draws. `Seats::named` because uidump plays
+        // its one turn locally and has no reason to keep the agent alive.
+        seats: ui::Seats::named([agent_name.as_str(); 4]),
         thinking,
         last_decisions,
         last_played,
