@@ -88,8 +88,26 @@ def make_batch(buf: Buffer, n: int, rng, augment: bool):
     """
     x, t = batch_arrays(buf.sample(n, rng), buf.schema, augment)
     tgt: dict = {}
+    ptr = None
     for k, v in t.items():
-        if isinstance(v, tuple):
+        if k == "policy_ptr":
+            # `sel` goes to the forward pass (which rows of the batch are
+            # pointer nodes) rather than into the loss, so the pointer head runs
+            # on ~18% of the batch instead of on a mostly-padded full one.
+            sel, dist, weight, mask, cand, cell, tag = v
+            ptr = (
+                torch.from_numpy(sel),
+                torch.from_numpy(cand),
+                torch.from_numpy(mask),
+                torch.from_numpy(cell),
+                torch.from_numpy(tag),
+            )
+            tgt[k] = (
+                torch.from_numpy(dist),
+                torch.from_numpy(weight),
+                torch.from_numpy(mask),
+            )
+        elif isinstance(v, tuple):
             sel, dist, weight, mask = v
             tgt[k] = (
                 torch.from_numpy(sel),
@@ -99,7 +117,7 @@ def make_batch(buf: Buffer, n: int, rng, augment: bool):
             )
         else:
             tgt[k] = torch.from_numpy(v)
-    return torch.from_numpy(x), tgt
+    return torch.from_numpy(x), tgt, ptr
 
 
 # ----------------------------------------------------------------------
@@ -236,14 +254,18 @@ def main():
             for g in opt.param_groups:
                 g["lr"] = base_lr * warmup(step - start)
 
-            x, tgt = make_batch(buf, args.batch, rng, augment=not args.no_augment)
+            x, tgt, ptr = make_batch(buf, args.batch, rng, augment=not args.no_augment)
             x = x.to(dev)
             tgt = {
                 k: (v.to(dev) if torch.is_tensor(v) else tuple(t.to(dev) for t in v))
                 for k, v in tgt.items()
             }
 
-            out = net(x)
+            if ptr is None:
+                out = net(x)
+            else:
+                rows, cand, cmask, cell, ptag = (t.to(dev) for t in ptr)
+                out = net(x, cand=cand, cand_mask=cmask, ptr_rows=rows, cell=cell, tag=ptag)
             total, parts = loss_fn(out, tgt)
             opt.zero_grad(set_to_none=True)
             total.backward()

@@ -47,7 +47,7 @@ import os
 
 import numpy as np
 
-from arch import PHASE_HEADS
+from arch import D_CHOICE, POINTER_TAGS, PHASE_HEADS
 
 from replay import State
 
@@ -119,6 +119,10 @@ def _lib():
     lib.tzolkin_d_in.restype = ctypes.c_uint32
     lib.tzolkin_state_slot.restype = ctypes.c_uint32
     lib.tzolkin_encode_batch.restype = ctypes.c_int32
+    if hasattr(lib, "tzolkin_edge_slots"):
+        lib.tzolkin_edge_slots.restype = ctypes.c_int32
+    if hasattr(lib, "tzolkin_edge_choices"):
+        lib.tzolkin_edge_choices.restype = ctypes.c_int32
     _LIB, _D_IN, _SLOT = lib, int(lib.tzolkin_d_in()), int(lib.tzolkin_state_slot())
     return lib
 
@@ -188,6 +192,143 @@ def encode_batch(
     return out
 
 
+def edge_slots(
+    states: np.ndarray,
+    movers: np.ndarray,
+    phase_tags: np.ndarray,
+    phase_args: np.ndarray,
+    n_edges: np.ndarray,
+    max_edges: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Edge index -> head slot, from ``tzolkin::encode::edges``.
+
+    Returns ``(kinds, arity, slots)``: ``kinds`` is 0 unusable / 1 fixed-arity /
+    2 pointer, ``arity`` the head width, and ``slots[i, e]`` the head slot edge
+    ``e`` of row ``i`` maps to.
+
+    **This map is not the identity.** It was assumed to be, and that assumption
+    put each visit count on the wrong move for 37.7% of ``Beg`` nodes, 32.3% of
+    ``Placing`` and *every* ``PickWorker`` node: a head's legal edges are a
+    subset of its slots, not a prefix of them. Nothing downstream can detect a
+    scrambled target -- the loss goes down, the head learns to rank the wrong
+    move -- so the mapping comes from the same Rust call the network's own prior
+    path makes at play time (`src/ffi.rs`), never from a second copy of the rule.
+    """
+    lib = _lib()
+    import ctypes
+
+    n = len(states)
+    if n == 0 or max_edges <= 0:
+        return (
+            np.zeros(0, np.uint8),
+            np.zeros(0, np.uint16),
+            np.zeros((0, max(max_edges, 1)), np.uint16),
+        )
+    if not hasattr(lib, "tzolkin_edge_slots"):
+        raise RuntimeError(
+            "the loaded libtzolkin has no tzolkin_edge_slots; rebuild with "
+            "`cargo build --release` so the policy targets can be mapped"
+        )
+
+    states = np.ascontiguousarray(states, dtype=np.uint8).reshape(n, -1)
+    if states.shape[1] != _SLOT:
+        raise ValueError(f"state slot is {states.shape[1]} bytes, encoder wants {_SLOT}")
+    movers = np.ascontiguousarray(movers, dtype=np.uint8)
+    tags = np.ascontiguousarray(phase_tags, dtype=np.uint8)
+    args = np.ascontiguousarray(phase_args, dtype=np.uint8).reshape(n, 5)
+    ne = np.ascontiguousarray(n_edges, dtype=np.uint16)
+
+    kinds = np.zeros(n, np.uint8)
+    arity = np.zeros(n, np.uint16)
+    slots = np.zeros((n, max_edges), np.uint16)
+
+    u8 = ctypes.POINTER(ctypes.c_uint8)
+    u16 = ctypes.POINTER(ctypes.c_uint16)
+    rc = lib.tzolkin_edge_slots(
+        states.ctypes.data_as(u8),
+        movers.ctypes.data_as(u8),
+        tags.ctypes.data_as(u8),
+        args.ctypes.data_as(u8),
+        ne.ctypes.data_as(u16),
+        ctypes.c_uint32(n),
+        ctypes.c_uint32(max_edges),
+        kinds.ctypes.data_as(u8),
+        arity.ctypes.data_as(u16),
+        slots.ctypes.data_as(u16),
+    )
+    if rc != 0:
+        raise RuntimeError(f"tzolkin_edge_slots failed with {rc}")
+    return kinds, arity, slots
+
+
+def edge_choices(
+    states: np.ndarray,
+    movers: np.ndarray,
+    phase_tags: np.ndarray,
+    phase_args: np.ndarray,
+    n_edges: np.ndarray,
+    max_edges: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-candidate ``Choice`` features for the pointer phases.
+
+    Returns ``(kinds, cells, feats)`` with ``feats`` of shape
+    ``[n, max_edges, D_CHOICE]``, zero-padded past each row's ``n_edges``.
+    ``kinds == 2`` marks the rows that actually reconstructed.
+
+    This is what makes ``Take`` trainable. It is 18% of the nodes a champion
+    search visits and its widest phase, and it had no policy target at all: the
+    pointer head ran at inference on parameters that had never seen a gradient
+    and scored worse than uniform.
+    """
+    lib = _lib()
+    import ctypes
+
+    n = len(states)
+    d_choice = D_CHOICE
+    if n == 0 or max_edges <= 0:
+        return (
+            np.zeros(0, np.uint8),
+            np.zeros(0, np.uint16),
+            np.zeros((0, max(max_edges, 1), d_choice), np.float32),
+        )
+    if not hasattr(lib, "tzolkin_edge_choices"):
+        raise RuntimeError(
+            "the loaded libtzolkin has no tzolkin_edge_choices; rebuild with "
+            "`cargo build --release` to train the pointer head"
+        )
+
+    states = np.ascontiguousarray(states, dtype=np.uint8).reshape(n, -1)
+    if states.shape[1] != _SLOT:
+        raise ValueError(f"state slot is {states.shape[1]} bytes, encoder wants {_SLOT}")
+    movers = np.ascontiguousarray(movers, dtype=np.uint8)
+    tags = np.ascontiguousarray(phase_tags, dtype=np.uint8)
+    args = np.ascontiguousarray(phase_args, dtype=np.uint8).reshape(n, 5)
+    ne = np.ascontiguousarray(n_edges, dtype=np.uint16)
+
+    kinds = np.zeros(n, np.uint8)
+    cells = np.zeros(n, np.uint16)
+    feats = np.zeros((n, max_edges, d_choice), np.float32)
+
+    u8 = ctypes.POINTER(ctypes.c_uint8)
+    u16 = ctypes.POINTER(ctypes.c_uint16)
+    rc = lib.tzolkin_edge_choices(
+        states.ctypes.data_as(u8),
+        movers.ctypes.data_as(u8),
+        tags.ctypes.data_as(u8),
+        args.ctypes.data_as(u8),
+        ne.ctypes.data_as(u16),
+        ctypes.c_uint32(n),
+        ctypes.c_uint32(max_edges),
+        kinds.ctypes.data_as(u8),
+        cells.ctypes.data_as(u16),
+        feats.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.c_uint32(feats.size),
+    )
+    if rc != 0:
+        raise RuntimeError(f"tzolkin_edge_choices failed with {rc}")
+    return kinds, cells, feats
+
+
 def value_targets(batch: dict, movers: np.ndarray) -> dict:
     """Rotate the stored per-seat targets into the querying player's frame.
 
@@ -244,6 +385,10 @@ def _rank_targets(scores: np.ndarray) -> np.ndarray:
 # records do not carry yet, so those rows train the value heads alone.
 PHASE_ARITY = PHASE_HEADS
 
+# `net.rs`'s `TOP_K`: at or under it stage 1 prunes nothing, so the loss
+# trained here is exactly the softmax the search reads.
+PTR_MAX_EDGES = 64
+
 
 def batch_arrays(batch: dict, schema: dict, augment: bool) -> tuple[np.ndarray, dict]:
     """Encode one sampled batch into inputs and targets. No torch.
@@ -268,34 +413,121 @@ def batch_arrays(batch: dict, schema: dict, augment: bool) -> tuple[np.ndarray, 
     targets = {"rel": t["z_rel"], "score": t["z_score"], "rank": t["rank"]}
 
     # `policy_kind == 0` means the visit indices are not regenerable from
-    # `(state, phase)`, which is every record until MCTS lands. Those rows are
-    # dropped here and the batch trains the value heads alone -- which is
-    # exactly the value warm-start of §6.7, not a degraded mode.
-    usable = rec["policy_kind"] != 0
-    if usable.any():
+    # `(state, phase)`. Those rows train the value heads alone.
+    #
+    # **And only the mover's own perspective trains the policy.** The 4x
+    # augmentation is legitimate for the value heads because the encoder takes
+    # the querying player independently and every seat has a value target. It is
+    # not legitimate here: `net.rs` only ever queries the policy from
+    # `phase.mover(turn)`'s perspective, and from any other seat the input does
+    # not even identify whose move is being predicted -- three of every four
+    # augmented rows were asking the head to produce the same distribution from
+    # inputs that cannot determine it. Restricting to `movers == mover` costs
+    # nothing (those rows still train the value heads) and removes 75% of the
+    # policy gradient, all of it noise.
+    usable = (rec["policy_kind"] != 0) & (movers == rec["mover"])
+    sel_all = np.where(usable)[0]
+    if len(sel_all):
+        ne_all = rec["n_edges"][sel_all].astype(np.int64)
+        max_edges = int(max(1, ne_all.max()))
+        kinds, arity_of, slots_all = edge_slots(
+            rec["state"][sel_all],
+            movers[sel_all],
+            rec["phase_tag"][sel_all],
+            rec["phase_args"][sel_all],
+            ne_all,
+            max_edges,
+        )
+        tags_all = rec["phase_tag"][sel_all]
         for tag, (name, arity) in PHASE_ARITY.items():
-            sel = np.where(usable & (rec["phase_tag"] == tag))[0]
-            if len(sel) == 0:
+            rows = np.where((kinds == 1) & (tags_all == tag))[0]
+            if len(rows) == 0:
                 continue
+            if not (arity_of[rows] == arity).all():
+                raise RuntimeError(
+                    f"arity disagreement on tag {tag}: arch.py says {arity}, "
+                    f"encode::edges says {sorted(set(arity_of[rows].tolist()))}"
+                )
+            sel = sel_all[rows]
+            ne = ne_all[rows]
+            sl = slots_all[rows].astype(np.int64)          # [R, max_edges]
             v = rec["visits"][sel]
+            eidx = v[:, :, 0].astype(np.int64)             # edge index, not slot
+            cnt = v[:, :, 1].astype(np.float32)
+            # An unused visit pair is (0, 0); an out-of-range index is a
+            # reconstruction failure. Both contribute zero rather than landing
+            # somewhere arbitrary.
+            good = eidx < ne[:, None]
+            cnt = np.where(good, cnt, 0.0)
+            eidx = np.where(good, eidx, 0)
+            tslot = np.take_along_axis(sl, eidx, axis=1)   # [R, 24] head slots
             dist = np.zeros((len(sel), arity), np.float32)
-            idx = np.clip(v[:, :, 0], 0, arity - 1)
-            np.add.at(dist, (np.arange(len(sel))[:, None], idx), v[:, :, 1].astype(np.float32))
+            np.add.at(dist, (np.arange(len(sel))[:, None], tslot), cnt)
             s = dist.sum(1, keepdims=True)
             dist = np.divide(dist, s, out=np.zeros_like(dist), where=s > 0)
-            # Legality mask, regenerated from the stored edge count rather than
-            # stored per record (`LEARNING.md` §6.2). For the fixed-arity heads
-            # the count is enough because their edges are enumerated in a fixed
-            # order; the `Take` head has no mask at all, its candidate list
-            # *is* the legal set.
-            n_edges = np.clip(rec["n_edges"][sel], 1, arity)
-            mask = np.arange(arity)[None, :] < n_edges[:, None]
+            # Legality mask: exactly the slots the legal edges map to
+            # (`LEARNING.md` §6.2 wants it regenerated, not stored -- but
+            # regenerated from the mapping, not from the edge count).
+            mask = np.zeros((len(sel), arity), bool)
+            live = np.arange(max_edges)[None, :] < ne[:, None]
+            rr = np.repeat(np.arange(len(sel))[:, None], max_edges, axis=1)
+            mask[rr[live], sl[live]] = True
             targets[f"policy_{name}"] = (
                 sel.astype(np.int64),
                 dist,
                 rec["policy_weight"][sel].astype(np.float32),
                 mask,
             )
+
+        # ---- the pointer phases (`Take`, `DraftTile`) --------------------
+        #
+        # Capped at PTR_MAX_EDGES because `net.rs` prunes to `TOP_K = 64` with
+        # stage 1 before stage 2 scores anything: at or under the cap, nothing
+        # is pruned and the cross-entropy trained here is *exactly* the softmax
+        # the search reads. Above it the target would have to model the pruning
+        # too. The cap keeps 92.4% of `Take` nodes.
+        ptr_rows = np.where(
+            np.isin(tags_all, POINTER_TAGS) & (ne_all >= 2) & (ne_all <= PTR_MAX_EDGES)
+        )[0]
+        if len(ptr_rows):
+            sel = sel_all[ptr_rows]
+            ne = ne_all[ptr_rows]
+            width = int(ne.max())
+            kinds2, cells, cand = edge_choices(
+                rec["state"][sel],
+                movers[sel],
+                rec["phase_tag"][sel],
+                rec["phase_args"][sel],
+                ne,
+                width,
+            )
+            keep = np.where(kinds2 == 2)[0]
+            if len(keep):
+                sel = sel[keep]
+                ne = ne[keep]
+                cand = cand[keep]
+                v = rec["visits"][sel]
+                eidx = v[:, :, 0].astype(np.int64)
+                cnt = v[:, :, 1].astype(np.float32)
+                good = eidx < ne[:, None]
+                cnt = np.where(good, cnt, 0.0)
+                eidx = np.where(good, eidx, 0)
+                dist = np.zeros((len(sel), width), np.float32)
+                np.add.at(dist, (np.arange(len(sel))[:, None], eidx), cnt)
+                sm = dist.sum(1, keepdims=True)
+                dist = np.divide(dist, sm, out=np.zeros_like(dist), where=sm > 0)
+                # The candidate list *is* the legal set, so the mask is only the
+                # zero padding out to `width`.
+                mask = np.arange(width)[None, :] < ne[:, None]
+                targets["policy_ptr"] = (
+                    sel.astype(np.int64),
+                    dist,
+                    rec["policy_weight"][sel].astype(np.float32),
+                    mask,
+                    cand,
+                    cells[keep].astype(np.int64),
+                    rec["phase_tag"][sel].astype(np.int64),
+                )
     return x, targets
 
 

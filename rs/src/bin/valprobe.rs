@@ -179,6 +179,9 @@ fn main() {
     };
 
     let mut evals: Vec<(String, Box<dyn Evaluator>)> = Vec::new();
+    // The bare nets as well, for the policy probe: `Blended` only touches the
+    // value, so a prior has to come off the `Net` itself.
+    let mut nets: Vec<(String, Net)> = Vec::new();
     for s in &specs {
         if s == "heuristic" {
             evals.push(("heuristic (eval.rs, today)".into(), Box::new(HeuristicEvaluator)));
@@ -194,7 +197,15 @@ fn main() {
             _ => (s.as_str(), 0.0),
         };
         match Net::load(p) {
-            Ok(net) => evals.push((s.clone(), Box::new(Blended { net, blend }))),
+            Ok(net) => {
+                if blend == 0.0 {
+                    match Net::load(p) {
+                        Ok(n2) => nets.push((s.clone(), n2)),
+                        Err(e) => eprintln!("cannot re-load {p} for the policy probe: {e}"),
+                    }
+                }
+                evals.push((s.clone(), Box::new(Blended { net, blend })))
+            }
             Err(e) => {
                 eprintln!("cannot load {p}: {e}");
                 std::process::exit(1);
@@ -274,6 +285,9 @@ fn main() {
     if std::env::var("VALPROBE_PHASES").is_ok() {
         phase_sweep(path, &evals, start, total, stride.max(1) * 20);
     }
+    if std::env::var("VALPROBE_POLICY").is_ok() {
+        policy_probe(path, &nets, start, total, stride.max(1));
+    }
 }
 
 /// How much does an evaluator's value move when only the *phase* changes?
@@ -340,5 +354,249 @@ fn phase_sweep(
             print!(" {:>11.4}", sums[e][k] / n);
         }
         println!();
+    }
+}
+
+// ===========================================================================
+// The policy probe
+// ===========================================================================
+//
+// `VALPROBE_POLICY=1`. Everything above asks whether an evaluator's *value* is
+// a better predictor than `eval::heuristic`'s. This asks the other half, which
+// only became answerable when champion self-play gave the records a
+// `TREE_EDGE` policy target: is the net's **prior** a better ranking of the
+// edges than `Priors::OnePly` -- the one-ply `eval::heuristic` softmax that
+// `mcts.rs:2191` actually uses -- against the visit distribution the 8,192-
+// simulation search backed up?
+//
+// The comparison is exactly the one the search makes, and it costs seconds
+// where the arena costs core-hours. Three rows:
+//
+// * `net`      -- `Net::evaluate(...).priors`, i.e. what `Priors::Evaluator`
+//                 would hand `priors_for`. Straight from the same code path.
+// * `one-ply`  -- `apply_step` + `eval::heuristic(mover)` + softmax at
+//                 `prior_temp = 1`, which is `Mcts::one_ply` re-implemented
+//                 against the public API. Its control is that it must beat
+//                 uniform by a lot; `OVERNIGHT.md` prices that gap at ~7 points.
+// * `uniform`  -- 1/n, the floor.
+//
+// Scored two ways: cross-entropy against the normalised visit distribution
+// (lower better; the floor is the target's own entropy, printed beside it) and
+// top-1 agreement with the visit argmax.
+//
+// It also checks the assumption `train/features.py` makes when it builds the
+// fixed-arity targets: that **edge index == head slot**. `encode::edges` is the
+// authority on that mapping, so the two are compared here per phase and the
+// disagreement rate is reported. A scrambled target trains the head to rank the
+// wrong move and nothing downstream would ever say so.
+
+const O_POLICY_KIND: usize = 338;
+const O_N_EDGES: usize = 340;
+const O_N_VISIT_PAIRS: usize = 342;
+const O_VISITS: usize = 348;
+const MAX_VISIT_PAIRS: usize = 24;
+
+#[derive(Default, Clone)]
+struct PolAcc {
+    n: f64,
+    ce: [f64; 3],
+    top1: [f64; 3],
+    tgt_entropy: f64,
+    edges: f64,
+}
+
+impl PolAcc {
+    fn add(&mut self, t: &[f32], ps: [&Vec<f32>; 3]) {
+        self.n += 1.0;
+        self.edges += t.len() as f64;
+        let amax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                    if x > bv {
+                        (i, x)
+                    } else {
+                        (bi, bv)
+                    }
+                })
+                .0
+        };
+        let ta = amax(t);
+        self.tgt_entropy += -t
+            .iter()
+            .map(|&x| if x > 0.0 { x as f64 * (x as f64).ln() } else { 0.0 })
+            .sum::<f64>();
+        for (k, p) in ps.iter().enumerate() {
+            let ce: f64 = t
+                .iter()
+                .zip(p.iter())
+                .map(|(&tv, &pv)| {
+                    if tv > 0.0 {
+                        -(tv as f64) * (pv.max(1e-9) as f64).ln()
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+            self.ce[k] += ce;
+            if amax(p) == ta {
+                self.top1[k] += 1.0;
+            }
+        }
+    }
+}
+
+fn softmax_t1(raw: &[f32]) -> Vec<f32> {
+    let best = raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut out: Vec<f32> = raw.iter().map(|x| (x - best).exp()).collect();
+    let s: f32 = out.iter().sum();
+    if s > 0.0 {
+        for x in out.iter_mut() {
+            *x /= s;
+        }
+    }
+    out
+}
+
+fn policy_probe(path: &str, nets: &[(String, Net)], start: usize, total: usize, stride: usize) {
+    use tzolkin::encode::{edges as edge_spec, EdgeSpec};
+    use tzolkin::phase::Phase;
+    use tzolkin::tree;
+
+    let names = ["Beg", "Mode", "Placing", "PickWorker", "Take", "ExtraDay", "PityPlace", "DraftTile"];
+    let mut per: Vec<Vec<PolAcc>> = vec![vec![PolAcc::default(); 9]; nets.len().max(1)];
+    // (records where encode::edges gave a Fixed spec, of those where idx != identity)
+    let mut slot_seen = [0.0f64; 8];
+    let mut slot_bad = [0.0f64; 8];
+    let mut skipped_len = 0usize;
+    let mut skipped_kind = 0usize;
+
+    let mut f = File::open(path).unwrap();
+    let mut buf = [0u8; RECORD_BYTES];
+    let mut i = start;
+    let mut feats: Vec<f32> = Vec::new();
+    while i < total {
+        f.seek(SeekFrom::Start((HEADER_BYTES + i * RECORD_BYTES) as u64))
+            .unwrap();
+        if f.read_exact(&mut buf).is_err() {
+            break;
+        }
+        i += stride;
+        if buf[O_POLICY_KIND] == 0 {
+            skipped_kind += 1;
+            continue;
+        }
+        let n_edges = u16::from_le_bytes([buf[O_N_EDGES], buf[O_N_EDGES + 1]]) as usize;
+        if n_edges < 2 {
+            continue;
+        }
+        let pairs =
+            (u16::from_le_bytes([buf[O_N_VISIT_PAIRS], buf[O_N_VISIT_PAIRS + 1]]) as usize)
+                .min(MAX_VISIT_PAIRS);
+        let r = read_record(&buf);
+        let tag = r.phase.tag() as usize;
+        let mover = r.phase.mover(r.turn);
+
+        // Target: visit counts over edges, normalised. A pair whose index is
+        // out of range is a reconstruction failure, not something to clamp.
+        let mut t = vec![0f32; n_edges];
+        let mut bad = false;
+        let mut sum = 0f32;
+        for k in 0..pairs {
+            let o = O_VISITS + k * 4;
+            let idx = u16::from_le_bytes([buf[o], buf[o + 1]]) as usize;
+            let cnt = u16::from_le_bytes([buf[o + 2], buf[o + 3]]) as f32;
+            if idx >= n_edges {
+                bad = true;
+                break;
+            }
+            t[idx] += cnt;
+            sum += cnt;
+        }
+        if bad || sum <= 0.0 {
+            skipped_len += 1;
+            continue;
+        }
+        for x in t.iter_mut() {
+            *x /= sum;
+        }
+
+        // The features.py assumption, checked against the authority.
+        feats.clear();
+        if let EdgeSpec::Fixed { idx, .. } = edge_spec(&r.state, mover, r.phase, n_edges, &mut feats)
+        {
+            slot_seen[tag] += 1.0;
+            if idx.iter().enumerate().any(|(e, &s)| s as usize != e) {
+                slot_bad[tag] += 1.0;
+            }
+        }
+
+        // One-ply: the prior `Priors::OnePly` would compute for this node.
+        let steps = tree::legal_steps(&r.state, r.phase, r.turn, r.done);
+        if steps.len() != n_edges {
+            skipped_len += 1;
+            continue;
+        }
+        let raw: Vec<f32> = steps
+            .iter()
+            .map(|st| {
+                let mut next = r.state;
+                let _ = tree::apply_step(&mut next, r.phase, r.turn, r.done, st);
+                tzolkin::eval::heuristic(&next, mover)
+            })
+            .collect();
+        let one_ply = softmax_t1(&raw);
+        let uniform = vec![1.0f32 / n_edges as f32; n_edges];
+
+        for (ni, (_, net)) in nets.iter().enumerate() {
+            let p = net.evaluate(&r.state, r.phase, r.turn, n_edges).priors;
+            let p = if p.len() == n_edges { p } else { uniform.clone() };
+            per[ni][tag].add(&t, [&p, &one_ply, &uniform]);
+            per[ni][8].add(&t, [&p, &one_ply, &uniform]);
+        }
+        let _ = Phase::Mode;
+    }
+
+    println!("\n  ===================================================================");
+    println!("  POLICY PROBE -- the prior, not the value");
+    println!("  skipped: {skipped_kind} with policy_kind = NONE, {skipped_len} whose edge list did not reconstruct");
+    println!("\n  features.py's `edge index == head slot` assumption, vs encode::edges:");
+    println!("  {:<12} {:>10} {:>12}", "phase", "fixed nodes", "mismatched");
+    for tag in 0..8 {
+        if slot_seen[tag] > 0.0 {
+            println!(
+                "  {:<12} {:>10.0} {:>11.1}%",
+                names[tag],
+                slot_seen[tag],
+                100.0 * slot_bad[tag] / slot_seen[tag]
+            );
+        }
+    }
+    for (ni, (name, _)) in nets.iter().enumerate() {
+        let short: String = name.rsplit('/').next().unwrap_or(name).chars().take(30).collect();
+        println!("\n  --- {short}");
+        println!(
+            "  {:<12} {:>7} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "phase", "nodes", "edges", "H(tgt)", "CE net", "CE 1ply", "CE unif", "T1 net", "T1 1ply"
+        );
+        for tag in 0..9 {
+            let a = &per[ni][tag];
+            if a.n == 0.0 {
+                continue;
+            }
+            let nm = if tag == 8 { "ALL" } else { names[tag] };
+            println!(
+                "  {:<12} {:>7.0} {:>6.2} {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>8.3} {:>8.3}",
+                nm,
+                a.n,
+                a.edges / a.n,
+                a.tgt_entropy / a.n,
+                a.ce[0] / a.n,
+                a.ce[1] / a.n,
+                a.ce[2] / a.n,
+                a.top1[0] / a.n,
+                a.top1[1] / a.n,
+            );
+        }
     }
 }

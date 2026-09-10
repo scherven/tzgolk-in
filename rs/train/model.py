@@ -206,12 +206,25 @@ class Pointer(nn.Module):
         nn.init.normal_(self.cell_emb, std=0.02)
         nn.init.normal_(self.step_emb, std=0.02)
 
-    def forward(self, h, cand, mask):
-        """``h`` [N, W]; ``cand`` [N, C, d_choice]; ``mask`` [N, C] bool."""
+    def forward(self, h, cand, mask, cell=None, tag=None):
+        """``h`` [N, W]; ``cand`` [N, C, d_choice]; ``mask`` [N, C] bool.
+
+        ``cell`` and ``tag`` are [N] int64. **Pass them.** `net.rs`'s `finish`
+        builds the stage-2 query as ``q_deep(h) + cell_emb[cell] +
+        step_emb[tag]``, so leaving them out here trains a different function
+        from the one the search reads: the two embeddings stay at their N(0,
+        0.02) initialisation and arrive at inference as pure noise on every
+        pointer query. They are optional only so an older caller keeps working.
+        """
         fast = torch.einsum("nd,ncd->nc", self.q_fast(h), cand)
         fast = fast.masked_fill(~mask, float("-inf"))
         k = self.key2(self.act(self.key1(cand)))
-        deep = torch.einsum("nd,ncd->nc", self.q_deep(h), k)
+        q = self.q_deep(h)
+        if cell is not None:
+            q = q + self.cell_emb[cell]
+        if tag is not None:
+            q = q + self.step_emb[tag]
+        deep = torch.einsum("nd,ncd->nc", q, k)
         deep = deep.masked_fill(~mask, float("-inf"))
         return fast, deep
 
@@ -228,13 +241,20 @@ class Net(nn.Module):
         self.policy = PolicyHeads(cfg)
         self.ptr = Pointer(cfg)
 
-    def forward(self, x, cand=None, cand_mask=None):
+    def forward(self, x, cand=None, cand_mask=None, ptr_rows=None, cell=None, tag=None):
+        """``ptr_rows`` selects which rows of the batch are pointer nodes.
+
+        Only ~18% of a batch is `Take`, and the candidate tensor is
+        ``[rows, C, 96]``, so gathering first is the difference between a
+        4 MB tensor and a 24 MB one of mostly padding.
+        """
         h = self.fuse.norm(self.fuse(self.stem(x)))
         h = self.trunk(h)
         out = {"h": h, "policy": self.policy(h)}
         out.update(self.value(h))
         if cand is not None:
-            out["ptr_fast"], out["ptr_deep"] = self.ptr(h, cand, cand_mask)
+            hp = h if ptr_rows is None else h[ptr_rows]
+            out["ptr_fast"], out["ptr_deep"] = self.ptr(hp, cand, cand_mask, cell, tag)
         return out
 
     def n_params(self) -> int:
@@ -261,6 +281,13 @@ W_POLICY = {
     "who": 1.0,
     "extra_day": 0.5,
 }
+# The pointer head. `Take` is 18% of a champion search's nodes and its widest
+# phase; the same weight as the other big heads. `W_PTR_FAST` is the stage-1
+# scorer, trained against the same target so it learns to approximate stage 2
+# (LEARNING.md 2.3) -- it only bites above `TOP_K` candidates, which is why it
+# is a minority term rather than an equal one.
+W_PTR = 1.0
+W_PTR_FAST = 0.25
 W_DECOMP = 0.3
 
 
@@ -295,6 +322,14 @@ def loss_fn(out: dict, tgt: dict) -> tuple[torch.Tensor, dict]:
         lp = F.log_softmax(logits, dim=-1)
         ce = -(target * lp).nan_to_num(0.0).sum(-1)
         parts[f"pi_{name}"] = w * (ce * weight).mean()
+
+    t = tgt.get("policy_ptr")
+    if t is not None and "ptr_deep" in out:
+        target, weight, mask = t[0], t[1], t[2]
+        for key, w in (("ptr_deep", W_PTR), ("ptr_fast", W_PTR_FAST)):
+            lp = F.log_softmax(out[key].masked_fill(~mask, float("-inf")), dim=-1)
+            ce = -(target * lp).nan_to_num(0.0).sum(-1)
+            parts["pi_" + key[4:]] = w * (ce * weight).mean()
 
     total = sum(parts.values())
     return total, {k: float(v.detach()) for k, v in parts.items()}

@@ -17,6 +17,10 @@ N_PLACE = 7
 N_WHO = 56
 N_CELLS = 55
 N_PHASE_TAGS = 8
+# `encode::D_CHOICE` -- the per-candidate feature width the pointer head reads.
+# `tzolkin_edge_choices` length-checks against it, so a disagreement is a -2
+# return rather than a silent reshape.
+D_CHOICE = 96
 N_DECOMP = 6  # score components per player, LEARNING.md §3.2
 
 # Fixed-arity policy heads, keyed by `Phase::tag()` in src/phase.rs. The arity
@@ -52,7 +56,7 @@ class Config:
     globals_: int = 128
     value_hidden: int = 256
     key: int = 128
-    d_choice: int = 96
+    d_choice: int = D_CHOICE
     dropout: float = 0.0
 
     # Input geometry, fixed by src/encode.rs.
