@@ -214,11 +214,39 @@ def test_phase_tables_agree():
           f"{PHASE_ARITY} vs {PHASE_HEADS}")
 
 
+def test_holdout_is_disjoint(directory: str):
+    """`sample_holdout` must never hand back a record the optimiser can draw.
+
+    The held-out loss `train.py` prints is only a generalisation number if this
+    holds; if the two ranges overlap it silently becomes a second, noisier copy
+    of the training loss, which is the failure that would be hardest to notice
+    from the curve alone.
+    """
+    buf = Buffer.open(directory, holdout=0.05)
+    check("holdout reserves a tail", buf.n_train < buf.n,
+          f"{buf.n_train:,} of {buf.n:,}")
+    rng = np.random.default_rng(7)
+    idx = rng.integers(buf.n_train, buf.n, size=4096)
+    check("holdout indices are past the training end", bool((idx >= buf.n_train).all()))
+    # The public path, not the index arithmetic: draw and confirm it decodes.
+    d = buf.sample_holdout(256, np.random.default_rng(11))
+    check("sample_holdout returns a full batch", len(d["state"]) == 256,
+          f"{len(d['state'])}")
+    # And a buffer with no holdout must refuse rather than fall back to sample().
+    plain = Buffer.open(directory, holdout=0.0)
+    try:
+        plain.sample_holdout(8)
+        check("no-holdout buffer refuses to sample one", False)
+    except ValueError:
+        check("no-holdout buffer refuses to sample one", True)
+
+
 def main():
     directory = sys.argv[1] if len(sys.argv) > 1 else "replay"
     buf = Buffer.open(directory)
     print(buf.summary())
     print("\nchecks")
+    test_holdout_is_disjoint(directory)
     test_policy_targets(buf)
     test_slot_map_is_not_the_identity(buf)
     test_perspective(buf)

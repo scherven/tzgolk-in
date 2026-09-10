@@ -345,6 +345,14 @@ def value_targets(batch: dict, movers: np.ndarray) -> dict:
         "z_score": np.clip((scores - SCORE_CENTRE) / SCORE_SCALE, -2.0, 2.0),
         "rank": _rank_targets(scores),
         "win_share": batch["win_share"].astype(np.float32)[rows, rot],
+        # The search's own backed-up value at this node, per seat, in the same
+        # centred convention as `z_rel` (rowsum 0, measured) and rotated the
+        # same way. Present and finite on 100% of champion records and never
+        # read until now. It is a *lower-variance* target than the game outcome
+        # -- sd 0.294 against z_rel's 0.361 -- and on held-out records it
+        # predicts z_rel better than any evaluator this project has (rmse
+        # 0.2485, where `eval::heuristic` is 0.2702 and the best net 0.2600).
+        "root_value": batch["root_value"].astype(np.float32)[rows, rot],
     }
 
 
@@ -390,7 +398,9 @@ PHASE_ARITY = PHASE_HEADS
 PTR_MAX_EDGES = 64
 
 
-def batch_arrays(batch: dict, schema: dict, augment: bool) -> tuple[np.ndarray, dict]:
+def batch_arrays(
+    batch: dict, schema: dict, augment: bool, value_mix: float = 0.0
+) -> tuple[np.ndarray, dict]:
     """Encode one sampled batch into inputs and targets. No torch.
 
     ``augment`` turns on the 4x perspective augmentation of ``LEARNING.md``
@@ -399,7 +409,18 @@ def batch_arrays(batch: dict, schema: dict, augment: bool) -> tuple[np.ndarray, 
     querying player independently of whose turn it is, and it trains exactly the
     off-turn query a max^n backup makes. It is this domain's substitute for Go's
     8-fold dihedral augmentation and the only one available.
+
+    ``value_mix`` blends the search's backed-up value into the ``rel`` target:
+    ``(1 - mix) * z_rel + mix * root_value``. 0.0 is the game outcome alone,
+    which is what every checkpoint before this was trained on. The policy head
+    already learns from a search target (the visit distribution) and is the
+    strongest thing in the net; the value head learns from the final score and
+    is the weakest. This makes that asymmetry a knob rather than an assumption.
+    Nothing about the architecture changes -- same tensors, same manifest, same
+    `src/net.rs` -- so a checkpoint trained at any mix loads unmodified.
     """
+    if not 0.0 <= value_mix <= 1.0:
+        raise ValueError(f"value_mix must be in 0..=1, got {value_mix}")
     if augment:
         reps = N_PLAYERS
         rec = {k: np.repeat(v, reps, axis=0) for k, v in batch.items()}
@@ -410,7 +431,10 @@ def batch_arrays(batch: dict, schema: dict, augment: bool) -> tuple[np.ndarray, 
 
     x = encode_batch(rec["state"], movers, rec["phase_tag"], rec["phase_args"], schema)
     t = value_targets(rec, movers)
-    targets = {"rel": t["z_rel"], "score": t["z_score"], "rank": t["rank"]}
+    rel = t["z_rel"]
+    if value_mix > 0.0:
+        rel = (1.0 - value_mix) * rel + value_mix * t["root_value"]
+    targets = {"rel": rel, "score": t["z_score"], "rank": t["rank"]}
 
     # `policy_kind == 0` means the visit indices are not regenerable from
     # `(state, phase)`. Those rows train the value heads alone.

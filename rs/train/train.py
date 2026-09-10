@@ -77,8 +77,9 @@ def warmup(step: int, n: int = 200) -> float:
 # ----------------------------------------------------------------------
 
 
-def make_batch(buf: Buffer, n: int, rng, augment: bool):
-    """One training batch as tensors.
+def make_batch(buf: Buffer, n: int, rng, augment: bool, held: bool = False,
+               value_mix: float = 0.0):
+    """One batch as tensors, from the training head or the held-out tail.
 
     All the actual work is `features.batch_arrays`, which is torch-free so that
     the encoding and the target construction can be smoke-tested on a machine
@@ -86,7 +87,8 @@ def make_batch(buf: Buffer, n: int, rng, augment: bool):
 
         python train/features.py replay
     """
-    x, t = batch_arrays(buf.sample(n, rng), buf.schema, augment)
+    draw = buf.sample_holdout if held else buf.sample
+    x, t = batch_arrays(draw(n, rng), buf.schema, augment, value_mix=value_mix)
     tgt: dict = {}
     ptr = None
     for k, v in t.items():
@@ -118,6 +120,63 @@ def make_batch(buf: Buffer, n: int, rng, augment: bool):
         else:
             tgt[k] = torch.from_numpy(v)
     return torch.from_numpy(x), tgt, ptr
+
+
+# ----------------------------------------------------------------------
+# held-out loss
+# ----------------------------------------------------------------------
+
+
+def forward(net, x, ptr, dev):
+    """One forward pass, routing the pointer rows if the batch has any."""
+    if ptr is None:
+        return net(x)
+    rows, cand, cmask, cell, ptag = (t.to(dev) for t in ptr)
+    return net(x, cand=cand, cand_mask=cmask, ptr_rows=rows, cell=cell, tag=ptag)
+
+
+def to_dev(tgt, dev):
+    return {
+        k: (v.to(dev) if torch.is_tensor(v) else tuple(t.to(dev) for t in v))
+        for k, v in tgt.items()
+    }
+
+
+def evaluate(net, buf: Buffer, dev, batch: int, batches: int, gen: int, augment: bool,
+             value_mix: float = 0.0):
+    """Mean loss on the held-out tail, by component.
+
+    Two things make this comparable across steps rather than a fresh sample of
+    noise each time. The rng is **re-seeded identically on every call**, so it
+    is the same records every time and a change in the number is a change in
+    the net; and `net.eval()` is entered even though `Config.dropout` is 0.0
+    today, because a future non-zero dropout would otherwise turn this into a
+    quietly different quantity.
+
+    Returned separately from the training loss on purpose: the training loss
+    cannot distinguish a net that is learning from a net that is memorising,
+    and "is more data worth generating?" is exactly that question.
+    """
+    rng = np.random.default_rng(99_991 + gen)
+    was_training = net.training
+    net.eval()
+    acc: dict[str, float] = {}
+    n = 0
+    try:
+        with torch.no_grad():
+            for _ in range(batches):
+                x, tgt, ptr = make_batch(buf, batch, rng, augment=augment, held=True,
+                                         value_mix=value_mix)
+                out = forward(net, x.to(dev), ptr, dev)
+                total, parts = loss_fn(out, to_dev(tgt, dev))
+                parts["total"] = float(total.detach())
+                for k, v in parts.items():
+                    acc[k] = acc.get(k, 0.0) + v
+                n += 1
+    finally:
+        if was_training:
+            net.train()
+    return {k: v / max(n, 1) for k, v in acc.items()}
 
 
 # ----------------------------------------------------------------------
@@ -178,17 +237,35 @@ def main():
     ap.add_argument("--size", choices=["small", "main"], default="small")
     # A contiguous tail of whole games the optimiser never draws from, so
     # `valprobe --from` measures generalisation rather than memorisation.
+    # NOT the newest records, which is what this used to claim and what N53
+    # cost: `Buffer.open` indexes the newest shard first, so the reserved tail
+    # is the *oldest* games. `buf.summary()` prints the VALPROBE_FROM that
+    # walks it.
     ap.add_argument("--holdout", type=float, default=0.02,
-                    help="fraction of the newest records reserved for evaluation")
+                    help="fraction of the buffer reserved for evaluation "
+                         "(a contiguous tail of whole games; see buf.summary() "
+                         "for which shard it lands in)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--lr", type=float, default=None, help="override the §6.6 schedule")
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--no-augment", action="store_true", help="disable 4x perspective augmentation")
+    # `root_value` -- the search's own backed-up value -- is in every record and
+    # was never read. 0.0 reproduces every checkpoint before this one.
+    ap.add_argument("--value-mix", type=float, default=0.0,
+                    help="blend root_value into the `rel` target: "
+                         "(1-mix)*z_rel + mix*root_value")
     ap.add_argument("--init", default=None, help="warm-start from this checkpoint base")
     ap.add_argument("--resume", action="store_true", help="continue this generation")
     ap.add_argument("--checkpoint-every", type=int, default=250)
     ap.add_argument("--log-every", type=int, default=50)
+    # The holdout existed before this and nothing read it: the loop reported a
+    # running *training* loss and nothing else, which is the one quantity that
+    # cannot tell learning from memorising.
+    ap.add_argument("--eval-every", type=int, default=500,
+                    help="held-out loss every N steps; 0 disables")
+    ap.add_argument("--eval-batches", type=int, default=8,
+                    help="batches averaged per held-out evaluation")
     args = ap.parse_args()
 
     signal.signal(signal.SIGINT, _on_sigint)
@@ -244,8 +321,14 @@ def main():
           f"{' x4 perspective' if not args.no_augment else ''}, "
           f"{args.steps} steps, device {args.device}\n")
 
+    do_eval = args.eval_every > 0 and buf.n_train < buf.n
+    if args.eval_every > 0 and not do_eval:
+        print("[warn] --eval-every set but the buffer has no holdout; "
+              "no held-out loss will be reported", file=sys.stderr)
+
     t0 = time.time()
     running: dict[str, float] = {}
+    held: list[dict] = []
     step = start
     try:
         for step in range(start, args.steps):
@@ -254,19 +337,10 @@ def main():
             for g in opt.param_groups:
                 g["lr"] = base_lr * warmup(step - start)
 
-            x, tgt, ptr = make_batch(buf, args.batch, rng, augment=not args.no_augment)
-            x = x.to(dev)
-            tgt = {
-                k: (v.to(dev) if torch.is_tensor(v) else tuple(t.to(dev) for t in v))
-                for k, v in tgt.items()
-            }
-
-            if ptr is None:
-                out = net(x)
-            else:
-                rows, cand, cmask, cell, ptag = (t.to(dev) for t in ptr)
-                out = net(x, cand=cand, cand_mask=cmask, ptr_rows=rows, cell=cell, tag=ptag)
-            total, parts = loss_fn(out, tgt)
+            x, tgt, ptr = make_batch(buf, args.batch, rng, augment=not args.no_augment,
+                                     value_mix=args.value_mix)
+            out = forward(net, x.to(dev), ptr, dev)
+            total, parts = loss_fn(out, to_dev(tgt, dev))
             opt.zero_grad(set_to_none=True)
             total.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip)
@@ -282,13 +356,39 @@ def main():
                     f"{comp}  {(step + 1 - start) / max(el, 1e-9):.1f} steps/s",
                     flush=True,
                 )
+            if do_eval and (step + 1) % args.eval_every == 0:
+                h = evaluate(net, buf, dev, args.batch, args.eval_batches,
+                             args.gen, augment=not args.no_augment,
+                             value_mix=args.value_mix)
+                held.append({"step": step + 1, **h})
+                with open(base + ".held.jsonl", "a") as f:
+                    f.write(json.dumps(held[-1]) + "\n")
+                comp = "  ".join(f"{k} {v:.4f}" for k, v in sorted(h.items())
+                                 if k != "total")
+                print(f"  HELD {step + 1:>5}/{args.steps}  loss {h['total']:.4f}  "
+                      f"{comp}", flush=True)
             if (step + 1) % args.checkpoint_every == 0:
-                save(base, net, opt, step + 1, args.gen, {"loss": running})
+                save(base, net, opt, step + 1, args.gen,
+                     {"loss": running, "held": held[-1] if held else None})
     except KeyboardInterrupt:
         print("\n[interrupt] hard stop; the last periodic checkpoint stands.")
         raise SystemExit(130)
 
-    save(base, net, opt, step + 1, args.gen, {"loss": running, "records": buf.n})
+    # ...unless the loop's last step was already an evaluation step, which it is
+    # whenever --steps is a multiple of --eval-every.
+    if do_eval and not (held and held[-1]["step"] == step + 1):
+        h = evaluate(net, buf, dev, args.batch, args.eval_batches, args.gen,
+                     augment=not args.no_augment, value_mix=args.value_mix)
+        held.append({"step": step + 1, **h})
+        with open(base + ".held.jsonl", "a") as f:
+            f.write(json.dumps(held[-1]) + "\n")
+        comp = "  ".join(f"{k} {v:.4f}" for k, v in sorted(h.items()) if k != "total")
+        print(f"  HELD {step + 1:>5}/{args.steps}  loss {h['total']:.4f}  {comp}",
+              flush=True)
+    save(base, net, opt, step + 1, args.gen,
+         {"loss": running, "held": held[-1] if held else None, "records": buf.n,
+          "train_records": buf.n_train, "shards": len(buf.shards),
+          "value_mix": args.value_mix})
     print(f"\nsaved {base}.pt (+ .opt.pt, .json) at step {step + 1}")
     if STOP:
         print("interrupted; resume with --resume")

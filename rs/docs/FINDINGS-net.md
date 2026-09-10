@@ -1696,3 +1696,848 @@ money.
 ```
 
 160 games, days 27.00, 0 aborted. Half-width **1.24**.
+
+---
+
+# Session 14 (continued after a usage-limit kill mid-sentence at N49)
+
+## N50. Collecting the races that were still running — and a correction to N49
+
+Read off disk before touching anything, `summ.py` over `logs2/*.jsonl`:
+
+```
+f8-full     blk 40  centred +13.600 (+12.368,+14.832)  win 0.831  cand 62.19 base 44.05
+f8-full-b   blk 12  centred +13.125 (+10.473,+15.777)  win 0.792  cand 62.25 base 44.75
+  POOLED    blk 52  centred +13.490 (+12.374,+14.607)  win 0.822  208 games, 0 aborted
+m2-main     blk 12  centred +15.307 (+12.889,+17.726)  win 0.802  cand 57.27 base 36.86
+f2-full     blk 18  centred +14.250 (+12.352,+16.148)  win 0.826  cand 57.33 base 38.33
+l8-ladder   blk  8  centred +20.898 (+17.922,+23.875)  win 0.906  cand 73.00 base 45.14
+p2-prior    blk 24  centred  +9.237 ( +7.815,+10.659)  win 0.635
+s2-control  blk 50  centred  -0.016 ( -1.387, +1.354)  win 0.305   <- the null, still null
+u2-uniform  blk 78  centred -21.921 (-23.211,-20.630)  win 0.000
+```
+
+**(a) `f8-full-b` has now contributed, and the pooling works.** Twelve blocks
+from seeds 8500000.., zero duplicates against the primary's 8000000.. range,
+and the two independent runners agree to within 0.5 of a point (+13.60 against
++13.13, intervals overlapping almost entirely). Pooled, **52 blocks / 208 games,
++13.49 [+12.37, +14.61]**, half-width **1.12** — below the 1.33 noise floor N25
+measured at 50 blocks. This is the number for the champion-budget race and it is
+finished; the point estimate has moved 0.57 of a point across 10 -> 52 blocks.
+
+**(b) N49 was six blocks and the third digit was not the only thing that was
+noise.** `m2-main` has doubled to 12 blocks and the MAIN advantage has halved:
+
+| checkpoint | params | centred at 2,048 | blocks | interval |
+| --- | --- | --- | --- | --- |
+| SMALL `p2000` | 1,913,016 | +14.25 | 18 | [+12.35, +16.15] |
+| MAIN `m8000` | 4,332,376 | **+15.31** (was +17.23 at 6 blk) | 12 | [+12.89, +17.73] |
+
+The intervals now overlap over almost their whole length. **N49's "+3.0 points,
+intervals do not overlap" does not survive doubling the block count** — the gap
+is +1.06 and the pooled half-width on the difference is larger than the gap.
+MAIN is not yet shown to be worth anything in the arena. The offline case (N42:
+`sd` 0.195 -> 0.241, every policy head better, top-1 0.661 -> 0.693) stands
+unchanged; what does not stand is the claim that it converts to three points of
+score. Logged here before doing anything else, because N49 as written is wrong.
+
+## N51. The second generation is the wrong next input, because the *first* one was only 39% consumed
+
+Before deciding anything about generating more games I counted what is already
+on disk. `data/replay-champ/manifest.json`:
+
+```
+generation 20, agent mcts8192/heuristic:pt=1:pmin=2:cp=0.02, commit 901257d
+games   20,000
+records 1,856,372   over 8 shards, gen0020-000 .. gen0020-007
+```
+
+And the header of both training runs that produced the checkpoints this whole
+session is built on (`train-ptr.log` and `train-main.log`, identical first line):
+
+```
+724,241 records over 4 shards  (688,028 trainable, 5.0% held out)
+  newest shard : gen0020-003-20260909T202303Z.tzr
+```
+
+**`p2000` and `m8000` were trained on shards 000-003 only — 724,241 of
+1,856,372 records, 39%.** Not by a choice anyone made: shards 004-007 were
+written at 21:23, 22:23, 23:23 and 00:19, and the training ran 17:33-18:43. The
+self-play the brief describes as "finished at 20,000 games" finished *after* the
+nets were trained, and **2.56x the data has never had a gradient taken on it.**
+
+So N45(d)'s "how much more data would it take? None" was answered against 688k
+records, and the experiment that tests it has been sitting on disk unrun and
+costs no self-play at all.
+
+**Decision: do not generate a second generation yet.** A generation of games
+from `p2000`/`m8000` is 20,000 games of 8,192-simulation search — the single
+most expensive thing this project can do — and it would be bought *before*
+finding out whether the data already generated is exhausted. The order is:
+
+1. Retrain `MAIN` on the full buffer, same recipe, same step count, **only the
+   buffer changes** — the controlled version of "is it data or parameters?".
+2. If the value head's `sd` climbs off 0.241 toward the target's 0.361 and the
+   arena moves, **data was still binding**, N45(d) is wrong, and a second
+   generation is worth its cost.
+3. If it does not move, data is genuinely saturated at this architecture, and
+   the second generation is worth its cost for a *different* reason (better
+   targets from a stronger searcher), which is a claim that then has to be
+   argued rather than assumed.
+
+Set up so both nets are scored on records neither has seen: shard
+`gen0020-007` (142 MB, ~277k records) is withheld from the new run entirely and
+becomes the common holdout for `valprobe`.
+
+## N52. `train.py` now reads the holdout it has always reserved
+
+`Buffer.__init__` has carved a contiguous tail of whole games out of the
+sampling range since the loader was written, and `train.py` never once looked at
+it. Every number in `train-ptr.log` and `train-main.log` — every number this
+session's architecture conclusions were read off — is a **training** loss, which
+is the one quantity that cannot distinguish a net that is learning from a net
+that is memorising. That is a bad instrument to answer N51 with, so it is fixed
+before N51's run is read.
+
+* `Buffer.sample_holdout(n, rng)` (`train/replay.py`) draws from
+  `[n_train, n)`. It **raises** on a buffer opened with `holdout=0.0` rather
+  than falling back to `sample`: a validation number that is quietly the
+  training set is worse than none.
+* `evaluate()` (`train/train.py`) averages `loss_fn` over `--eval-batches`
+  held-out batches under `no_grad` and `net.eval()`. The rng is **re-seeded
+  identically on every call**, so it is the same records at every checkpoint and
+  a move in the number is a move in the net, not a resample.
+* `--eval-every N` (default 500, 0 disables), `--eval-batches K` (default 8).
+  Readings print as `HELD <step>` lines, append to `<base>.held.jsonl`, and the
+  last one goes into `<base>.json` beside the training loss.
+* `forward()` / `to_dev()` factored out so the eval path and the training path
+  cannot drift — the pointer-row routing is written once.
+
+Checked: the final evaluation is suppressed when `--steps` is a multiple of
+`--eval-every` (it was double-logging step 8000); the no-holdout buffer warns
+once and skips; and `selftest.py` gained `test_holdout_is_disjoint`, which
+asserts the two index ranges do not overlap and that the no-holdout buffer
+refuses. `train/selftest.py <replay7>` — all checks pass.
+
+**N51's run was restarted to pick this up.** It was 450 of 8,000 steps in, the
+seeds are fixed (`torch.manual_seed(1234+gen)`, `default_rng(1234+gen)`) and
+`evaluate` draws from its own generator under `no_grad`, so the restarted run
+reproduces the same training trajectory and adds the curve. 145 seconds of CPU
+to make the experiment readable.
+
+## N53. **The held-out probes were not held out. `VALPROBE_FROM` was pointed at the wrong shard.**
+
+N51's experiment needed a "before" reading on records neither checkpoint had
+seen, so I probed `gen0020-007` — written at 00:19, after both trainings had
+finished at 18:43, and in no training buffer. Both nets are equally blind to it.
+
+```
+valprobe gen0020-007 20000 heuristic p2000@0.5 m8000@0.5      21,349 positions
+
+  eval::heuristic     rmse 0.2699  r +0.6784  top1 0.585  sd 0.296  slope 0.83
+  SMALL p2000@0.5     rmse 0.2605  r +0.6926  top1 0.595  sd 0.235  slope 1.06
+  MAIN  m8000@0.5     rmse 0.2604  r +0.6918  top1 0.594  sd 0.254  slope 0.98
+  root_value (search) rmse 0.2511  r +0.7231  top1 0.626  sd 0.292  slope 0.89
+```
+
+and the policy heads on the same 21,193 nodes:
+
+| | CE ALL | T1 ALL |
+| --- | --- | --- |
+| SMALL `p2000` | 0.8775 | 0.655 |
+| MAIN `m8000` | **0.8733** | **0.664** |
+| `Priors::OnePly` | 0.9821 | 0.583 |
+
+**2.3x the parameters buys 0.0001 rmse and 0.0042 nats.** N42 measured the same
+two checkpoints on what it called a held-out set and got 0.2593 against SMALL's
+worse figure and **CE 0.8288 against 0.8768, T1 0.693 against 0.661** — ten
+times the policy gap.
+
+Note which side moved. **SMALL scores 0.8775 here against N42's 0.8768 — the
+same net, the same number.** MAIN goes 0.8288 -> 0.8733. A distribution shift
+between the two probe sets would move both. Only the big net moved, which is
+the signature of a probe set the big net had already fitted.
+
+### N53a. Where the holdout actually is
+
+`Buffer.open` reverses the file list so the **newest shard is index 0**, then
+concatenates. The holdout is `[n_train, n)` — the tail of the *concatenation* —
+which is therefore the tail of the **oldest** shard, not the newest. Measured,
+not reasoned:
+
+```
+shard order as the Buffer indexes them, the 4-shard buffer both nets trained on:
+  [        0 ..   333,891)  gen0020-003   333,891 records
+  [  333,891 ..   524,377)  gen0020-002   190,486
+  [  524,377 ..   630,350)  gen0020-001   105,973
+  [  630,350 ..   724,241)  gen0020-000    93,891
+
+  n = 724,241   n_train = 688,028   holdout = [688,028, 724,241)
+  the held-out tail lies in shard: gen0020-000     <- the OLDEST
+
+  gen0020-003 occupies global [0, 333,891)
+  VALPROBE_FROM=0.90 on gen0020-003 probes global [300,501, 333,891)
+  inside the training window [0, 688,028)?  YES -- the probe was training data
+```
+
+N26 states the reasoning that went wrong, in as many words: "the optimiser's
+window ends at 95% of 724,241 records = 89.15% of that shard", taking for
+granted that the tail of the buffer is the tail of `gen0020-003`. It is the tail
+of `gen0020-000`. So `VALPROBE_FROM=0.90` on `gen0020-003` — the probe behind
+**N26, N32, N35 and N42** — walked records the optimiser drew from freely.
+
+The training code was never wrong. `sample` really does draw from `[0, n_train)`
+and the reserved tail really is whole games no step ever sees. What was wrong is
+that every probe was aimed at the wrong file, and `--holdout`'s own help text
+says "fraction of the **newest** records reserved for evaluation", which is the
+opposite of what the ordering produces. Nothing in the output said which file to
+aim at, so nothing caught it.
+
+### N53b. What this invalidates, and what it does not
+
+**Invalid — offline, training-set numbers, not generalisation:** the MAIN-vs-
+SMALL policy table in N42; the value tables in N26, N32, N35, N42 insofar as
+they claim to be held out. The *ordering* against `eval::heuristic` may well
+survive — `eval::heuristic` has no parameters and cannot memorise, so a net
+beating it on training data is weak evidence but not zero — but the margins are
+not generalisation margins and the SMALL-vs-MAIN comparisons are worthless.
+
+**Still valid — nothing in the arena touches this.** `f8-full`, `f2-full`,
+`l8-ladder`, `p2-prior`, `u2-uniform`, `s2-control`, `m2-main` play games from
+fresh seeds against a live opponent. The headline stands untouched: **52 blocks,
++13.49 [+12.37, +14.61]** at the champion's own budget. So does +20.90 against
+`heuristic:full` and +9.24 for the policy head alone.
+
+**And it explains two things that had not made sense.** N49's +3.0 for MAIN
+collapsed to +1.06 with overlapping intervals when the block count doubled
+(N50b); and N45(d) concluded "parameters bind, not data" on the strength of the
+N35/N42 ladder. Both were reading a memorisation gradient. **On honest held-out
+data MAIN and SMALL are the same net**, and the claim that capacity is the
+binding constraint has no evidence behind it.
+
+### N53c. The same two checkpoints on three probe sets — the overfit, isolated
+
+`valprobe`, the policy probe, `p2000` and `m8000` unchanged throughout. Only the
+records change.
+
+| probe set | what it is | SMALL CE | MAIN CE | MAIN's edge | SMALL T1 | MAIN T1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `gen0020-003` tail, `FROM=0.90` | **training data** (what N26/N42 ran) | 0.8780 | **0.8274** | **0.0506** | 0.658 | 0.690 |
+| `gen0020-000` tail, `FROM=0.6143` | **the real holdout** of that buffer | 0.8802 | 0.8792 | 0.0010 | 0.652 | 0.659 |
+| `gen0020-007`, all of it | a shard written after training ended | 0.8775 | 0.8733 | 0.0042 | 0.655 | 0.664 |
+
+**Read the SMALL row across: 0.8780, 0.8802, 0.8775.** The 1.9M-parameter net
+scores the same on data it trained on and on data it has never seen — a spread
+of 0.003 nats over three sets, which is what "not overfitting" looks like. The
+4.3M net is **0.0506 better on the records it trained on and 0.001 better
+everywhere else.**
+
+The value probe says the same thing more quietly, and once with the sign
+flipped:
+
+| probe set | heuristic | SMALL@0.5 | MAIN@0.5 | root_value |
+| --- | --- | --- | --- | --- |
+| training data | 0.2722 | 0.2603 | **0.2593** | 0.2527 |
+| the real holdout | 0.2738 | **0.2633** | 0.2637 | 0.2539 |
+| unseen shard 007 | 0.2699 | 0.2605 | **0.2604** | 0.2511 |
+
+The training-data row reproduces **N42's value table to four decimals**
+(0.2722 / 0.2593 / 0.2527), which is the check that this is the probe N42 ran.
+On the real holdout MAIN is 0.0004 *worse* than SMALL.
+
+**So `Arch::MAIN`'s entire measured advantage was memorisation of 688,028
+records.** N42's "better on every policy head" is true only of the training set;
+N45(d)'s "what binds now is parameters" was read off that; N49's +3.0 in the
+arena was six blocks and went to +1.06 at twelve (N50b). Three independent
+symptoms, one cause.
+
+**What SMALL is worth is unchanged, and it is the thing that plays.** Against
+`Priors::OnePly` on the honest holdout: CE 0.8802 against 0.9884, top-1 0.652
+against 0.575. That is the +9.24 of N38a and it was never in question.
+
+**And this makes N51 a much better experiment than it looked.** The question is
+no longer "would more data help a net that is already fine?" but "does 2.2x the
+records stop a 4.3M net overfitting 688k of them?" — which has a real chance of
+being yes, and is measured by a `HELD` curve that N52 exists to produce.
+
+## N54. `@0.5` is the right blend, checked on data the net has never seen
+
+The blend is a free field in the agent spec and costs nothing to move, so it is
+worth knowing whether the value it has been carried at since N36 is the right
+one. `valprobe` on `gen0020-007`, 15,419 positions, `p2000` throughout:
+
+| blend (weight on `eval::heuristic`) | rmse | r | top1 | slope |
+| --- | --- | --- | --- | --- |
+| `@0.2` | 0.2687 | +0.6732 | 0.583 | 1.17 |
+| `@0.3` | 0.2649 | +0.6831 | 0.588 | 1.14 |
+| `@0.4` | 0.2622 | +0.6890 | 0.590 | 1.10 |
+| **`@0.5`** | **0.2606** | +0.6916 | 0.593 | 1.06 |
+| **`@0.6`** | **0.2602** | +0.6918 | **0.594** | **1.01** |
+| `@0.7` | 0.2610 | +0.6899 | 0.593 | 0.96 |
+| `@1.0` | 0.2702 | +0.6774 | 0.585 | 0.82 |
+
+The optimum is flat across `@0.5`-`@0.6` and `@0.5` is **0.0004 rmse** off it —
+an order of magnitude below anything the arena can resolve, so there is no race
+to run here and the champion spec does not change.
+
+`@1.0` reproduces the `eval::heuristic` row to every digit (0.2702, +0.6774,
+0.585, sd 0.296, slope 0.82), which is the control on the blend arithmetic that
+`valprobe`'s own comment asks for. The blend weight is the weight on the
+*heuristic*: `@0.0` is the bare net.
+
+## N55. **The champion is carrying an under-trained checkpoint.** `p4500` has the better policy head.
+
+With an honest probe set available for the first time (N53), the obvious thing
+to ask is whether the checkpoint the whole ladder is quoted on is the best one
+this session produced. `p2000` was picked because it was the first export that
+existed, not because anything compared it with `p4500`.
+
+`valprobe`, `gen0020-007`, 15,306 policy nodes, four checkpoints, two
+architectures:
+
+| checkpoint | params | steps | **CE ALL** | **T1 ALL** | value rmse `@0.5` |
+| --- | --- | --- | --- | --- | --- |
+| `p2000` — what the champion runs | 1,913,016 | 2,000 | 0.8727 | 0.662 | **0.2606** |
+| **`p4500`** | 1,913,016 | 4,500 | **0.8563** | **0.673** | 0.2620 |
+| `m3000` | 4,332,376 | 3,000 | 0.8599 | 0.670 | 0.2607 |
+| `m8000` | 4,332,376 | 8,000 | 0.8682 | 0.671 | 0.2600 |
+| `Priors::OnePly` | — | — | 0.9855 | 0.580 | — |
+
+Two things.
+
+**(a) `p4500` is the best policy of the four, by 0.0164 nats over `p2000`** and
++0.011 top-1, and it beats *both* MAIN checkpoints. Per phase the gain is where
+the nodes are: `PickWorker` 0.8007 -> 0.7765 (T1 0.631 -> 0.658), `Take` 0.7681
+-> 0.7307, `Placing` 1.4518 -> 1.4419. The policy head is worth +9.24 on its own
+(N38a), so a 0.016-nat improvement in it is the cheapest candidate upgrade
+available — the weights already exist and cost nothing to make.
+
+**(b) MAIN's overfit is visible as a curve, not just an endpoint.** 3,000 steps
+0.8599, 8,000 steps **0.8682** — the 4.3M net gets *worse* on unseen data
+between those two while its training loss falls throughout (`train-main.log`).
+`m3000` and `p4500` are within 0.004 of each other, which is N53c again: at
+688k records the architectures are interchangeable and the step count is what
+matters.
+
+The value head says the opposite and quietly: `p2000` 0.2606, `p4500` 0.2620 —
+SMALL's value peaks by 2,000 steps and decays, its policy keeps improving to at
+least 4,500. **The two heads want different step counts**, which is the value
+squeeze of N35 seen from the other side, and it is a `W_REL`/`W_POLICY`
+question rather than a parameter-count one.
+
+Since the policy is worth +9.24 and the whole value blend `@0.5` -> `@1.0` is
+worth about +5 (N44a's table: +14.25 with the blend, +9.24 without), the trade
+should favour `p4500`. **Racing it head to head, paired, same budget, same
+blend, only the step count differing** — `d2-steps`, seed 17000000. `d2-cap`
+(MAIN vs SMALL) was stopped at 0 blocks to pay for it: N53c answers that
+question offline and more cheaply than 800 games would.
+
+`p4500` and `m3000` copied into `data/net/ckpt/` — the scratchpad is
+session-scoped and `p4500` may be the best set of weights this project has.
+
+## N56. The pin is still valid at HEAD — checked, because N23 was not
+
+Every race in this log runs `bin3/arena`, pinned at `f9789b3`. HEAD is
+`2105d81`, six commits later, and N23 is the record of a pinned binary being
+silently invalidated by a rules commit. So: what actually changed under the
+champion spec?
+
+```
+git diff --stat f9789b3 HEAD -- src/mcts.rs src/net.rs src/encode.rs \
+                                src/rules.rs src/game.rs src/phase.rs src/state.rs
+(nothing)
+```
+
+**The search, the network, the encoder and every rules file are byte-identical.**
+What changed is `eval.rs` (the per-seat research tilt, and `tests/tilt.rs:63`
+asserts `heuristic` "returns the identical bits" with it off), `record.rs`
+(`parse_mcts_flags` threads an `Option<ResearchTilt>` out; `parse_backend`,
+`deeper`, `Priors::Evaluator` and the `@BLEND` split are untouched), the TUI, the
+tests, the docs and `train/`.
+
+So the spec below reproduces in a TUI built at HEAD, and the +13.49 is a number
+about this tree and not about a stale binary.
+
+**The champion spec, exactly as it goes into the TUI:**
+
+```
+mcts:8192:data/net/ckpt/p2000.safetensors@0.5:deeper,pri=eval
+```
+
+`deeper` is sugar for `c_puct_init = 0.02, prior_min_edges = 2`
+(`record.rs:3199`); under `Priors::Evaluator` the `pmin` half is inert, which is
+why `mcts_label` prints only `:cp=0.02`. The path may be relative to `rs/` or
+absolute. `@0.5` is the weight on `eval::heuristic` in the leaf value (N54).
+
+## N57. In flight as of 22:10, so the next run does not re-launch them
+
+`<scratch>/logs2/PIDS` is authoritative; kill by PID from that file and never
+`pkill -f` a jsonl path (N14/N33a: it matched the poll loops, twice).
+
+| name | pid | what it asks | first reading due |
+| --- | --- | --- | --- |
+| `m2-main` | 35192 | MAIN at 2,048 vs the champion — the arena side of N53c | has 18 blocks |
+| `m8-main` | 44163 | MAIN at 8,192 vs the champion — the rung N49 could not afford | ~2.3 h/burst of 6 |
+| `d2-steps` | 46422 | **`p4500@0.5` vs `p2000@0.5`**, paired, 2,048 — the champion upgrade of N55 | ~30 min/burst |
+| `train-full` | 45096 | MAIN, 8,000 steps, **1,578,845 records** (7 shards, `gen0020-007` withheld) — N51 | ~50 min total |
+| `after-train` | 46855 | waits on 45096, exports `mfull8000`, probes shard 007 against `p2000`/`p4500`/`m8000` | writes `logs2/after-train.out` |
+
+Stopped this session, with reasons: `f8-full` at 40 and `f8-full-b` at 12
+(pooled 52 blocks, converged, half-width 1.12 — N50a); `d2-cap` at 0 blocks
+(MAIN-vs-SMALL, which N53c answers offline for free).
+
+**The comparison `after-train` makes is clean by construction.** `gen0020-007`
+was written at 00:19, after every training in this project finished; the
+`train-full` buffer is shards 000-006 only. So all four checkpoints are blind to
+the probe set and the only thing that differs between `m8000` and `mfull8000` is
+**724,241 records against 1,578,845** — same architecture, same recipe, same
+step count, same seeds.
+
+## N58. **`root_value` is in every record and nothing has ever read it**
+
+The policy head learns from a *search* target — the visit distribution — and is
+the strongest thing in this net (+9.24 on its own, N38a). The value head learns
+from the *game outcome* `z_rel` and is the weakest: on unseen records the bare
+net is **0.2796** where `eval::heuristic` is 0.2702, which is the entire reason
+the agent runs `@0.5` and is still leaning on a hand-tuned evaluator (N54).
+
+That asymmetry is not a law. `data/replay-champ/schema.json` lists
+
+```
+{'name': 'root_value', 'offset': 492, 'dtype': 'f4', 'count': 4}
+```
+
+— the 8,192-simulation search's own backed-up value at that node, per seat, 16
+bytes of every 512-byte record. `train/features.py` reads `z_rel`,
+`final_scores` and `win_share`, and has never touched it.
+
+Measured over 200,000 champion records:
+
+```
+finite                     : True
+all-zero rows              : 0.00%      (present on every record)
+rowsum |mean|              : 0.00000    (already centred, same convention as z_rel)
+sd                         : 0.2939     (z_rel 0.3605)
+corr with z_rel            : 0.7297
+rmse against z_rel         : 0.2485
+```
+
+**0.2485 is better than anything this project has ever evaluated** —
+`eval::heuristic` 0.2702, the best net 0.2600, and it is the `root_value` row
+that has been sitting at the bottom of every `valprobe` table all session as an
+unreachable ceiling. It is not unreachable; it is a column in the training data.
+
+### N58a. Wired as a knob, with the default reproducing every existing checkpoint
+
+`batch_arrays(..., value_mix=λ)` sets the `rel` target to
+`(1-λ)·z_rel + λ·root_value`; `train.py --value-mix λ` passes it through, and it
+goes into the checkpoint's `.json`. **Nothing about the architecture changes** —
+same tensors, same manifest, same `src/net.rs`, so a checkpoint trained at any
+mix loads unmodified and races with no code change anywhere.
+
+Checked on 512 real records:
+
+```
+mix=0.0 == z_rel exactly       : True     <- every checkpoint before this
+mix=1.0 == root_value exactly  : True
+mix=0.5 == the midpoint        : True
+inputs unchanged by the mix    : True
+out-of-range refused           : yes
+target sd: z_rel 0.3582   root_value 0.2962   half 0.3053
+```
+
+The lower target variance is the point. The value head's output `sd` is 0.235
+against a target `sd` of 0.361 (N42, N53) — it is shrinking hard toward the mean
+because the outcome is noisy at a node 20 days from the end. A target with 82%
+of the variance and a *higher* correlation to the outcome is the textbook fix,
+and it costs one flag.
+
+**This is the measurement that would most change the picture**, and the reason
+is specific: if the value head trained at `--value-mix 1.0` beats
+`eval::heuristic` *alone*, the blend can go to `@0.0` and the agent stops
+depending on the hand-tuned evaluator at all — which is what the network
+workstream is for. Today `@0.0` is 0.2796 against the heuristic's 0.2702 and the
+whole +13.49 rests on a 50/50 crutch.
+
+### N50c. `m2-main` at 23 blocks — **+15.36 [+13.47, +17.25]**, and the MAIN premium keeps shrinking
+
+```
+mcts:2048:m8000@0.5:cp=0.06,pri=eval   vs   mcts:2048:heuristic:cp=0.06
+   6 blk  +17.229  (+15.155, +19.303)   <- N49, the claim
+  12 blk  +15.307  (+12.889, +17.726)
+  18 blk  +15.625  (+13.357, +17.893)
+  23 blk  +15.359  (+13.470, +17.248)   win 0.821  cand 57.88  base 37.40
+```
+
+against SMALL `p2000` on the identical race, `f2-full`, 18 blocks:
+**+14.250 [+12.352, +16.148]**.
+
+The gap is **+1.11** with intervals overlapping over four fifths of their
+length, where N49 read +3.0 off six blocks. That is exactly the size N53c
+predicts from the offline side (CE 0.8792 against 0.8802 on honest held-out
+records) and it is not the size N42 predicted from the training set.
+
+## N59. The held-out curve N52 added catches MAIN turning over, live, at ~4,500 steps
+
+`train-full` — `Arch::MAIN`, 8,000 steps, **1,578,845 records**, the same recipe
+that produced `m8000` on 724,241:
+
+```
+HELD   500  5.0954
+HELD  1000  4.9871
+HELD  1500  4.9179
+HELD  2000  4.9036
+HELD  2500  4.8746
+HELD  3000  4.8561
+HELD  3500  4.8354
+HELD  4000  4.8257
+HELD  4500  4.7852      <- minimum
+HELD  5000  4.7941
+HELD  5500  4.7976
+```
+
+The training loss falls throughout (`train-full.log`). **The held-out loss turns
+at ~4,500 steps and rises**, on a buffer 2.2x the one `m8000` was trained on.
+This is the first time in this project that overfitting has been visible while
+it happened rather than inferred afterwards from an arena result; before N52
+there was no held-out number in the loop at all.
+
+More data moved the turnover later — N55 has MAIN degrading on unseen records
+somewhere between 3,000 and 8,000 steps at 724k — but it did not remove it.
+**8,000 steps was the wrong step count for `m8000` and it is still the wrong
+step count at 1.58M records.**
+
+`ckpt5/gen0001.pt` is overwritten every 250 steps, so the step-4,250 checkpoint
+was copied aside as `mfullMID` while the run was still going and exported to
+`data/net/ckpt/mfull4250.safetensors`. It sits within 250 steps of the minimum
+and is the checkpoint this run should be judged on; `mfull8000` is exported too,
+as the like-for-like control against `m8000`'s step count.
+
+## N60. **N51 answered: more data helps the policy head and does nothing at all for the value head**
+
+`mfull4250` — `Arch::MAIN`, **1,578,845 records**, 4,250 steps (within 250 of the
+held-out minimum, N59) — against the three checkpoints this session was built
+on. `valprobe`, `gen0020-007`, unseen by every one of them, 11,981 policy nodes:
+
+| checkpoint | arch | records | steps | **policy CE** | **policy T1** | value `@0.5` rmse |
+| --- | --- | --- | --- | --- | --- | --- |
+| `p2000` — the champion | SMALL | 724,241 | 2,000 | 0.8727* | 0.662* | **0.2613** |
+| `p4500` | SMALL | 724,241 | 4,500 | 0.8575 | 0.667 | 0.2628 |
+| `m8000` | MAIN | 724,241 | 8,000 | 0.8750 | 0.658 | 0.2611 |
+| **`mfull4250`** | **MAIN** | **1,578,845** | **4,250** | **0.8491** | **0.672** | 0.2618 |
+| `Priors::OnePly` | — | — | — | 0.9830 | 0.577 | — |
+| `eval::heuristic` | — | — | — | — | — | 0.2710 |
+| *`root_value`* | — | — | — | — | — | *0.2516* |
+
+\* from N55's larger 15,306-node run; the orderings agree across both.
+
+**(a) The policy head answers to data.** `mfull4250` is the best prior this
+project has produced: 0.8491 against the champion's 0.8727, and it beats
+`p4500` — the best SMALL — by a further 0.0084. 2.2x the records at half the
+step count turns `m8000` from the *worst* of the four into the best. That is
+N53's overfit removed by feeding it, exactly as N53c predicted it might be.
+
+**(b) The value head answers to nothing.** Blended `@0.5`, all four checkpoints
+lie between **0.2611 and 0.2628** — a spread of 0.0017 across 2.3x the
+parameters, 2.2x the data and a 4x range of step counts. Sweeping `mfull4250`'s
+own blend to `@0.6` gets 0.2613. The value head is **saturated**, and it is
+saturated a long way short of the ceiling: `root_value`, sitting in the same
+records, is 0.2516.
+
+So the answer to N45(d) is neither of the two things that were argued for it:
+
+* **data binds the policy head** — and the data was already on disk (N51);
+* **neither data nor parameters binds the value head.** N35's "value-head
+  squeeze", N42's "capacity is still the binding constraint on the value head"
+  and N45(d)'s "what binds now is parameters" are all wrong, and N53 explains
+  why they looked right.
+
+**The value head's problem is its target, and that is now a flag** (N58): it is
+trained on `z_rel`, sd 0.361, a game outcome up to 26 days away, while the
+search's own backed-up value for the same node — `root_value`, sd 0.294,
+rmse 0.2516 against that outcome — is 16 unread bytes of every record.
+`--value-mix 1.0` is queued as `srv`.
+
+`mfull4250` and `mfull8000` are in `data/net/ckpt/`.
+
+## N61. **`m8-main` — the number, since it will not be a result: ~4.7 CPU-hours for one reading**
+
+The brief asked for the `Arch::MAIN`-at-8,192 rung or the cost, and the cost is
+what this is. Measured, not estimated:
+
+| race | budget | net seats | blocks | CPU | CPU/block |
+| --- | --- | --- | --- | --- | --- |
+| `f8-full` | 8,192 | SMALL x1 | 40 | 7.5 h | **11.3 min** |
+| `m2-main` | 2,048 | MAIN x1 | 23 | 1.95 h | **5.1 min** |
+| `m8-main` | 8,192 | MAIN x1 | **0** | 0.88 h | — |
+
+`m8-main` burned **52:55 of CPU in 41:32 of wall clock and produced zero
+blocks**, arena writing in bursts of `--concurrency 6`. Scaling `m2-main` by the
+4x simulations gives ~47 CPU-min/block, so a first burst of six is **~4.7
+CPU-hours, ~4.3 hours of wall clock on this shared machine** — for one reading
+with a half-width around ±2.5 points. `MAIN` at 8,192 is **4.2x** the cost per
+block of `SMALL` at 8,192.
+
+**Stopped, and not because of the cost.** The question it was launched to answer
+was "does MAIN's +3.0 at 2,048 survive at the champion's budget". There is no
++3.0: it is **+1.11 with intervals overlapping over four fifths of their
+length** (N50c), and offline `m8000` ties `p2000` on honest held-out records and
+is the **worst of the four checkpoints** now available (N53c, N60). Spending 4.3
+hours of a shared machine to place a dominated checkpoint on the ladder is not a
+good trade, and the honest version of "MAIN at the champion's budget" is now a
+race of `mfull4250`, which is a different net.
+
+The core went to `d2-full`: **`mfull4250@0.5` against the champion's
+`p2000@0.5`**, paired, 2,048, seed 18000000 — the cheap version of the same
+question, on the checkpoint that deserves it.
+
+### N59a. Correction: that was not a turnover, it was noise, and I called it too early
+
+Two consecutive upticks after step 4,500 are not a turnover. The next reading
+went *below* the old minimum:
+
+```
+HELD  4000  4.8257
+HELD  4500  4.7852     <- what N59 called "the minimum"
+HELD  5000  4.7941
+HELD  5500  4.7976
+HELD  6000  4.7647     <- lower than any of them
+```
+
+The evaluation sample is **fixed** (`evaluate` re-seeds identically), so the
+wobble is not resampling noise — it is the net itself moving under SGD, about
+±0.02 step to step against a total descent of 0.33. **N59's headline is wrong:
+`MAIN` on 1.58M records had not turned over at 4,500 and was still improving.**
+
+Two things survive it, and one is worth more than the claim that failed.
+
+* **The instrument is right even though I misread it.** Before N52 there was no
+  held-out number in the training loop at all and this could not have been
+  discussed either way. What it needs is a smoothing window or more
+  `--eval-batches`, not removal.
+* **`mfull4250`'s probe result is unaffected.** N60 measured that checkpoint
+  against three others on `gen0020-007` directly and it won; that comparison
+  never depended on where the minimum was. What changes is the *claim* that
+  4,250 was near-optimal — `mfull8000` may well be better, and `after-train`
+  probes it on the same shard.
+
+Logged rather than edited, because a log that quietly fixes its own wrong calls
+is worth less than one that shows them.
+
+## N62. **`mfull8000` — the best prior this project has produced, and the value head went backwards making it**
+
+`train-full` finished. `MAIN`, 8,000 steps, 1,578,845 records. The held-out
+curve descends to the last reading — **no turnover at all**, which settles
+N59a: on 724k records MAIN degraded on unseen data past ~3,000 steps (N55); on
+2.2x the records it is still improving at 8,000.
+
+```
+HELD   500 5.0954   3000 4.8561   5500 4.7976   8000 4.7453   <- the minimum is the last point
+      1000 4.9871   3500 4.8354   6000 4.7647
+      1500 4.9179   4000 4.8257   6500 4.7704
+      2000 4.9036   4500 4.7852   7000 4.7526
+      2500 4.8746   5000 4.7941   7500 4.7534
+```
+
+`valprobe`, `gen0020-007`, **15,306 policy nodes**, unseen by all four:
+
+| checkpoint | records | steps | **policy CE** | **T1** | value `@0.5` | value bare |
+| --- | --- | --- | --- | --- | --- | --- |
+| `p2000` — the champion | 724,241 | 2,000 | 0.8727 | 0.662 | 0.2606 | 0.2795 |
+| `p4500` | 724,241 | 4,500 | 0.8563 | 0.673 | 0.2620 | 0.2847 |
+| `m8000` | 724,241 | 8,000 | 0.8682 | 0.671 | **0.2600** | 0.2777 |
+| **`mfull8000`** | **1,578,845** | 8,000 | **0.8427** | **0.681** | 0.2614 | 0.2851 |
+| `Priors::OnePly` | — | — | 0.9855 | 0.580 | — | — |
+| `eval::heuristic` | — | — | — | — | 0.2702 | 0.2702 |
+| *`root_value`* | — | — | — | — | — | *0.2509* |
+
+**(a) The prior.** `mfull8000` is **0.0300 nats** and **+0.019 top-1** better
+than the checkpoint the champion runs. For scale, the champion's whole advantage
+over `Priors::OnePly` — the thing worth +9.24 in the arena (N38a) — is 0.1128
+nats. `mfull8000` adds **27% again** of that margin. Racing it: `d2-full`,
+`mfull8000@0.5` against `p2000@0.5`, paired, 2,048, seed 18000000.
+
+**(b) The value head moved the other way, and this is the finding.** Read the
+bare-value column down: **0.2795, 0.2847, 0.2777, 0.2851**. More steps make it
+worse (`p2000` -> `p4500`). More data makes it worse (`m8000` -> `mfull8000`).
+The blend hides it — `@0.5` stays in a 0.0028 band across all four — because
+`eval::heuristic` is carrying it.
+
+**Training harder improves the policy head and degrades the value head, in the
+same net, in the same run.** That is not a capacity story and it is not a data
+story. It is the target: the policy learns from the search's visit
+distribution, which is low-noise, so fitting it harder helps; the value learns
+from `z_rel`, a game outcome up to 26 days away with sd 0.361, so fitting it
+harder is fitting noise. Every checkpoint's value `sd` sits at 0.19-0.26
+against that 0.361 — all of them shrinking hard toward the mean, which is what
+a least-squares fit to a noisy target does.
+
+**N58 is now not a speculation but the diagnosis.** `root_value` — the same
+node's backed-up value from the same search, sd 0.294, rmse 0.2509 against the
+outcome, better than any evaluator here — is 16 bytes of every record and has
+never been a target. `--value-mix 1.0` is queued as `srv`.
+
+### N62a. `mfull8000`'s blend optimum, and why the race still runs `@0.5`
+
+```
+@0.40 0.2646   @0.55 0.2617   @0.65 0.2614
+@0.50 0.2623   @0.60 0.2614   @0.70 0.2618        p2000@0.5 0.2613
+```
+
+The optimum moved up — `@0.60`-`@0.65` against `p2000`'s flat `@0.50`-`@0.60`
+(N54) — which is the same fact as N62(b) seen through the blend: a weaker bare
+value head wants more `eval::heuristic` mixed in. It is worth **0.0009 rmse**,
+an order of magnitude under the arena's noise floor, so `d2-full` keeps `@0.5`
+on both arms and the only thing that differs between candidate and baseline
+stays the checkpoint.
+
+## N63. **`p4500` is not a champion upgrade. 0.016 nats of policy buys nothing measurable.**
+
+```
+mcts:2048:p4500@0.5:cp=0.06,pri=eval   vs   mcts:2048:p2000@0.5:cp=0.06,pri=eval
+6 blocks / 24 games, paired (1 candidate seat, 3 baseline seats, all four rotated)
+
+  centred   -0.031   (-2.069, +2.007)      null 0.00
+  win        0.312                          null 0.25
+  cand 56.21   base 56.25    days 27.00, 0 aborted
+```
+
+N55 read the 0.0164-nat policy improvement and called `p4500` "the cheapest
+candidate upgrade available". It is not an upgrade at all: **−0.03 with a
+half-width of 2.07.** Six blocks is not much, but the point estimate is on top
+of zero, not at the edge of an interval that happens to include it.
+
+**This is the calibration the whole offline programme was missing**, and it is
+worth more than the result. The scale: `Priors::OnePly` -> `p2000` is **0.1128
+nats** of policy CE and is worth **+9.24** in the arena (N38a). Linearly that
+makes a nat worth ~82 points and 0.0164 nats worth **+1.3** — inside this
+race's own noise. Every offline CE comparison in this log should be read
+against that constant from now on:
+
+| CE improvement | linear prediction | resolvable at 24 games? |
+| --- | --- | --- |
+| `p2000` -> `p4500`, 0.0164 | +1.3 | no (half-width 2.07) |
+| `p2000` -> `mfull8000`, **0.0300** | **+2.5** | marginally |
+| `OnePly` -> `p2000`, 0.1128 | +9.24 (measured) | yes |
+
+So `d2-full` — `mfull8000@0.5` against `p2000@0.5`, the same paired design —
+is expected to land around **+2.5 and needs roughly 24 blocks** to separate from
+zero, not six. It is running; `d2-steps` keeps running beside it because the
+same blocks also sharpen this null.
+
+**And the champion does not move today.** `p2000` stays.
+
+## N64. **Data binds `MAIN`. Capacity binds `SMALL`. Both were true and each was measured alone.**
+
+`sfull` — `Arch::SMALL`, the **full 1,578,845-record buffer**, 4,500 steps, the
+same recipe that produced `p4500` on 724,241. Probed with the others on
+`gen0020-007`, 11,981 policy nodes, one run so the numbers are comparable:
+
+| checkpoint | arch | records | steps | **policy CE** | **T1** | bare value rmse |
+| --- | --- | --- | --- | --- | --- | --- |
+| `p2000` — the champion | SMALL | 724,241 | 2,000 | 0.8759 | 0.654 | 0.2798 |
+| `p4500` | SMALL | 724,241 | 4,500 | 0.8575 | 0.667 | 0.2854 |
+| **`sfull`** | **SMALL** | **1,578,845** | 4,500 | **0.8562** | 0.663 | 0.2921 |
+| `mfull8000` | MAIN | 1,578,845 | 8,000 | **0.8454** | **0.673** | 0.2862 |
+| `m8000` | MAIN | 724,241 | 8,000 | 0.8750* | 0.658* | 0.2777 |
+
+\* from the 15,306-node run; the orderings agree.
+
+**Hold the architecture and the step count fixed and vary only the data:**
+
+* `SMALL`, 4,500 steps: 724k -> 1.58M is **0.8575 -> 0.8562**. Thirteen
+  ten-thousandths of a nat for 2.2x the games. **Nothing.**
+* `MAIN`, 8,000 steps: 724k -> 1.58M is **0.8750 -> 0.8454**. **0.0296**, and it
+  turns MAIN from the worst checkpoint into the best.
+
+**That is the whole data-versus-parameters argument, settled, and the answer is
+that both sides were right about a different net.** `SMALL` is capacity-bound:
+it has already extracted what its 1.9M parameters can hold from 724k records and
+more games do not reach it. `MAIN` is data-bound: at 724k it memorised (N53c)
+and at 1.58M it does not, and the 2.3x parameters finally pay. N45(d) said
+parameters; N51 said data; **neither buys anything without the other**, which is
+why every experiment that moved one at a time read as a null or as noise.
+
+The held-out curves say the same thing in the training loop, on the identical
+holdout:
+
+```
+                        step 3500   step 4500   step 8000
+MAIN,  1.58M records      4.8354      4.7852      4.7453
+SMALL, 1.58M records      4.8082      4.7669        --      (run stopped at 4,500)
+```
+
+`SMALL` is **more step-efficient** — ahead of MAIN at every step it was run for
+— and MAIN passes it only by running twice as long. `SMALL` on the full buffer
+for 8,000+ steps is the obvious cheap follow-up and has not been run.
+
+**The value head, once more, for the record.** Bare rmse across the five:
+0.2798, 0.2854, **0.2921**, 0.2862, 0.2777. `sfull` is the worst value head in
+the table and it was trained on the most data. Every intervention that improves
+the prior degrades the value. N58/N62(b).
+
+## N65. **N58 was wrong. Training the value head on `root_value` makes it worse.**
+
+`srv` and `sfull` are the same net, the same 1,578,845 records, the same 4,500
+steps, the same seeds. The only difference is `--value-mix`: `sfull` trains the
+`rel` head on `z_rel`, `srv` trains it on `root_value`. `gen0020-007`:
+
+| | bare value rmse | r | top1 | sd | slope | `@0.5` rmse |
+| --- | --- | --- | --- | --- | --- | --- |
+| `sfull` — `--value-mix 0.0` | **0.2915** | +0.5969 | 0.526 | 0.252 | 0.85 | **0.2649** |
+| `srv` — `--value-mix 1.0` | 0.3006 | +0.5654 | 0.515 | 0.248 | 0.82 | 0.2697 |
+| `eval::heuristic` | 0.2702 | +0.6774 | 0.585 | 0.296 | 0.82 | — |
+| *`root_value` itself* | *0.2509* | *+0.7229* | *0.624* | *0.292* | *0.89* | — |
+
+**Worse by 0.0091 bare and 0.0048 blended**, and worse on r, on top-1 and on
+slope. The prediction in N58 — lower target variance, higher correlation with
+the outcome, therefore a better value head — is refuted.
+
+**Why, and it is the interesting part.** `root_value` is a better *predictor* of
+`z_rel` than any evaluator (0.2509 against `eval::heuristic`'s 0.2702) because
+it is the backed-up result of **8,192 simulations of lookahead from that exact
+node**. That advantage is not a function of the position; it is search output.
+A net given only the position can learn the component of `root_value` that the
+position determines, and that component turns out to be *less* informative about
+the eventual outcome than `z_rel` is — the net inherits the search's shrinkage
+(`root_value` sd 0.294 against the outcome's 0.361) and its systematic errors,
+and gets none of the lookahead that made it good.
+
+So the `root_value` row at the bottom of every `valprobe` table is **not a
+ceiling the value head can be trained toward.** It is a measure of what search
+buys, and buying it requires searching.
+
+**A second thing falls out, and it contradicts N35.** The policy heads barely
+moved: `sfull` CE 0.8507, `srv` 0.8535, top-1 0.675 against 0.672 — 0.003 nats
+for completely replacing the value target. If six policy heads and the value
+head were really competing for one trunk, changing what the value head is
+trained on by that much would have shown up in the prior. It does not. **The two
+heads are far more decoupled than the "value-head squeeze" of N35 assumed** —
+which is one more thing that story got from a probe set the net had memorised.
+
+`--value-mix` stays in `train.py`: the knob is right even though the hypothesis
+was wrong, `0.0` is the default and reproduces everything, and a partial mix is
+now a measured-not-guessed dead end rather than an untried idea.
+
+### N50d. `m2-main` final — **38 blocks, +14.87 [+13.55, +16.19]**. The MAIN premium is gone.
+
+```
+mcts:2048:m8000@0.5:cp=0.06,pri=eval   vs   mcts:2048:heuristic:cp=0.06
+   6 blk  +17.229  (+15.155, +19.303)    <- N49's claim, and the whole "parameters bind" story
+  12 blk  +15.307  (+12.889, +17.726)
+  23 blk  +15.359  (+13.470, +17.248)
+  30 blk  +15.221  (+13.717, +16.725)
+  38 blk  +14.870  (+13.547, +16.193)   win 0.839  cand 57.86  base 38.03
+```
+
+152 games, days 27.00, 0 aborted, half-width **1.32**. Against SMALL `p2000` on
+the identical race (`f2-full`, 18 blocks): **+14.250 [+12.352, +16.148]**.
+
+**The gap is +0.62 and the intervals overlap over essentially their whole
+length.** N49 read +3.0 off six blocks and N45(d) built "what binds now is
+parameters" on top of it. At 38 blocks there is no premium for 2.3x the
+parameters at 724k records, which is precisely what N53c said from the offline
+side once the probe was pointed at data the net had not trained on, and what
+N64 explains: at that buffer size `MAIN` had nothing to spend the parameters on.
+
+Stopped; the core went to `d2-full`.

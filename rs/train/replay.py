@@ -171,7 +171,14 @@ class Buffer:
         # set of *whole games* the optimiser never sees. That is what makes an
         # offline value-fit number ("is this net a better predictor than
         # `eval::heuristic`?") mean anything: sample from the head, probe on the
-        # tail. `valprobe --from` walks the same tail on the Rust side.
+        # tail. `valprobe`'s VALPROBE_FROM walks the same tail on the Rust side.
+        #
+        # **Which file the tail is in is not obvious and got this wrong once.**
+        # `open()` reverses the file list so index 0 is the *newest* shard, so
+        # the tail of the concatenation is the tail of the **oldest** shard.
+        # N53: four probes were aimed at the newest shard instead and were
+        # reading training data. `holdout_probe()` below computes the answer so
+        # nobody has to derive it again, and `summary()` prints it.
         self.holdout = float(holdout)
         self.n_train = int(self.n * (1.0 - self.holdout))
         if self.n_train <= 0:
@@ -251,6 +258,38 @@ class Buffer:
         rng = rng or np.random.default_rng()
         return decode(self.take(rng.integers(0, self.n_train, size=n)), self.schema)
 
+    def sample_holdout(self, n: int, rng: np.random.Generator | None = None) -> dict:
+        """Uniform sample of ``n`` records from the held-out tail.
+
+        The tail is a contiguous run of *whole games* the optimiser never draws
+        from (see ``__init__``), so a loss measured on it is generalisation and
+        the training loss beside it is not. Raises rather than falling back to
+        ``sample`` when there is no holdout: a validation number that is
+        silently the training set is worse than no validation number.
+        """
+        if self.n_train >= self.n:
+            raise ValueError(
+                "no holdout to sample: open the Buffer with holdout > 0"
+            )
+        rng = rng or np.random.default_rng()
+        idx = rng.integers(self.n_train, self.n, size=n)
+        return decode(self.take(idx), self.schema)
+
+    def holdout_probe(self) -> tuple[str, float] | None:
+        """`(shard path, VALPROBE_FROM)` that walks exactly the held-out tail.
+
+        The number to hand `valprobe` so it probes whole games no optimiser step
+        drew from. Returns None when there is no holdout. Derived from the same
+        offsets `sample` uses, so it cannot drift from where the tail really is.
+        """
+        if self.n_train >= self.n:
+            return None
+        which = int(np.searchsorted(self.offsets, self.n_train, side="right") - 1)
+        lo = int(self.offsets[which])
+        size = int(self.sizes[which])
+        frac = (self.n_train - lo) / size
+        return self.paths[which], float(frac)
+
     def all(self) -> dict:
         return decode(self.take(np.arange(self.n)), self.schema)
 
@@ -274,6 +313,12 @@ class Buffer:
             f"({int((pk != 0).sum()):,} of {len(pk):,} sampled)\n"
             f"  day range       : {int(d['day'].min())}..{int(d['day'].max())}\n"
             f"  newest shard    : {os.path.basename(self.paths[0])}"
+            + (
+                f"\n  holdout probe   : VALPROBE_FROM={probe[1]:.4f} "
+                f"{os.path.basename(probe[0])}"
+                if (probe := self.holdout_probe())
+                else ""
+            )
         )
 
 

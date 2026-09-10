@@ -106,20 +106,29 @@ fn main() {
     let out = flag("--out").unwrap_or_else(|| "seatmatch.jsonl".into());
     let quiet = present("--quiet");
 
-    let searching = specs.iter().any(|s| s.searches());
+    // 128 games in flight is `arena`'s default and it exists for one reason:
+    // to fill a network's evaluation batch, most of those threads parked inside
+    // `Evaluator::evaluate`. With no network there is nothing to fill, and every
+    // extra game in flight is another live MCTS tree competing for memory.
+    //
+    // It also delays the *first completed game*, which is what progress, ETA and
+    // resume are all built on: at 128 in flight and 100 games, all 100 start at
+    // once and none finishes until nearly all do, so a run that is interrupted
+    // has nothing on disk. Default to the core count unless a net can use more.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let wants_batch = !present("--no-batch") && specs.iter().any(|s| s.batchable());
     let concurrency = match num("--concurrency", 0) {
-        0 if searching => 128,
-        0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+        0 if wants_batch => 128,
+        0 => cores,
         n => n,
-    };
+    }
+    .max(1);
     let batch = match num("--batch", 0) {
         0 => concurrency.min(256),
         n => n,
     };
     let batchers = match num("--batchers", 0) {
-        0 => (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
-            .div_ceil(5)
-            .clamp(1, 4),
+        0 => cores.div_ceil(5).clamp(1, 4),
         n => n,
     };
     let linger = num("--linger-us", 200);
@@ -166,6 +175,16 @@ fn main() {
         already.len()
     );
     println!("  progress  : {out}");
+    if concurrency >= todo.len() && todo.len() > 1 {
+        println!(
+            "  note      : {concurrency} in flight and {} to play, so every game \
+             finishes at\n              about the same time -- expect no progress \
+             until near the end.\n              Pass --concurrency {} for games that \
+             land steadily.",
+            todo.len(),
+            cores.min(todo.len())
+        );
+    }
 
     let f = std::fs::OpenOptions::new()
         .create(true)

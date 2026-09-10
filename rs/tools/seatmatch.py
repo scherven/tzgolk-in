@@ -202,18 +202,25 @@ def run(cmd: list[str], games_path: Path, want: int, lineup: list[str]) -> int:
 
     signal.signal(signal.SIGINT, on_sigint)
 
-    started, last = time.time(), 0
+    started = time.time()
     try:
         while proc.poll() is None:
             time.sleep(5)
+            if stopping:
+                continue
             done = len(read_games(games_path))
-            if done != last and not stopping:
-                elapsed = time.time() - started
-                rate = done / elapsed if elapsed > 0 else 0
-                left = (want - done) / rate if rate > 0 else float("inf")
+            elapsed = time.time() - started
+            if done == 0:
+                # Say so rather than showing nothing: a run with more games in
+                # flight than games to play finishes them all at once, and
+                # silence there is indistinguishable from a hang.
+                print(f"\r  0/{want} games   {elapsed / 60:.1f} min elapsed, "
+                      f"none finished yet    ", end="", flush=True)
+            else:
+                rate = done / elapsed
+                left = (want - done) / rate
                 print(f"\r  {done}/{want} games   {rate:.2f} games/s   "
                       f"eta {left / 3600:5.1f} h    ", end="", flush=True)
-                last = done
     finally:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
     print()
